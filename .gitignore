@@ -1,0 +1,127 @@
+# ---- Build output ----
+/target/
+**/*.rs.bk
+*.pdb
+
+# ---- Runtime data created by ccwm (database, WAL/SHM, journals) ----
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*-journal
+*-wal
+*-shm
+
+# ---- Sockets, locks, runtime/instance state ----
+*.sock
+*.socket
+*.lock
+!Cargo.lock
+instance.json
+/run/
+/state/
+/data/
+
+# ---- Tokens, credentials, keys, environment files ----
+*.token
+cli.token
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.csr
+id_rsa*
+id_ed25519*
+*.secret
+*.secrets
+secrets.toml
+secrets.json
+secrets.yaml
+secrets.yml
+credentials.json
+.credentials.json
+.env
+.env.*
+!.env.example
+.netrc
+.npmrc
+.pypirc
+*.kdbx
+
+# ---- Local configuration (commit only config.example.toml) ----
+/config.toml
+config.local.toml
+*.local.toml
+.claude/settings.local.json
+.claude/*.local.*
+
+# ---- Claude Code session records: never commit, except reviewed synthetic fixtures ----
+*.jsonl
+!tests/fixtures/**/*.jsonl
+.claude-mem/
+.claude/projects/
+.session-aliases
+
+# ---- Synthetic environments generated for manual runs ----
+/synthetic-env/
+/synth-env/
+/tmp/
+/scratch/
+
+# ---- Logs ----
+*.log
+/logs/
+*.log.*
+excalidraw.log
+
+# ---- Local benchmark results and test artifacts ----
+/bench-results/
+/benchmarks/results/
+/perf-results/
+*.prof
+*.profraw
+*.profdata
+flamegraph*.svg
+perf.data*
+callgrind.out.*
+heaptrack.*
+/coverage/
+lcov.info
+tarpaulin-report.*
+*.orig
+*.rej
+/test-output/
+/screenshots-local/
+
+# ---- Release artifacts ----
+/dist/
+*.tar.gz
+SHA256SUMS
+*.sha256
+
+# ---- Editors / IDEs ----
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.#*
+\#*#
+.history/
+
+# ---- OS files ----
+.DS_Store
+.Trash-*
+.directory
+Thumbs.db
+desktop.ini
+.fuse_hidden*
+.nfs*
