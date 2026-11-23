@@ -1,0 +1,51 @@
+# cargo-deny configuration. CI runs `cargo deny check` (M4); run it locally if installed.
+# REQUIREMENTS.md §11.5: HTTP/network client crates and DNS resolvers are banned.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+  { crate = "reqwest", reason = "HTTP client (zero external network communication)" },
+  { crate = "ureq", reason = "HTTP client" },
+  { crate = "curl", reason = "HTTP client" },
+  { crate = "curl-sys", reason = "HTTP client" },
+  { crate = "isahc", reason = "HTTP client" },
+  { crate = "attohttpc", reason = "HTTP client" },
+  { crate = "surf", reason = "HTTP client" },
+  { crate = "minreq", reason = "HTTP client" },
+  { crate = "hyper-tls", reason = "HTTP client TLS connector" },
+  { crate = "hyper-rustls", reason = "HTTP client TLS connector" },
+  { crate = "native-tls", reason = "TLS client" },
+  { crate = "openssl", reason = "TLS client" },
+  { crate = "rustls", reason = "TLS client" },
+  { crate = "trust-dns-resolver", reason = "DNS resolver" },
+  { crate = "hickory-resolver", reason = "DNS resolver" },
+  { crate = "hickory-client", reason = "DNS client" },
+  { crate = "c-ares", reason = "DNS resolver" },
+]
+
+# The axum server pulls in hyper and hyper-util; their *client* features must stay off.
+[[bans.features]]
+crate = "hyper"
+deny = ["client"]
+
+[[bans.features]]
+crate = "hyper-util"
+deny = ["client", "client-legacy", "client-proxy", "client-pool"]
+
+[advisories]
+version = 2
+
+[licenses]
+version = 2
+allow = [
+  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+  "ISC", "Unicode-3.0", "Unlicense", "Zlib", "CC0-1.0", "MPL-2.0", "0BSD",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

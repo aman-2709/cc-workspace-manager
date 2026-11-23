@@ -54,7 +54,7 @@ Non-goals for v0.1:
 ## 4. Project discovery (v0.1)
 
 ### 4.1 Roots and scope
-- The default discovery root is the home directory of the non-root user running the service, resolved by platform mechanisms (the passwd entry of the effective UID; `$HOME` is used only if it is owned by that user). Never hardcode `~/dev` or a username. Refuse to run as root.
+- The default discovery root is the home directory of the non-root user running the service, resolved by platform mechanisms (`$HOME` if it is an absolute path to a directory owned by that user, which is what systemd and login shells provide and what the synthetic test environment of §19 overrides; otherwise the passwd entry of the effective UID). Never hardcode `~/dev` or a username. Refuse to run as root.
 - Users can add, remove and narrow roots (including roots outside home that they explicitly authorize) and add exclusion patterns. Changes apply without restart (watchers are reconfigured safely).
 - Hard safety boundaries that explicit roots can never override: `/proc`, `/sys`, `/dev`, `/run`, the ccwm data, config, state and runtime directories, and any path not readable by the user.
 - `same_file_system = true` by default. Symlinked directories are not followed by default. Max traversal depth defaults to 10 (configurable).
@@ -415,6 +415,7 @@ Built from the maintainer's pasted schema output (§19), using synthetic fixture
 | SQLx | Superseded → rusqlite with bundled SQLite and a dedicated writer (§14) |
 | Names "Claude Dashboard", "Claude Code Workspace Manager", `claude-workspace` | Superseded → CC Workspace Manager / `ccwm` (§1) |
 | Hardcoded `~/dev` root | Superseded → user's home directory, configurable roots (§4.1) |
+| Home from the passwd entry only | Superseded → `$HOME` (owned by the user) first, then passwd, so the §19 synthetic environment cannot silently fall through to the real home (§4.1) |
 | CLAUDE.md as the only qualifying marker | Superseded → CLAUDE.md **or** session cwd (§4.3) |
 | Session-only candidates "optionally surfaced" | Superseded → enabled by default (§4.3) |
 | Cookie-based browser sessions (HttpOnly, SameSite) | Superseded → origin-scoped bearer tokens (§11.2) |

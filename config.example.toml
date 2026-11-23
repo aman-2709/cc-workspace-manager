@@ -1,0 +1,18 @@
+# CC Workspace Manager: example configuration.
+# Copy to $XDG_CONFIG_HOME/ccwm/config.toml (default ~/.config/ccwm/config.toml).
+# The file is read when the daemon starts; unknown keys are errors.
+
+[server]
+# TCP port on 127.0.0.1 (1024-65535). `ccwm serve --port N` overrides it.
+port = 8765
+
+[discovery]
+# Directories to search for projects (absolute paths). Empty = your home directory.
+roots = []
+# Extra exclusions, gitignore syntax, relative to each root.
+# Hidden directories, node_modules, target, build, dist, venv and __pycache__ are always skipped.
+exclude = []
+# How many directory levels below a root are searched.
+max_depth = 10
+# Stay on the root's file system (do not descend into other mounts).
+same_file_system = true

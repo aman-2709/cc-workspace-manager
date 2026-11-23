@@ -36,7 +36,7 @@ src/
   exit.rs         # exit-code constants (M1: OK, ERROR, USAGE; M4 adds PORT_IN_USE, ALREADY_RUNNING)
   cli.rs          # clap definitions (+ unofficial notice in --help)
   client.rs       # M1: `open` -> Unix-socket client (peer verification, JSON lines). No HTTP client.
-  paths.rs        # M1: Dirs{config,data,state,runtime}; XDG + fallbacks; 0700 creation + owner/mode verification; home via passwd
+  paths.rs        # M1: Dirs{config,data,state,runtime}; XDG + fallbacks; 0700 creation + owner/mode verification; home = owned `$HOME`, else passwd
   config.rs       # M1: config.toml model (serde, deny_unknown_fields), defaults, validation
   clock.rs        # M1: Clock trait (System / Fake)
   sandbox.rs      # M1: Landlock policy, apply(), SandboxReport (what is actually active)
@@ -179,7 +179,7 @@ async facade is `spawn_blocking`.
 [server]
 port = 8765                  # 1024..=65535; `--port 0` (ephemeral) is accepted for tests only
 [discovery]
-roots = []                   # empty ⇒ passwd home of the euid
+roots = []                   # empty ⇒ home (owned $HOME, else passwd)
 exclude = []                 # extra gitignore-syntax patterns, relative to each root
 max_depth = 10
 same_file_system = true
@@ -353,6 +353,13 @@ daemon is tested under them (`ReadWritePaths=` for ccwm's dirs). `Type=exec`; po
 codes go in `RestartPreventExitStatus=`.
 
 ---
+
+## 13a. M1 verification notes (what was actually run)
+
+- Landlock on this host (Linux 7.0, ABI 8): `tests/sandbox.rs` re-executes the test binary, applies the policy, and verifies that writes outside the allowed directories, reads outside the allowed paths, outbound TCP connects and binds to other ports are denied — for the process **and** for `/bin/sh`/`/bin/bash` children — while writes in ccwm's directories, `/dev/null`, Unix-socket binding and the allowed TCP port work. A real daemon run reported `fully_enforced abi=8 filesystem=true network=true` and `NoNewPrivs: 1`. `--port 0` needs an explicit `NetPort(0)` rule (granted automatically because the configured port is 0).
+- `hyper`/`hyper-util` are in the tree only with their `server` features (checked with `cargo tree -e features`); no client crates. `deny.toml` encodes the bans but `cargo-deny` has **not** been run (not installed here).
+- The UI was exercised with a Node DOM stub against a live synthetic daemon (fragment removal, exchange, listing, session storage). It has **not** been viewed in a real browser (extension not connected).
+- Sign-in links printed by `ccwm open --print` contain the single-use token by design; the log never does (asserted).
 
 ## 14. Decisions log and remaining open items
 

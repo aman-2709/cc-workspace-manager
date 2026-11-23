@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **M1 in progress** (docs + `.gitignore` done; code next).
+Current position: **M1 complete — waiting for the maintainer's go-ahead for M2.**
 
 ---
 
@@ -16,23 +16,23 @@ cached projects immediately; security acceptance tests **1, 6, 7, 9, 11** pass.
 
 - [x] Spec revision applied; ARCHITECTURE.md / ROADMAP.md / CLAUDE.md rewritten
 - [x] Full `.gitignore` before any code; local `git init`
-- [ ] Cargo scaffold (`cc-workspace-manager` / `ccwm`, `rust-version=1.94`, `Cargo.lock`), `LICENSE` (MIT, holder TBD), `config.example.toml`
-- [ ] `paths` (XDG + fallback, 0700, owner/mode verification, 108-byte socket limit, passwd home, refuse root, umask 0077) · `config` · `clock`
-- [ ] `sandbox`: Landlock policy applied before any thread, `SandboxReport` in log + `service.status`
-- [ ] `instance`: flock + `instance.json`
-- [ ] SQLite: pragmas, migration 1, writer thread, read pool
-- [ ] Discovery: exclusions, hard boundaries, mountinfo FUSE detection, DFS walk, marker rules, nested rule, non-UTF-8 skip, progressive batches, status counters
-- [ ] Auth: bootstrap (in-memory, single-use, 60 s), exchange, sessions (hashed, sliding 30 d), rotate (+60 s grace), logout, revoke-all
-- [ ] Service layer + Unix-socket server (SO_PEERCRED) + client (verifies peer) — ops `ping`, `auth.bootstrap`, `auth.revoke_all`, `service.status`
-- [ ] HTTP: security headers, Host/Origin/auth middleware, error envelope, body limit, routes `/health /auth/* /projects /stats /discovery/status /service/status`
-- [ ] CLI: `serve [--port --config]`, `open [--print]`, `--version`, `--help` (unofficial notice)
-- [ ] UI: embedded `index.html`/`app.css`/`app.js`; fragment → `replaceState` → exchange; polling; card list; loading/empty/error/unauthenticated/partial-progress states; unofficial footer; no `innerHTML`
-- [ ] Synthetic environment generator (`ccwm-synth`, shared with tests)
-- [ ] `scripts/inspect-session-schema.py` (tested on synthetic data only; handed to the maintainer, never run by the agent on real data)
-- [ ] `deny.toml` network-crate bans (run if `cargo-deny` is installed)
-- [ ] Tests: unit + HTTP + process-level + acceptance **1, 6, 7, 9, 11**
-- [ ] Manual acceptance run in a synthetic env (steps + results recorded)
-- [ ] fmt / clippy / test green; docs + roadmap updated; local commit
+- [x] Cargo scaffold (`cc-workspace-manager` / `ccwm`, `rust-version=1.94`, `Cargo.lock`), `LICENSE` (MIT, holder TBD), `config.example.toml`
+- [x] `paths` (XDG + fallback, 0700, owner/mode verification, 108-byte socket limit, passwd home, refuse root, umask 0077) · `config` · `clock`
+- [x] `sandbox`: Landlock policy applied before any thread, `SandboxReport` in log + `service.status`
+- [x] `instance`: flock + `instance.json`
+- [x] SQLite: pragmas, migration 1, writer thread, read pool
+- [x] Discovery: exclusions, hard boundaries, mountinfo FUSE detection, DFS walk, marker rules, nested rule, non-UTF-8 skip, progressive batches, status counters
+- [x] Auth: bootstrap (in-memory, single-use, 60 s), exchange, sessions (hashed, sliding 30 d), rotate (+60 s grace), logout, revoke-all
+- [x] Service layer + Unix-socket server (SO_PEERCRED) + client (verifies peer) — ops `ping`, `auth.bootstrap`, `auth.revoke_all`, `service.status`
+- [x] HTTP: security headers, Host/Origin/auth middleware, error envelope, body limit, routes `/health /auth/* /projects /stats /discovery/status /service/status`
+- [x] CLI: `serve [--port --config]`, `open [--print]`, `--version`, `--help` (unofficial notice)
+- [x] UI: embedded `index.html`/`app.css`/`app.js`; fragment → `replaceState` → exchange; polling; card list; loading/empty/error/unauthenticated/partial-progress states; unofficial footer; no `innerHTML`
+- [x] Synthetic environment generator (`ccwm-synth`, shared with tests)
+- [x] `scripts/inspect-session-schema.py` (tested on synthetic data only; handed to the maintainer, never run by the agent on real data)
+- [x] `deny.toml` network-crate bans written; **not yet run** (`cargo-deny` is not installed on this host; the dependency tree was checked by hand with `cargo tree`)
+- [x] Tests: unit + HTTP + process-level + acceptance **1, 6, 7, 9, 11**
+- [x] Manual acceptance run in a synthetic env (see CLAUDE.md "How to run"); the UI was exercised with a Node DOM stub, **not in a real browser** (the Chrome extension was not connected)
+- [x] fmt / clippy / test green; docs + roadmap updated; local commit
 
 ## M2 — Activity tracking
 Accept: editing a file moves its project to the top live; creating `CLAUDE.md` in a watched area registers a

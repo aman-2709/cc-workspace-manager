@@ -7,7 +7,7 @@ Independent, unofficial tool to discover, track and resume Claude Code projects.
 2. `ARCHITECTURE.md` (modules, data flow, schema, contracts, verified findings), `ROADMAP.md` (checklists + §18 backlog). Keep all three current. §18 items are **not** v0.1.
 
 ## Current status
-**M1 — Foundation: in progress.** Spec revision applied, docs and `.gitignore` written, repo initialised (local only). Implement only the approved milestone; after M1, stop, report, and wait for the maintainer's go-ahead.
+**M1 — Foundation: complete (committed locally).** Waiting for the maintainer's go-ahead before M2. Implement only the approved milestone; after it, stop, report, and wait.
 
 ## Hard rules
 - **Never** push, add remotes, tag, publish, run `sudo`, or run `loginctl enable-linger`. Never write outside this repo except cargo's normal `~/.cargo` cache and `/tmp` synthetic environments. Never modify `~/.claude` or monitored projects.
@@ -19,11 +19,12 @@ Independent, unofficial tool to discover, track and resume Claude Code projects.
 ## Commands
 ```bash
 cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test
-cargo run --features synth --bin ccwm-synth -- /tmp/ccwm-synth-demo     # prints the env to use
-# then, in a separate shell with that env applied ONLY to ccwm:
-env $(cat /tmp/ccwm-synth-demo/env) cargo run -- serve    # (cargo itself must not see the synthetic HOME: build first, then run target/debug/ccwm)
+cargo build
+target/debug/ccwm-synth /tmp/ccwm-synth-demo --projects 30      # synthetic HOME/XDG/CLAUDE_CONFIG_DIR; writes <dir>/env
+env $(cat /tmp/ccwm-synth-demo/env) target/debug/ccwm serve --port 8766 &   # the synthetic env goes to ccwm only, never to cargo
+env $(cat /tmp/ccwm-synth-demo/env) target/debug/ccwm open --print          # single-use sign-in link (open it in a browser)
 ```
-Prefer: `cargo build` then `env <synthetic env> target/debug/ccwm serve --port 0`, `… open --print`.
+Tests: `cargo test` (unit + `tests/*.rs`; `tests/process.rs` spawns the real binary in a synthetic env; `tests/ui.rs` runs `node --test` if node exists).
 
 ## Conventions
 - Rust stable, `rust-version = "1.94"` (only tested toolchain). `Cargo.lock` committed. New dependency ⇒ justify in ARCHITECTURE.md §4 first; HTTP/DNS client crates are **banned** (`deny.toml`).
@@ -44,6 +45,13 @@ Ubuntu 24.04, rustc/cargo 1.94.0, git 2.43.0 (needs ≥2.41.0 for `--attr-source
 - SQLite under Landlock: `temp_store=MEMORY` (no `/tmp` writes).
 - Session timestamps are unordered within a file; `cwd` only on `user|assistant|attachment|system`; no single genuine-prompt flag (ARCHITECTURE.md §11).
 - `PrivateDevices=yes` is rejected in user units.
+- Home is `$HOME` (if owned by you) before the passwd entry; otherwise the synthetic environment would silently fall through to the real home.
+- serde `deny_unknown_fields` does not reject extra fields on internally tagged unit variants: the socket protocol parser checks the object shape by hand.
+- `ignore::gitignore` accepts most odd patterns (`[`); only a few (`a\\`, `{a`) error — patterns are validated at config load.
+- Landlock: `NetPort(0, BindTcp)` makes `--port 0` (ephemeral) work; without a rule for 0 an ephemeral bind is denied.
+
+## Module status (M1)
+`paths config clock error api_error sandbox instance db/{mod,writer,reader,queries} discovery/{walk,exclusions,mounts,status} auth/{tokens,bootstrap,sessions} service ipc/{protocol,server} client http/{mod,middleware,extract,routes,assets,error} daemon cli synth bin/ccwm-synth` + `web/*` + `scripts/inspect-session-schema.py` + `deny.toml`. Not built yet: `watch activity git claude privacy` (M2/M3).
 
 ## Open items
 See ARCHITECTURE.md §14 (O1–O4).
