@@ -7,7 +7,16 @@ Independent, unofficial tool to discover, track and resume Claude Code projects.
 2. `ARCHITECTURE.md` (modules, data flow, schema, contracts, verified findings), `ROADMAP.md` (checklists + §18 backlog). Keep all three current. §18 items are **not** v0.1.
 
 ## Current status
-**M1 — Foundation: complete (committed locally).** Waiting for the maintainer's go-ahead before M2. Implement only the approved milestone; after it, stop, report, and wait.
+**M1 — Foundation: complete (pushed to `origin/main` by the maintainer).** Waiting for the maintainer's go-ahead before M2. Implement only the approved milestone; after it, stop, report, and wait.
+
+## Session handoff (2026-11-23)
+- **State:** M1 is complete and pushed to `origin/main`. The commit author identity was rewritten to the maintainer's personal identity.
+- **Next:** (1) an independent, adversarial M1 security review: findings ranked by severity, each with file:line, an exploit scenario and a proposed fix, and no code changes; (2) M2, only after the maintainer approves.
+- **Open items:**
+  - `cargo-deny` has not been run yet (not installed), so the `deny.toml` bans are unverified.
+  - Security acceptance test 5: `unshare -rn` is unavailable here (AppArmor). The strace fallback (trace `connect` for the daemon and its children, assert no non-loopback connect) is not built yet.
+  - Waiting on the maintainer for the output of `scripts/inspect-session-schema.py` (the maintainer runs it and pastes the output; the agent never runs it).
+- **Build / test / run (synthetic environment only):** See **Commands** below.
 
 ## Hard rules
 - **Never** push, add remotes, tag, publish, run `sudo`, or run `loginctl enable-linger`. Never write outside this repo except cargo's normal `~/.cargo` cache and `/tmp` synthetic environments. Never modify `~/.claude` or monitored projects.
