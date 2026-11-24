@@ -17,6 +17,15 @@ use std::path::Path;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+/// A temporary directory with mode 0700 regardless of the umask: ccwm refuses group-writable
+/// ancestors that do not belong to the user's private group.
+pub fn tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    fs::set_permissions(t.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    t
+}
+
 /// A port that is only used for Host/Origin/CSP arithmetic in oneshot tests.
 pub const PORT: u16 = 18765;
 pub const START: i64 = 1_800_000_000;
@@ -124,9 +133,17 @@ pub fn code(v: &serde_json::Value) -> &str {
 
 /// Every entry's mode, mtime, ctime, size, inode and (for files) content: for "nothing was modified" checks.
 pub fn snapshot(root: &Path) -> Vec<String> {
+    snapshot_excluding(root, &[])
+}
+
+/// Like [`snapshot`], skipping the subtrees in `skip` (ccwm's own directories, which it writes).
+pub fn snapshot_excluding(root: &Path, skip: &[std::path::PathBuf]) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(p) = stack.pop() {
+        if skip.iter().any(|s| p.starts_with(s)) {
+            continue;
+        }
         let md = fs::symlink_metadata(&p).unwrap();
         out.push(format!(
             "{} mode={:o} mtime={}.{} ctime={} size={} ino={}",

@@ -4,7 +4,7 @@
 //! delivered only **after** the batch transaction has committed. Every command runs in its own
 //! savepoint, so one failing command cannot poison the rest of its batch.
 
-use super::{db_err, open_writer_connection};
+use super::{db_err, open_writer_connection, sort_key};
 use crate::error::{Error, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -14,6 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 
 const CHANNEL_CAPACITY: usize = 1024;
 const MAX_BATCH: usize = 256;
+/// Live browser sessions kept; creating one more revokes the least recently used (L3).
+pub const MAX_LIVE_SESSIONS: usize = 10;
 
 pub type Reply<T> = oneshot::Sender<Result<T>>;
 pub type TokenHash = [u8; 32];
@@ -388,14 +390,7 @@ fn execute(tx: &rusqlite::Transaction<'_>, cmd: Cmd) -> Outcome {
                 .map(|n| n as u64)
                 .map_err(|e| db_err("revoke all", &e))
         }),
-        Cmd::PurgeExpiredSessions { now, reply } => run!(reply, |c| {
-            c.execute(
-                "DELETE FROM auth_sessions WHERE expires_at <= ?1",
-                params![now],
-            )
-            .map(|n| n as u64)
-            .map_err(|e| db_err("purge sessions", &e))
-        }),
+        Cmd::PurgeExpiredSessions { now, reply } => run!(reply, |c| purge_expired(c, now)),
         Cmd::SetMeta { key, value, reply } => run!(reply, |c| {
             c.execute(
                 "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -441,8 +436,8 @@ fn upsert_projects(c: &Connection, batch: &[ProjectUpsert], now: i64) -> Result<
         let id = match existing {
             Some(id) => {
                 c.execute(
-                    "UPDATE projects SET name = ?2, last_seen_at = ?3 WHERE id = ?1",
-                    params![id, p.name, now],
+                    "UPDATE projects SET name = ?2, sort_key = ?3, last_seen_at = ?4 WHERE id = ?1",
+                    params![id, p.name, sort_key(&p.name), now],
                 )
                 .map_err(|e| db_err("update project", &e))?;
                 summary.updated += 1;
@@ -451,8 +446,8 @@ fn upsert_projects(c: &Connection, batch: &[ProjectUpsert], now: i64) -> Result<
             None => {
                 let id = random_id()?;
                 c.execute(
-                    "INSERT INTO projects (id, canonical_path, name, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?4)",
-                    params![id, p.canonical_path, p.name, now],
+                    "INSERT INTO projects (id, canonical_path, name, sort_key, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![id, p.canonical_path, p.name, sort_key(&p.name), now],
                 )
                 .map_err(|e| db_err("insert project", &e))?;
                 summary.inserted += 1;
@@ -468,23 +463,50 @@ fn upsert_projects(c: &Connection, batch: &[ProjectUpsert], now: i64) -> Result<
     Ok(summary)
 }
 
+/// Insert a session after dropping expired ones, then keep only the [`MAX_LIVE_SESSIONS`] most
+/// recently used (the new one counts as just used). Existing sessions are otherwise left alone:
+/// `ccwm open` does not sign out other browsers.
 fn create_session(
     c: &Connection,
     token_hash: TokenHash,
     now: i64,
     expires_at: i64,
 ) -> Result<StoredSession> {
+    purge_expired(c, now)?;
     let id = random_id()?;
     c.execute(
         "INSERT INTO auth_sessions (id, token_hash, created_at, last_used_at, rotated_at, expires_at) VALUES (?1, ?2, ?3, ?3, ?3, ?4)",
         params![id, token_hash.as_slice(), now, expires_at],
     )
     .map_err(|e| db_err("create session", &e))?;
+    c.execute(
+        "DELETE FROM auth_sessions WHERE id NOT IN (
+           SELECT id FROM auth_sessions ORDER BY (id = ?1) DESC, last_used_at DESC, created_at DESC LIMIT ?2)",
+        params![id, MAX_LIVE_SESSIONS as i64],
+    )
+    .map_err(|e| db_err("cap sessions", &e))?;
     Ok(StoredSession {
         id,
         expires_at,
         rotated_at: now,
     })
+}
+
+/// Delete expired sessions and forget previous tokens whose grace window has closed.
+fn purge_expired(c: &Connection, now: i64) -> Result<u64> {
+    let n = c
+        .execute(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?1",
+            params![now],
+        )
+        .map_err(|e| db_err("purge sessions", &e))?;
+    c.execute(
+        "UPDATE auth_sessions SET prev_token_hash = NULL, prev_valid_until = NULL
+         WHERE prev_valid_until IS NOT NULL AND prev_valid_until <= ?1",
+        params![now],
+    )
+    .map_err(|e| db_err("purge previous tokens", &e))?;
+    Ok(n as u64)
 }
 
 fn rotate_session(

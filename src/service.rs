@@ -178,12 +178,7 @@ impl Service {
         let has_more = rows.len() > limit as usize;
         rows.truncate(limit as usize);
         let next_cursor = match (has_more, rows.last()) {
-            (true, Some(last)) => Some(encode_cursor(
-                &v.sort,
-                &v.order,
-                &last.name.to_lowercase(),
-                &last.id,
-            )),
+            (true, Some(last)) => Some(encode_cursor(&v.sort, &v.order, &last.sort_key, &last.id)),
             _ => None,
         };
         Ok(ProjectsPage {

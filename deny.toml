@@ -1,4 +1,6 @@
-# cargo-deny configuration. CI runs `cargo deny check` (M4); run it locally if installed.
+# cargo-deny configuration. CI runs `cargo deny check` (M4). Locally (M1.1, cargo-deny 0.21.0; 0.22 needs
+# rustc 1.95):  cargo install --locked --root target/tools cargo-deny --version 0.21.0
+#               target/tools/bin/cargo-deny check
 # REQUIREMENTS.md §11.5: HTTP/network client crates and DNS resolvers are banned.
 
 [graph]
@@ -7,6 +9,11 @@ targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Known duplicate: proc-macro crates not yet on syn 3 (enumflags2_derive via landlock, tracing-attributes).
+# Build-time only; revisit when they upgrade.
+skip = [
+  { crate = "syn@2.0.119", reason = "enumflags2_derive (landlock) and tracing-attributes still depend on syn 2" },
+]
 deny = [
   { crate = "reqwest", reason = "HTTP client (zero external network communication)" },
   { crate = "ureq", reason = "HTTP client" },
@@ -41,10 +48,8 @@ version = 2
 
 [licenses]
 version = 2
-allow = [
-  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
-  "ISC", "Unicode-3.0", "Unlicense", "Zlib", "CC0-1.0", "MPL-2.0", "0BSD",
-]
+# Exactly the licenses in the dependency tree (cargo deny list); a new one must be reviewed and added.
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0", "Unlicense", "Zlib"]
 
 [sources]
 unknown-registry = "deny"

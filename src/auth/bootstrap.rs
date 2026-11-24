@@ -1,4 +1,4 @@
-//! Single-use bootstrap tokens: in memory only, 60 s lifetime, at most 16 outstanding.
+//! Single-use bootstrap tokens: in memory only, 30 s lifetime, at most 16 outstanding.
 
 use super::tokens::{hash_token, is_well_formed, new_token};
 use crate::api_error::ApiError;
@@ -6,7 +6,7 @@ use crate::clock::Clock;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub const BOOTSTRAP_TTL_SECS: i64 = 60;
+pub const BOOTSTRAP_TTL_SECS: i64 = 30;
 pub const MAX_OUTSTANDING: usize = 16;
 
 pub struct BootstrapStore {
@@ -78,14 +78,15 @@ mod tests {
     }
 
     #[test]
-    fn token_expires_after_60_seconds() {
+    fn token_expires_after_30_seconds() {
+        assert_eq!(BOOTSTRAP_TTL_SECS, 30);
         let (s, clock) = store();
         let t = s.issue().unwrap();
-        clock.advance(59);
+        clock.advance(BOOTSTRAP_TTL_SECS - 1);
         assert!(s.redeem(&t));
         let t = s.issue().unwrap();
-        clock.advance(60);
-        assert!(!s.redeem(&t), "expiry is exclusive at exactly 60 s");
+        clock.advance(BOOTSTRAP_TTL_SECS);
+        assert!(!s.redeem(&t), "expiry is exclusive at exactly 30 s");
         assert_eq!(s.outstanding(), 0, "an expired token is removed on redeem");
     }
 
@@ -117,7 +118,7 @@ mod tests {
         for _ in 0..5 {
             s.issue().unwrap();
         }
-        clock.advance(61);
+        clock.advance(BOOTSTRAP_TTL_SECS + 1);
         s.issue().unwrap();
         assert_eq!(s.outstanding(), 1);
     }

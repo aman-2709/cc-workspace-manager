@@ -6,7 +6,7 @@
 mod common;
 
 use cc_workspace_manager::synth::{self, SynthEnv};
-use common::snapshot;
+use common::{snapshot, snapshot_excluding};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -37,7 +37,14 @@ struct Daemon {
 
 impl Daemon {
     fn start(env: &SynthEnv, extra: &[&str]) -> Self {
+        Self::start_with_env(env, extra, &[])
+    }
+
+    fn start_with_env(env: &SynthEnv, extra: &[&str], vars: &[(&str, &str)]) -> Self {
         let mut c = command(env);
+        for (k, v) in vars {
+            c.env(k, v);
+        }
         c.args(["serve", "--port", "0"])
             .args(extra)
             .stdout(Stdio::null())
@@ -216,6 +223,45 @@ fn http(
     (status, hdrs, body.to_string())
 }
 
+const REQUIRE_LANDLOCK: &str = "CCWM_REQUIRE_LANDLOCK";
+
+fn sandbox_report(env: &SynthEnv) -> serde_json::Value {
+    cc_workspace_manager::client::call(
+        &env.runtime_dir.join("ccwm/ccwm.sock"),
+        nix::unistd::geteuid().as_raw(),
+        "service.status",
+    )
+    .unwrap()["sandbox"]
+        .clone()
+}
+
+/// Every claim the daemon makes about itself, checked exactly (EACCES probes, single thread).
+fn assert_daemon_confined(r: &serde_json::Value) {
+    if r["filesystem"] != true {
+        assert!(
+            std::env::var(REQUIRE_LANDLOCK).as_deref() != Ok("1"),
+            "{REQUIRE_LANDLOCK}=1 but the daemon is not confined: {r}"
+        );
+        eprintln!("NOTICE: Landlock not enforced on this kernel: {r}");
+        return;
+    }
+    assert_eq!(r["status"], "fully_enforced", "{r}");
+    assert_eq!(r["threads_at_apply"], 1, "{r}");
+    assert_eq!(r["thread_probes"]["worker"], "eacces", "{r}");
+    assert_eq!(r["thread_probes"]["blocking"], "eacces", "{r}");
+    assert_eq!(r["no_new_privs"], true, "{r}");
+    assert!(
+        r["network"] == "tcp_only" || r["abi"].as_u64() < Some(4),
+        "{r}"
+    );
+    for u in cc_workspace_manager::sandbox::ALWAYS_UNCONFINED {
+        assert!(
+            r["unconfined"].as_array().unwrap().iter().any(|v| v == u),
+            "{r}"
+        );
+    }
+}
+
 fn names(v: &serde_json::Value) -> Vec<String> {
     v["items"]
         .as_array()
@@ -231,7 +277,7 @@ fn mode(p: &Path) -> u32 {
 
 #[test]
 fn serve_open_browser_flow_security_checks_and_clean_shutdown() {
-    let t = tempfile::tempdir().unwrap();
+    let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 12).unwrap();
     let tree_before = snapshot(&env.home);
     let d = Daemon::start(&env, &[]);
@@ -389,30 +435,15 @@ fn serve_open_browser_flow_security_checks_and_clean_shutdown() {
     assert_eq!(mode(&env.state_home.join("ccwm")), 0o700);
     assert_eq!(mode(&env.config_home.join("ccwm")), 0o700);
 
-    // The sandbox report is visible in the log and over the socket; NoNewPrivs proves Landlock ran.
-    let status = command(&env).args(["open", "--print"]).output().unwrap();
-    assert!(status.status.success());
-    let proc_status = std::fs::read_to_string(format!("/proc/{}/status", d.pid())).unwrap();
-    let report = cc_workspace_manager::client::call(
-        &rt.join("ccwm.sock"),
-        nix::unistd::geteuid().as_raw(),
-        "service.status",
-    )
-    .unwrap();
-    let fs_enforced = report["sandbox"]["filesystem"] == true;
-    if fs_enforced {
-        assert!(
-            proc_status
-                .lines()
-                .any(|l| l.starts_with("NoNewPrivs:") && l.ends_with('1')),
-            "{proc_status}"
-        );
-    } else {
-        eprintln!(
-            "NOTICE: Landlock not enforced on this kernel: {}",
-            report["sandbox"]
-        );
+    // WAL/SHM exist while the daemon runs and are as private as the database.
+    for f in ["ccwm.db-wal", "ccwm.db-shm"] {
+        assert_eq!(mode(&env.data_home.join("ccwm").join(f)), 0o600, "{f}");
     }
+
+    // Test 11 in the real daemon: the report comes from the daemon's own daemon_policy(), and its
+    // worker and blocking-pool threads were probed after the runtime started.
+    let report = sandbox_report(&env);
+    assert_daemon_confined(&report);
     assert!(d.log.lock().unwrap().contains("landlock"));
 
     // Graceful shutdown: exit 0, runtime files removed.
@@ -433,7 +464,7 @@ fn serve_open_browser_flow_security_checks_and_clean_shutdown() {
 
 #[test]
 fn restart_serves_cached_projects_even_when_the_tree_is_gone() {
-    let t = tempfile::tempdir().unwrap();
+    let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 5).unwrap();
     let first = Daemon::start(&env, &[]);
     let s1 = first.login(&env);
@@ -465,7 +496,7 @@ fn restart_serves_cached_projects_even_when_the_tree_is_gone() {
 
 #[test]
 fn a_second_daemon_in_the_same_environment_refuses_to_start() {
-    let t = tempfile::tempdir().unwrap();
+    let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 0).unwrap();
     let d = Daemon::start(&env, &[]);
     let out = command(&env)
@@ -486,7 +517,7 @@ fn a_second_daemon_in_the_same_environment_refuses_to_start() {
 
 #[test]
 fn port_collision_fails_fast_with_a_clear_message() {
-    let t = tempfile::tempdir().unwrap();
+    let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 0).unwrap();
     let blocker = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = blocker.local_addr().unwrap().port();
@@ -504,7 +535,7 @@ fn port_collision_fails_fast_with_a_clear_message() {
 
 #[test]
 fn open_refuses_an_impostor_tcp_listener_and_sends_it_nothing() {
-    let t = tempfile::tempdir().unwrap();
+    let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 0).unwrap();
     // No daemon. An impostor listens on a port and even leaves a fake instance.json pointing at it.
     let impostor = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -537,7 +568,7 @@ fn open_refuses_an_impostor_tcp_listener_and_sends_it_nothing() {
 
 #[test]
 fn open_without_any_runtime_directory_explains_how_to_start_the_daemon() {
-    let t = tempfile::tempdir().unwrap();
+    let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 0).unwrap();
     let out = command(&env).args(["open"]).output().unwrap();
     assert!(!out.status.success());
@@ -550,7 +581,7 @@ fn open_without_any_runtime_directory_explains_how_to_start_the_daemon() {
 
 #[test]
 fn serve_refuses_unsafe_directories() {
-    let t = tempfile::tempdir().unwrap();
+    let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 0).unwrap();
     let data = env.data_home.join("ccwm");
     std::fs::create_dir(&data).unwrap();
@@ -571,7 +602,7 @@ fn serve_refuses_unsafe_directories() {
 
 #[test]
 fn serve_rejects_bad_config_and_bad_port_arguments() {
-    let t = tempfile::tempdir().unwrap();
+    let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 0).unwrap();
     let cfg = t.path().join("bad.toml");
     std::fs::write(&cfg, "[server]\nprot = 1\n").unwrap();
@@ -591,7 +622,7 @@ fn serve_rejects_bad_config_and_bad_port_arguments() {
 
 #[test]
 fn explicit_roots_in_the_config_are_honoured() {
-    let t = tempfile::tempdir().unwrap();
+    let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 0).unwrap();
     let only = env.home.join("dev/alpha");
     let cfg = t.path().join("c.toml");
@@ -605,6 +636,226 @@ fn explicit_roots_in_the_config_are_honoured() {
     d.wait_scan_done(&s);
     let page = d.get_json(&s, "/api/v1/projects");
     assert_eq!(names(&page), [only.to_str().unwrap().to_string()]);
+    assert_eq!(d.stop().0, Some(0));
+}
+
+/// All project paths, following the cursor.
+fn all_paths(d: &Daemon, session: &str) -> Vec<String> {
+    let mut all = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let page = d.get_json(session, &format!("/api/v1/projects?limit=7{cursor}"));
+        all.extend(names(&page));
+        match page["next_cursor"].as_str() {
+            Some(c) => cursor = format!("&cursor={c}"),
+            None => break,
+        }
+    }
+    all.sort();
+    all
+}
+
+fn expected_paths(env: &SynthEnv, bulk: usize) -> Vec<String> {
+    let home = env.home.to_str().unwrap();
+    let mut v: Vec<String> = env
+        .expected_projects(bulk)
+        .iter()
+        .map(|p| format!("{home}/{p}"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Tests 1, 7 and L7 in the layout the real defaults produce: ccwm's XDG directories (and the Claude
+/// config directory) inside the walked home, under non-hidden names so only the hard boundaries keep
+/// discovery out. Runs at CCWM_LOG=trace: no token may reach the log at any level (8-lite).
+#[test]
+fn xdg_and_claude_dirs_inside_home_are_never_walked_and_trace_logs_hold_no_secrets() {
+    let t = common::tempdir();
+    let env = synth::generate_with(&t.path().join("e"), 4, synth::Layout::InsideHome).unwrap();
+    let skip = env.ccwm_dirs().to_vec();
+    let before = snapshot_excluding(&env.home, &skip);
+    let d = Daemon::start_with_env(&env, &[], &[("CCWM_LOG", "trace")]);
+    let url = d.open_url(&env);
+    let bootstrap = url.split("#bt=").nth(1).unwrap().to_string();
+    let origin = d.origin();
+    let (s, _, body) = d.http(
+        "POST",
+        "/api/v1/auth/exchange",
+        &[("Origin", &origin), ("Content-Type", "application/json")],
+        &format!(r#"{{"bootstrap_token":"{bootstrap}"}}"#),
+    );
+    assert_eq!(s, 200, "{body}");
+    let session = serde_json::from_str::<serde_json::Value>(&body).unwrap()["session_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    d.wait_scan_done(&session);
+    assert_eq!(
+        all_paths(&d, &session),
+        expected_paths(&env, 4),
+        "ccwm's own directories and the Claude config directory are hard boundaries"
+    );
+    let (s, _, b) = d.http(
+        "POST",
+        "/api/v1/auth/rotate",
+        &[
+            ("Origin", &origin),
+            ("Authorization", &format!("Bearer {session}")),
+        ],
+        "",
+    );
+    assert_eq!(s, 200, "{b}");
+    let rotated = serde_json::from_str::<serde_json::Value>(&b).unwrap()["session_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_daemon_confined(&sandbox_report(&env));
+    let (code, log) = d.stop();
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("tcp peer check") && log.contains("socket request"),
+        "debug/trace events were not logged:\n{log}"
+    );
+    for secret in [&bootstrap, &session, &rotated] {
+        assert!(
+            !log.contains(secret.as_str()),
+            "a token reached the trace log"
+        );
+    }
+    assert_eq!(
+        snapshot_excluding(&env.home, &skip),
+        before,
+        "ccwm modified something outside its own directories"
+    );
+}
+
+/// L4 / test 7: XDG variables and the config path must not let another user steer the daemon.
+#[test]
+fn untrusted_xdg_directories_and_config_files_are_refused() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 0).unwrap();
+    let refused = |c: &mut Command| {
+        let out = c.output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    // A world-writable XDG_DATA_HOME: another user could swap ccwm's data directory.
+    let open_dir = t.path().join("world");
+    std::fs::create_dir(&open_dir).unwrap();
+    std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let err = refused(
+        command(&env)
+            .env("XDG_DATA_HOME", &open_dir)
+            .args(["serve", "--port", "0"]),
+    );
+    assert!(err.contains("other users"), "{err}");
+    assert!(!open_dir.join("ccwm").exists(), "nothing was created there");
+
+    // A world-writable config file, and a trusted-looking path whose directory is world-writable.
+    let cfg = t.path().join("c.toml");
+    std::fs::write(&cfg, "[server]\nport = 0\n").unwrap();
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let err = refused(command(&env).args(["serve", "--config", cfg.to_str().unwrap()]));
+    assert!(err.contains("untrusted config"), "{err}");
+    let inner = open_dir.join("c.toml");
+    std::fs::write(&inner, "[server]\nport = 0\n").unwrap();
+    std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let err = refused(command(&env).args(["serve", "--config", inner.to_str().unwrap()]));
+    assert!(err.contains("untrusted config"), "{err}");
+    // A symlinked config whose target lives in the world-writable directory.
+    let link = t.path().join("link.toml");
+    std::os::unix::fs::symlink(&inner, &link).unwrap();
+    let err = refused(command(&env).args(["serve", "--config", link.to_str().unwrap()]));
+    assert!(err.contains("untrusted config"), "{err}");
+    // A directory or FIFO is not a config file.
+    let fifo = t.path().join("fifo.toml");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    let err = refused(command(&env).args(["serve", "--config", fifo.to_str().unwrap()]));
+    assert!(err.contains("regular file"), "{err}");
+}
+
+/// M2: a --config elsewhere adds no read rule; a root that is an ancestor of home is flagged.
+#[test]
+fn broad_read_rules_are_reported_and_the_config_directory_is_not_granted() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 0).unwrap();
+    let cfg_dir = t.path().join("cfg");
+    std::fs::DirBuilder::new()
+        .mode_700()
+        .create(&cfg_dir)
+        .unwrap();
+    let cfg = cfg_dir.join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[discovery]\nroots = [\"{}\"]\n",
+            env.home.join("dev/alpha").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let d = Daemon::start(&env, &["--config", cfg.to_str().unwrap()]);
+    let r = sandbox_report(&env);
+    assert_eq!(r["broad_read_rules"], serde_json::json!([]), "{r}");
+    assert_daemon_confined(&r);
+    assert_eq!(d.stop().0, Some(0));
+
+    std::fs::write(
+        &cfg,
+        format!("[discovery]\nroots = [\"{}\"]\n", env.root.display()),
+    )
+    .unwrap();
+    let d = Daemon::start(&env, &["--config", cfg.to_str().unwrap()]);
+    let r = sandbox_report(&env);
+    let want = std::fs::canonicalize(&env.root).unwrap();
+    assert_eq!(r["broad_read_rules"], serde_json::json!([want]), "{r}");
+    assert!(
+        r["notes"].to_string().contains("ancestor of the home"),
+        "{r}"
+    );
+    assert_eq!(d.stop().0, Some(0));
+}
+
+/// L5: with every TCP connection slot held by idle clients, the CLI channel still works and the
+/// excess client waits in the kernel backlog instead of costing the daemon a file descriptor.
+#[test]
+fn the_unix_socket_stays_usable_while_tcp_connections_are_saturated() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 0).unwrap();
+    let d = Daemon::start(&env, &[]);
+    let fds_before = std::fs::read_dir(format!("/proc/{}/fd", d.pid()))
+        .unwrap()
+        .count();
+    let idle: Vec<TcpStream> = (0..cc_workspace_manager::http::MAX_CONNECTIONS + 20)
+        .map(|_| TcpStream::connect(("127.0.0.1", d.port)).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let url = d.open_url(&env);
+    assert!(url.contains("#bt="), "{url}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the CLI was slowed down"
+    );
+    let fds_during = std::fs::read_dir(format!("/proc/{}/fd", d.pid()))
+        .unwrap()
+        .count();
+    assert!(
+        fds_during <= fds_before + cc_workspace_manager::http::MAX_CONNECTIONS + 2,
+        "TCP clients beyond the cap must not hold descriptors: {fds_before} -> {fds_during}"
+    );
+    drop(idle);
+    // Slots are released: a normal request works again.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if d.http("GET", "/api/v1/health", &[], "").0 == 200 {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(d.stop().0, Some(0));
 }
 

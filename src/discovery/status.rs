@@ -18,6 +18,8 @@ pub struct Skipped {
     pub excluded: u64,
     pub non_utf8: u64,
     pub rejected_markers: u64,
+    /// A directory changed between being listed and being opened (e.g. swapped for a symlink).
+    pub changed: u64,
     pub other: u64,
 }
 

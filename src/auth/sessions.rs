@@ -1,5 +1,7 @@
 //! Browser sessions: 32-byte bearer tokens stored only as SHA-256 digests, sliding 30-day expiry,
 //! rotation (new token now, old token honoured for a 60 s grace window), logout and revoke-all.
+//! Rotation is enforced: once a token is overdue (more than 24 h + 60 s since the session last
+//! rotated), it is accepted **only** by `rotate` (M1.1, finding L1).
 
 use super::tokens::{digests_equal, hash_token, is_well_formed, new_token};
 use crate::api_error::ApiError;
@@ -13,6 +15,9 @@ use std::sync::Arc;
 pub const SESSION_TTL_SECS: i64 = 30 * 24 * 3600;
 pub const ROTATE_AFTER_SECS: i64 = 24 * 3600;
 pub const ROTATION_GRACE_SECS: i64 = 60;
+/// After `rotate_after`, a client gets this long (it checks just before sending) before the token
+/// is restricted to `rotate`.
+pub const ROTATION_OVERDUE_SLACK_SECS: i64 = 60;
 /// The sliding expiry is persisted at most this often per session.
 pub const TOUCH_INTERVAL_SECS: i64 = 300;
 
@@ -60,8 +65,18 @@ impl Sessions {
         })
     }
 
-    /// Resolve a bearer token. Every failure is the same `Unauthorized`.
+    /// Resolve a bearer token for ordinary use. Every failure is the same `Unauthorized`,
+    /// including a token whose rotation is overdue.
     pub async fn authenticate(&self, token: &str) -> Result<AuthedSession, ApiError> {
+        let (authed, overdue) = self.lookup(token).await?;
+        if overdue {
+            return Err(ApiError::unauthorized());
+        }
+        Ok(authed)
+    }
+
+    /// Resolve a token without the rotation check; also says whether rotation is overdue.
+    async fn lookup(&self, token: &str) -> Result<(AuthedSession, bool), ApiError> {
         if !is_well_formed(token) {
             return Err(ApiError::unauthorized());
         }
@@ -79,16 +94,21 @@ impl Sessions {
             self.writer
                 .touch_session(rec.id.clone(), now, now + SESSION_TTL_SECS);
         }
-        Ok(AuthedSession {
-            id: rec.id,
-            token_hash: hash,
-            via_previous: rec.via_previous,
-        })
+        let overdue = now >= rec.rotated_at + ROTATE_AFTER_SECS + ROTATION_OVERDUE_SLACK_SECS;
+        Ok((
+            AuthedSession {
+                id: rec.id,
+                token_hash: hash,
+                via_previous: rec.via_previous,
+            },
+            overdue,
+        ))
     }
 
     /// Issue a new token for the session; the presented (current) token stays valid for 60 s more.
+    /// The only operation an overdue token may perform.
     pub async fn rotate(&self, token: &str) -> Result<IssuedSession, ApiError> {
-        let authed = self.authenticate(token).await?;
+        let (authed, _overdue) = self.lookup(token).await?;
         if authed.via_previous {
             return Err(ApiError::unauthorized()); // only the current token may rotate
         }

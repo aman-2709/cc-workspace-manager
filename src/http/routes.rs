@@ -1,6 +1,6 @@
 //! HTTP handlers. Each is a thin adapter over [`crate::service::Service`].
 
-use super::extract::{ApiJson, ApiQuery, SessionAuth};
+use super::extract::{ApiJson, ApiQuery, Bearer, SessionAuth};
 use super::AppState;
 use crate::api_error::ApiError;
 use crate::auth::sessions::IssuedSession;
@@ -31,8 +31,9 @@ pub async fn exchange(
     Ok(Json(s.service.auth_exchange(&body.bootstrap_token).await?))
 }
 
-pub async fn rotate(State(s): St, auth: SessionAuth) -> Result<Json<IssuedSession>, ApiError> {
-    Ok(Json(s.service.auth_rotate(&auth.token).await?))
+/// The service authenticates here itself: an overdue token is accepted for rotation only.
+pub async fn rotate(State(s): St, bearer: Bearer) -> Result<Json<IssuedSession>, ApiError> {
+    Ok(Json(s.service.auth_rotate(&bearer.token).await?))
 }
 
 pub async fn logout(State(s): St, auth: SessionAuth) -> Result<StatusCode, ApiError> {

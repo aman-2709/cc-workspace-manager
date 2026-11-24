@@ -20,7 +20,7 @@ has run it (see `ROADMAP.md`).
 | `unshare -rn` | **fails** (`apparmor_restrict_unprivileged_userns=1`) ⇒ security acceptance test 5 is skipped on this host |
 | inotify | `max_user_watches=65536` ⇒ default budget `min(8192, 25 %)` = 8192; `max_user_instances=128` with ≥109 already used by other processes ⇒ ccwm uses exactly one instance |
 | Env | uid 1000; `XDG_RUNTIME_DIR=/run/user/1000`; other XDG vars unset; `CLAUDE_CONFIG_DIR` unset |
-| Not installed (maintainer installing) | `cargo-deny`, `musl-tools` |
+| Not installed | `musl-tools`; `cargo-deny` is not installed system-wide (M1.1 installs 0.21.0 into the ignored `target/tools/` to run it — 0.22 needs rustc 1.95) |
 
 ---
 
@@ -36,17 +36,20 @@ src/
   exit.rs         # exit-code constants (M1: OK, ERROR, USAGE; M4 adds PORT_IN_USE, ALREADY_RUNNING)
   cli.rs          # clap definitions (+ unofficial notice in --help)
   client.rs       # M1: `open` -> Unix-socket client (peer verification, JSON lines). No HTTP client.
-  paths.rs        # M1: Dirs{config,data,state,runtime}; XDG + fallbacks; 0700 creation + owner/mode verification; home = owned `$HOME`, else passwd
+  paths.rs        # M1: Dirs{config,data,state,runtime}; XDG + fallbacks; 0700 creation + owner/mode verification; home = owned `$HOME`, else passwd;
+                  #     M1.1: session_dir (CLAUDE_CONFIG_DIR), Owner::verify_trusted (config file + every ancestor), runtime file-name constants
   config.rs       # M1: config.toml model (serde, deny_unknown_fields), defaults, validation
   clock.rs        # M1: Clock trait (System / Fake)
-  sandbox.rs      # M1: Landlock policy, apply(), SandboxReport (what is actually active)
+  sandbox.rs      # M1: Landlock policy, apply(), SandboxReport (what is actually active);
+                  #     M1.1: scopes, single-thread check, thread probes, broad-read flags, child_command() (IPC env scrub)
   instance.rs     # M1: flock + instance.json
   db/             # M1: mod (open, pragmas, migrations), writer.rs (1 thread), reader.rs (RO pool), queries.rs
-  discovery/      # M1: exclusions.rs, mounts.rs (/proc/self/mountinfo), walk.rs (own DFS), status.rs
+  discovery/      # M1: exclusions.rs, mounts.rs (/proc/self/mountinfo), walk.rs (own DFS), status.rs; M1.1: dirfd.rs (fd-based opens)
   auth/           # M1: tokens.rs (CSPRNG, SHA-256, ct-compare, Bootstrap store), sessions.rs
   service.rs      # M1: THE service layer: bootstrap, exchange, rotate, logout, revoke_all, list_projects, stats, discovery_status, service_status
   ipc/            # M1: server.rs (accept loop, SO_PEERCRED, JSON lines) + protocol.rs (Request/Response enums)
-  http/           # M1: mod (router, state), middleware.rs, extract.rs (ApiJson/ApiQuery/SessionAuth), error.rs, routes.rs, assets.rs
+  http/           # M1: mod (router, state, serve loop), middleware.rs, extract.rs (ApiJson/ApiQuery/Bearer/SessionAuth), error.rs, routes.rs, assets.rs;
+                  #     M1.1: peer.rs (TCP peer UID via /proc/net/tcp{,6})
   synth.rs        # M1: synthetic environment generator (feature `synth`; also used by tests)
   bin/ccwm-synth.rs   # M1: CLI for the generator (required-features = ["synth"])
   watch/ activity/ git/        # M2   (git/ is the only module that spawns `git`)
@@ -57,7 +60,7 @@ tests/ …                       # integration tests; tests/fixtures/** reviewed
 deny.toml                      # bans HTTP-client/DNS crates (§11.5); CI in M4, runnable locally once cargo-deny is installed
 ```
 
-Hard rules: only `git/` spawns git; only `claude/` knows session formats; only `db/writer.rs` writes SQLite;
+Hard rules: only `git/` spawns git; every daemon child is built with `sandbox::child_command`; only `claude/` knows session formats; only `db/writer.rs` writes SQLite;
 no `rusqlite` call runs on a Tokio worker; every queue is bounded; HTTP handlers and Unix-socket ops call
 `service.rs` — no business logic lives in a transport.
 
@@ -96,13 +99,13 @@ Solid = M1. The CLI never uses TCP and never reads a token file; the browser nev
 
 ### Start sequence (`ccwm serve`)
 1. Refuse if `geteuid()==0`. `umask(0o077)`. Parse args/config path.
-2. Resolve dirs (`paths.rs`); create each `0700`; any existing dir must be owned by the euid and not group/world accessible, else fail (never silently `chmod` something we did not create).
-3. Load `config.toml` (absent ⇒ defaults); compute discovery roots (config or passwd home) and the session dir.
-4. **Apply Landlock now, on the main thread, before the Tokio runtime or any other thread exists** (`landlock_restrict_self` confines only the calling thread and its future children; threads created earlier would stay unconfined). Log the `SandboxReport`.
-5. Build the Tokio runtime. Take the `flock` (lock file in the runtime dir). Open SQLite (`temp_store=MEMORY` so no temp files are needed under the sandbox), migrate, spawn writer + reader pool.
+2. Resolve dirs (`paths.rs`); every **ancestor** must be trusted (`Owner::verify_trusted`: owned by the user or root, not writable by others except a root-owned sticky dir or the user's private group); create each `0700`; any existing dir must be owned by the euid and not group/world accessible, else fail (never silently `chmod` something we did not create).
+3. Load `config.toml` (absent ⇒ defaults; present ⇒ the file and its ancestors must be trusted too); compute discovery roots (config or home) and the session dir (`CLAUDE_CONFIG_DIR` if absolute, else `~/.claude`).
+4. **Apply Landlock now, on the main thread, before the Tokio runtime or any other thread exists** (`landlock_restrict_self` confines only the calling thread and its future children; threads created earlier would stay unconfined). `apply` counts `/proc/self/task` first: ≠ 1 ⇒ the report claims nothing. Flag broad read rules.
+5. Build the Tokio runtime; probe a worker and a blocking-pool thread (read of `/` must fail with `EACCES`); log the `SandboxReport`. Take the `flock` (lock file in the runtime dir). Open SQLite (`temp_store=MEMORY` so no temp files are needed under the sandbox), migrate, spawn writer + reader pool.
 6. Bind TCP `127.0.0.1:port` (failure ⇒ clear message naming the port; exit 1 in M1, dedicated code in M4) and the Unix socket (remove a stale socket only if it is a socket we own; the lock proves no live daemon).
 7. Write `instance.json` (pid, port, version, started_at; atomic rename).
-8. Spawn discovery (background) and serve. Cached projects are readable immediately.
+8. Spawn discovery (background), the hourly session purge, and serve. Cached projects are readable immediately.
 9. SIGTERM/SIGINT: stop accepting → cancel discovery → writer `Flush` + join → remove socket and `instance.json` → exit 0.
 
 ---
@@ -116,9 +119,10 @@ banned (§11.5).**
 
 | Crate | Why |
 |---|---|
-| `nix` (`fs`,`user`,`process`,`signal`,`socket`) | `flock`, `geteuid`, passwd lookup (`getpwuid_r`), `umask`, `SO_PEERCRED` on the CLI side, `killpg` (M2) |
+| `nix` (`dir`,`fs`,`user`,`process`,`signal`,`socket`) | `flock`, `geteuid`, passwd/group lookup, `umask`, `SO_PEERCRED` on the CLI side, `killpg` (M2); M1.1: `openat`/`openat2`/`fstatat`/`Dir` for the fd-based walk (`dir` feature: same crate) |
 | `sha2`, `subtle`, `getrandom`, `base64` | token hashing, constant-time compare, OS CSPRNG, URL-safe token/cursor encoding |
 | `landlock` | §11.5 sandbox |
+| `hyper` (`server`,`http1`), `hyper-util` (`tokio`,`service`) — M1.1 | already in the tree through axum with exactly these features (no new crate): the serve loop needs hyper's http1 builder for the header-read timeout, which `axum::serve` does not expose |
 | `ignore` (`gitignore` module only in M1) | user exclusion patterns with gitignore syntax; gitignore matching in M2 |
 | dev: `tempfile` | temp dirs/repos |
 
@@ -160,6 +164,15 @@ CREATE TABLE auth_sessions (
   created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL, rotated_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL);        -- sliding 30 days, bumped at most every 5 min
 ```
+### Migration 2 (M1.1)
+`projects.sort_key TEXT NOT NULL` (computed in Rust by `db::sort_key` = Unicode `to_lowercase`, backfilled
+for existing rows by a Rust step inside the migration transaction); index `(sort_key, id)` replaces
+`(lower(name), id)`; index `auth_sessions (last_used_at, created_at)` for the LRU cap. Keyset cursors
+carry the stored `sort_key`, so SQL and Rust can never disagree (L8).
+
+**Sessions (M1.1):** creating a session first purges expired ones, then keeps the 10 most recently used
+(the new one always kept). `PurgeExpiredSessions` also clears previous-token hashes whose grace has ended.
+
 Later: **M2** `ignored_paths`, `file_events`, `git_cache`, activity/missing/monitoring columns, sort indexes;
 **M3** `sessions` (aggregates only: min/max timestamps, first/last cwd, title, `is_sidechain`) and
 `session_file_checkpoints`; prompt text only if the opt-in "Store prompt text" is on. No per-record table.
@@ -191,20 +204,28 @@ same_file_system = true
 
 ## 7. M1 discovery
 
-Own iterative DFS over `std::fs::read_dir` inside `spawn_blocking` (not `ignore::Walk`: it hides
+Own iterative DFS (descriptor-based since M1.1, `discovery/dirfd.rs`) inside `spawn_blocking` (not `ignore::Walk`: it hides
 `.git`, yields files interleaved with sub-directories — which makes "is my ancestor a project?" order-dependent —
 and cannot compare exact entry names without extra work).
 
-1. Roots: configured or home; each canonicalized; must be a readable directory; rejected if inside a hard boundary (`/proc /sys /dev /run`, ccwm config/data/state/**runtime**). Bad roots are reported, never fatal.
-2. Per directory: `read_dir`; **marker** = an entry named exactly `CLAUDE.md` that is a file, or a symlink whose canonical target is a regular file under the canonical directory (anything else is counted as `rejected_markers`). No file contents are read in M1.
+1. Roots: configured or home; each canonicalized; must be a readable directory; rejected if inside a hard boundary (`/proc /sys /dev /run`, ccwm config/data/state/**runtime**, and Claude Code's config directory — hidden or not, M1.1 L7). Bad roots are reported, never fatal.
+2. Per directory: open it with `openat(parent_fd, name, O_DIRECTORY|O_NOFOLLOW)` and require `fstat` (dev, ino) to equal what the parent's listing showed (else `skipped.changed`); read entries from that descriptor; **marker** = an entry named exactly `CLAUDE.md` that is a regular file, or a symlink that `openat2(dir_fd, …, O_PATH, RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS)` resolves to a regular file (fallback without `openat2`: component-by-component `O_NOFOLLOW` walk, rejecting absolute targets, `..` and nested links); anything else is `rejected_markers`. No file contents are read in M1. Open descriptors are bounded by the depth (each directory's fd lives while its children are pending).
 3. **Nested rule** (preorder, so ancestors are known): a marker directory B becomes a project unless a registered ancestor A exists and `symlink_metadata(B/.git)` is absent (then B's marker is "a nested instruction file of A"). The home directory itself is never registered.
 4. Descend into subdirectories (real directories only; symlinks never followed) in name order **unless**: hidden (`.*`), default-excluded (`node_modules target build dist venv __pycache__ snap`[home only] `VirtualBox VMs`), user-excluded (gitignore patterns), a FUSE mount point (type `fuse*` from `/proc/self/mountinfo`), on another device (`same_file_system`), under a hard boundary, deeper than `max_depth`, or **not valid UTF-8** (counted). Pruning happens before descending.
-5. Candidates stream to the writer in batches (≤64 or 250 ms), keyed by canonical path (existing rows keep their `id`). Counters (dirs visited, projects found, skipped: permission / vanished / excluded / non_utf8 / rejected_markers / other) update `DiscoveryStatus`. Errors never abort the walk; user-visible samples show only `…/<last two components>`.
+5. Candidates stream to the writer in batches (≤64 or 250 ms), keyed by canonical path (existing rows keep their `id`). Counters (dirs visited, projects found, skipped: permission / vanished / excluded / non_utf8 / rejected_markers / changed / other) update `DiscoveryStatus`. Errors never abort the walk; user-visible samples show only `…/<last two components>`.
 6. Phases `idle → scanning → idle`; `last_success_at` persisted in `meta`. M1 scans once at startup; vanished projects are **not** removed in M1 (missing state is M2).
 
 ---
 
 ## 8. API and IPC contracts
+
+### Connection handling (M1.1)
+`http::serve` (hyper http1, not `axum::serve`): take one of 64 slots **before** `accept`; on accept,
+look up the client socket's owner in `/proc/net/tcp{,6}` (row with local = client address, remote =
+our address; v4-mapped v6 canonicalized; TIME_WAIT rows ignored; exactly one distinct owner required)
+on the blocking pool; serve only if it equals the daemon's euid, else close without reading (rejections
+logged at most once a minute). Then hyper http1 with `header_read_timeout = 10 s` and upgrades.
+Shutdown: stop accepting, `graceful_shutdown` every connection, wait at most 5 s.
 
 ### HTTP pipeline (every response, in this order)
 1. **Security headers** (outermost, so error responses carry them): `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`, the §11.3 CSP; `Cache-Control: no-store` on `/api`.
@@ -222,12 +243,14 @@ Errors: `{"error":{"code":"…","message":"…"}}` — codes `invalid_argument 4
 |---|---|---|
 | `GET /health` | Public | `{"status":"ok","version":"0.1.0"}` — never proof of identity |
 | `POST /auth/exchange` | Public + Origin | `{"bootstrap_token"}` → `{"session_token","expires_at","rotate_after"}`; bad/used/expired ⇒ identical 401 |
-| `POST /auth/rotate` | Session | → new `session_token` (+ times); the old token stays valid 60 s |
+| `POST /auth/rotate` | Bearer (authenticated by the service; the only route an overdue token may use) | → new `session_token` (+ times); the old token stays valid 60 s |
 | `POST /auth/logout` | Session | revokes the session → 204 |
 | `GET /projects` | Session | `q`, `sort` (`activity`\|`name`), `order`, `limit` 1–200 (default 50), `cursor` → `{"items":[{"id","name","path","sources","first_seen_at"}],"next_cursor","total"}`. In M1 `activity` has no timestamps, so (unknown sorts last, ties by name) it equals name order. Other §12 filters arrive with their milestone and are rejected as unknown until then. |
 | `GET /stats` | Session | `{"total_projects":n}`; later milestones add fields — unknown values are never emitted as `0` |
 | `GET /discovery/status` | Session | `{"phase","dirs_visited","projects_found","skipped":{…},"roots":[{"path","state"}],"last_success_at","next_scan_at"}` |
-| `GET /service/status` | Session | M1 subset: `version`, `uptime_s`, `port`, `sandbox{abi,status,filesystem,network,notes}`, `discovery{phase,last_success_at}` |
+| `GET /service/status` | Session | M1 subset: `version`, `uptime_s`, `port`, `sandbox{abi,status,filesystem,network:"tcp_only"\|"none",abstract_unix_socket,signal,no_new_privs,threads_at_apply,thread_probes{worker,blocking},broad_read_rules[],unconfined[],notes[]}`, `discovery{phase,last_success_at}` |
+
+"Session" = a valid token whose rotation is not overdue (rotated within 24 h + 60 s).
 
 Keyset cursors: base64url JSON `{s,o,k,i}`; a cursor whose `s`/`o` differ from the request, or is malformed, ⇒ 400.
 
@@ -240,14 +263,14 @@ owned by the user, verified; socket `0600`; path must be ≤ 107 bytes or startu
 
 ```
 {"op":"ping"}                → {"ok":{"version":"0.1.0"}}
-{"op":"auth.bootstrap"}      → {"ok":{"bootstrap_token":"…","expires_in":60,"port":8765}}
+{"op":"auth.bootstrap"}      → {"ok":{"bootstrap_token":"…","expires_in":30,"port":8765}}
 {"op":"auth.revoke_all"}     → {"ok":{"revoked":3}}
 {"op":"service.status"}      → {"ok":{…same body as GET /service/status…}}
 errors                       → {"error":{"code":"…","message":"…"}}   (same codes as HTTP)
 ```
 `ccwm open` uses `auth.bootstrap` only; the URL's port comes from the daemon, not from `instance.json` or a TCP
 probe, so an impostor on the TCP port receives nothing. Bootstrap tokens live in memory only: 32 random bytes,
-single-use, 60 s, ≤16 outstanding.
+single-use, 30 s, ≤16 outstanding.
 
 ---
 
@@ -258,19 +281,28 @@ active (never what was requested).
 
 | Access | Paths |
 |---|---|
-| read + execute | discovery roots; Claude session dir (`CLAUDE_CONFIG_DIR` or `~/.claude`); `/usr`, `/etc`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/proc` (inotify limits, mountinfo); the `--config` file's directory |
+| read + execute | discovery roots; Claude session dir (`CLAUDE_CONFIG_DIR` or `~/.claude`); `/usr`, `/etc`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/proc` (inotify limits, mountinfo, `net/tcp`). **Not** the `--config` file's directory (M1.1: the config is read before `apply`) |
 | read + write (create/remove/truncate/make-sock) | ccwm config, data, state, runtime dirs |
 | read + write file | `/dev/null` only |
-| network (ABI ≥ 4) | all TCP `connect` denied; `bind` allowed only on the configured port |
+| network (ABI ≥ 4) | all TCP `connect` denied; `bind` allowed only on the configured port — reported as `network: "tcp_only"` |
+| scopes (ABI ≥ 6) | abstract Unix sockets and signals cannot reach processes outside the domain |
+| **not confined** | UDP and other non-TCP families; `connect()` on path-based Unix sockets (`ResolveUnix` exists only from ABI 9, not requested in v0.1); listed in `unconfined[]`. Mitigation: `sandbox::child_command` drops `DBUS_*`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, display/agent/systemd IPC variables from every child's environment. Seccomp `socket()` deny: M4 |
 
-`SandboxReport {abi, status: Full|Partial|NotEnforced, filesystem: bool, network: bool, notes[]}` goes to the
-startup log and `service.status`. Child processes inherit the ruleset. Known consequences: roots added at
+`SandboxReport {abi, status, filesystem, network, abstract_unix_socket, signal, no_new_privs, threads_at_apply,
+thread_probes{worker,blocking}, broad_read_rules[], unconfined[], notes[]}` goes to the startup log and
+`service.status`. If `/proc/self/task` ≠ 1 entry at `apply`, or a thread probe is not `eacces`, every claim
+is withdrawn (`not_enforced`). Child processes inherit the ruleset. Known consequences: roots added at
 runtime (M3 settings) outside the startup read set cannot be read until restart — reported as "requires
 restart" (**Open**, M3); `claude` located outside the allowed system paths cannot be executed (M3).
-**Verified in M1 tests:** self-re-exec child applies the policy and asserts a write outside the ccwm dirs, an
-outbound TCP connect, and the same from a spawned `/bin/sh` child are all denied, while writes inside, bind on
-the allowed port and Unix-socket serving still work. The Git-subprocess variant of test 11 lands with the Git
-module (M2).
+**Verified in tests (M1.1):** `tests/sandbox.rs` has its own `main` (`harness = false`, because libtest runs
+tests on threads); its re-executed child applies the **real** `daemon_policy()` single-threaded and checks
+errnos exactly: writes/reads outside ⇒ `EACCES`, TCP connect and binds to other ports ⇒ `EACCES`, abstract
+Unix connect and signals to the parent ⇒ `EPERM`, a thread spawned later and grandchild processes are
+confined, a path-based Unix connect outside **succeeds** (documented residual), a second thread at `apply`
+time ⇒ `not_enforced`, and `child_command` children see no IPC variables. `tests/process.rs` checks the
+real daemon's report (`fully_enforced`, `threads_at_apply = 1`, both thread probes `eacces`).
+`CCWM_REQUIRE_LANDLOCK=1` turns "Landlock unavailable" into a failure. The Git-subprocess variant of test
+11 lands with the Git module (M2).
 
 ---
 
@@ -279,7 +311,7 @@ module (M2).
 - **Unit:** exclusions & hard boundaries; mountinfo parsing (incl. `\040`); marker rules (case, dir named `CLAUDE.md`, symlink in/out/dangling/loop); nested resolution; non-UTF-8 skip; `max_depth`; symlinked dirs not followed; `same_file_system` (best effort: needs a second device; skipped with notice); paths (modes, ownership, 108-byte limit, fallback); config validation; migrations idempotent; writer batching/flush/back-pressure; token primitives; bootstrap (single-use, expiry via `FakeClock`); sessions (create, slide, rotate + grace, logout, revoke-all); cursor round-trip/forgery; peer-uid decision function.
 - **HTTP via `tower::ServiceExt::oneshot`:** no/bad/expired/revoked token, wrong Host, wrong/`null`/`localhost` Origin, state-changing without Origin, header set on every response class (incl. 401/404/421), `OPTIONS` 405, oversized body, unknown query keys, traversal-looking paths and ids, error bodies free of secrets.
 - **Process-level (real `ccwm` in a synthetic env, `--port 0`):** serve → `open --print` → exchange → list projects → rotate → logout; SIGTERM clean exit; restart serves cached projects before the new scan completes; second instance exits; **impostor**: with no daemon, a TCP listener on the would-be port receives **zero** connections from `ccwm open`; startup log and `service.status` show the sandbox report.
-- **Security acceptance tests in M1:** **1** (hash the whole synthetic tree incl. mtimes/modes before/after a full discovery), **6** (no token, expired, revoked, wrong Origin, wrong Host, simulated peer-UID mismatch; cross-user check documented as manual), **7** (traversal and symlink escapes in project ids, static paths, `--config`, markers), **9** (a `tests/hygiene.rs` runs `git check-ignore` over db/WAL/SHM/socket/config/state/`*.jsonl`-outside-fixtures and asserts the fixtures are *not* ignored; skipped with notice if git is absent), **11** (above).
+- **Security acceptance tests in M1 (strengthened in M1.1):** **1** (hash the whole synthetic tree incl. mtimes/modes before/after a full discovery; also with the XDG and Claude config dirs *inside* the walked home), **6** (no token, expired, revoked, wrong Origin, wrong Host, simulated Unix-socket peer-UID mismatch, simulated **TCP** peer-UID mismatch / unknown owner / failed lookup ⇒ connection closed unanswered, concurrent rotation, logout and revoke-all during the grace window, overdue rotation; cross-user check documented as manual), **7** (traversal and symlink escapes in project ids, static paths, markers; untrusted `--config` (world-writable, in a world-writable dir, symlinked there, FIFO), untrusted XDG dirs, non-hidden `CLAUDE_CONFIG_DIR`, and a concurrent directory↔symlink swap race during the walk), **9** (`tests/hygiene.rs`: every runtime file name from the `paths.rs` constants incl. `instance.json.tmp` and WAL/SHM, a real synthetic env generated inside the repo, sensitive patterns; skipped with notice if git is absent, **failure** if `CI` is set), **11** (above). Log check runs at `info` and at `CCWM_LOG=trace`. WAL/SHM modes `0600` asserted (unit and process level).
 - `web/` grep test: no `innerHTML|outerHTML|insertAdjacentHTML|document.write|eval(|new Function`. `app.js` logic is exercised by `node --test` only if node exists (not a build requirement); otherwise documented manual steps.
 - All tests use temp dirs and synthetic data; none reads the real `$HOME` or `~/.claude`. Cargo itself runs with the normal environment, **never** under the synthetic `HOME` (`CARGO_HOME`/`RUSTUP_HOME` are not redirected; the synthetic env is applied only to spawned `ccwm` processes).
 - **Synthetic environment generator** (`src/synth.rs`, `ccwm-synth <dir>`): creates `home/`, XDG dirs and `claude/` (`CLAUDE_CONFIG_DIR`) under the given dir (default a fresh `/tmp/ccwm-synth-XXXX`), populates projects (marker, symlinked marker, nested git/non-git, excluded dirs, symlink loop, non-UTF-8 name, deep tree, decoys like `claude.md`) and minimal synthetic session files, and prints the `env` line to use. Shared by tests and manual runs (DRY).
@@ -357,9 +389,15 @@ codes go in `RestartPreventExitStatus=`.
 ## 13a. M1 verification notes (what was actually run)
 
 - Landlock on this host (Linux 7.0, ABI 8): `tests/sandbox.rs` re-executes the test binary, applies the policy, and verifies that writes outside the allowed directories, reads outside the allowed paths, outbound TCP connects and binds to other ports are denied — for the process **and** for `/bin/sh`/`/bin/bash` children — while writes in ccwm's directories, `/dev/null`, Unix-socket binding and the allowed TCP port work. A real daemon run reported `fully_enforced abi=8 filesystem=true network=true` and `NoNewPrivs: 1`. `--port 0` needs an explicit `NetPort(0)` rule (granted automatically because the configured port is 0).
-- `hyper`/`hyper-util` are in the tree only with their `server` features (checked with `cargo tree -e features`); no client crates. `deny.toml` encodes the bans but `cargo-deny` has **not** been run (not installed here).
+- `hyper`/`hyper-util` are in the tree only with their `server` features (checked with `cargo tree -e features`); no client crates. M1.1: `cargo deny check` run (see §13b).
 - The UI was exercised with a Node DOM stub against a live synthetic daemon (fragment removal, exchange, listing, session storage). It has **not** been viewed in a real browser (extension not connected).
 - Sign-in links printed by `ccwm open --print` contain the single-use token by design; the log never does (asserted).
+
+## 13b. M1.1 verification notes (what was actually run)
+
+- Real daemon in a synthetic env (Linux 7.0, ABI 8): `landlock fully_enforced: abi=8 filesystem=true network=tcp_only abstract_unix_socket=true signal=true threads_at_apply=1 probes=eacces/eacces unconfined=udp,unix_socket_connect_by_path`.
+- Race test (`tests/discovery.rs`): 8 directories swapped with symlinks by `renameat2(RENAME_EXCHANGE)` during 3,000 scans — ~100 k swaps, ~9 k swaps caught inside the list→open window (`skipped.changed`), the outside target never entered. Mutation check: with `O_NOFOLLOW` and the identity check removed, the test failed in 5/5 runs.
+- `cargo deny check` (cargo-deny 0.21.0, installed into `target/tools/`): see the M1.1 report in `ROADMAP.md`.
 
 ## 14. Decisions log and remaining open items
 
@@ -369,6 +407,15 @@ musl target/`musl-tools`/`cargo-deny` installed by the maintainer; `POST /auth/r
 in M1, WebSocket in M2; top-level session files only, aggregates not per-record dedup; prompts: `typed`/`queued`;
 non-UTF-8 paths skipped and counted; dependency set in §4; one inotify instance; runtime-dir fallback must be
 owned/0700 and respect 108 bytes; only allowed Origin `http://127.0.0.1:<port>`; no HTTP client crates.
+
+Decided for M1.1 (2026-11-23): the review's spec changes H1/H2 (TCP peer-UID check, bootstrap 30 s, `hidepid`
+optional, impostor fake UI as residual risk) and M1 (scopes, child IPC env scrub, TCP-only reporting, UDP and
+path-based Unix connect as residual risks, seccomp deferred to M4). **L4 rule:** group write is acceptable
+only for the user's private group (primary group, named like the user, no listed members); root-owned sticky
+ancestors are acceptable. **L3:** the 11th session revokes the **least recently used** one. **L1:** overdue
+means more than 24 h + 60 s since the last rotation (the slack covers a client that checks just before
+sending). **L6:** a nested object with more than 12 distinct keys over the whole corpus (record top level:
+64) is data-keyed and fully masked; tag labels come only from the script's own table.
 
 Open:
 - **O1 (M3):** Landlock vs. "roots change without restart" (§4.1): roots added later outside the startup read set need a restart; Settings must say so. Not a blocker for M1.

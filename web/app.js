@@ -25,7 +25,7 @@ function describeDiscovery(status) {
     return `Scanning… ${status.dirs_visited} folders checked, ${status.projects_found} projects found`;
   }
   const skipped = status.skipped || {};
-  const problems = (skipped.permission || 0) + (skipped.vanished || 0) + (skipped.other || 0);
+  const problems = (skipped.permission || 0) + (skipped.vanished || 0) + (skipped.changed || 0) + (skipped.other || 0);
   const last = status.last_success_at ? `Last scan ${new Date(status.last_success_at * 1000).toLocaleString()}` : "No completed scan yet";
   return problems > 0 ? `${last} · ${problems} folders could not be read` : last;
 }
@@ -39,8 +39,24 @@ function readSession(storage) {
   }
 }
 
+// Tabs share one session in localStorage. A 401 for token T clears the shared session only if the
+// stored token is still T; if another tab has already rotated it, the newer token is adopted.
+function shouldClearOnUnauthorized(stored, rejectedToken) {
+  return !stored || stored.token === rejectedToken;
+}
+
+// The session this tab should use: the stored one if it differs from ours (another tab rotated or
+// signed in), otherwise ours.
+function preferStored(current, stored) {
+  if (!stored) return current;
+  if (!current || stored.token !== current.token) return stored;
+  return current;
+}
+
 if (typeof module !== "undefined") {
-  module.exports = { parseFragmentToken, shouldRotate, describeDiscovery, readSession, STORAGE_KEY };
+  module.exports = {
+    parseFragmentToken, shouldRotate, describeDiscovery, readSession, shouldClearOnUnauthorized, preferStored, STORAGE_KEY,
+  };
 }
 
 // ---- browser-only code ------------------------------------------------------------------------
@@ -76,7 +92,7 @@ function startApp() {
 
   function clearSession() {
     session = null;
-    window.localStorage.removeItem(STORAGE_KEY);
+    window.localStorage.removeItem(STORAGE_KEY); // the storage event signs the other tabs out too
     if (timer) clearTimeout(timer);
     timer = null;
     lastKey = null;
@@ -94,14 +110,15 @@ function startApp() {
     );
   }
 
-  async function rawFetch(path, opts = {}) {
+  async function rawFetch(path, opts = {}, token = session && session.token) {
     const headers = { Accept: "application/json" };
-    if (session) headers.Authorization = `Bearer ${session.token}`;
+    if (token) headers.Authorization = `Bearer ${token}`;
     if (opts.body !== undefined) headers["Content-Type"] = "application/json";
     return fetch(API + path, { method: opts.method || "GET", headers, body: opts.body, cache: "no-store", credentials: "omit" });
   }
 
   async function ensureFreshToken() {
+    session = preferStored(session, readSession(window.localStorage)); // another tab may have rotated
     if (!shouldRotate(session, now())) return;
     if (!rotating) {
       rotating = rawFetch("/auth/rotate", { method: "POST" })
@@ -112,10 +129,16 @@ function startApp() {
     await rotating;
   }
 
-  async function api(path, opts) {
+  async function api(path, opts, retried = false) {
     await ensureFreshToken();
-    const r = await rawFetch(path, opts);
+    const used = session && session.token;
+    const r = await rawFetch(path, opts, used);
     if (r.status === 401) {
+      const stored = readSession(window.localStorage);
+      if (!retried && !shouldClearOnUnauthorized(stored, used)) {
+        session = stored; // another tab holds a newer token: use it instead of signing everyone out
+        return api(path, opts, true);
+      }
       showUnauthenticated("Your session has expired or was revoked.");
       throw new Error("unauthenticated");
     }
@@ -198,8 +221,24 @@ function startApp() {
   }
 
   signoutBtn.addEventListener("click", async () => {
-    try { await rawFetch("/auth/logout", { method: "POST" }); } catch (_) { /* best effort */ }
+    try {
+      await ensureFreshToken(); // an overdue token is accepted only for rotation
+      await rawFetch("/auth/logout", { method: "POST" });
+    } catch (_) { /* best effort */ }
     showUnauthenticated("You have signed out.");
+  });
+
+  // Keep tabs in step: adopt a token another tab rotated, follow sign-in and sign-out.
+  window.addEventListener("storage", (e) => {
+    if (e.key !== STORAGE_KEY && e.key !== null) return;
+    const stored = readSession(window.localStorage);
+    if (!stored) {
+      if (session) showUnauthenticated("You were signed out in another tab.");
+      return;
+    }
+    const wasSignedOut = !session;
+    session = preferStored(session, stored);
+    if (wasSignedOut) start();
   });
 
   const bootstrap = parseFragmentToken(window.location.hash);

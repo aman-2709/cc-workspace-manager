@@ -14,13 +14,16 @@ pub struct ListParams {
     pub q: Option<String>,
     pub order: Order,
     pub limit: u32,
-    /// Keyset position: `(lower(name), id)` of the last row of the previous page.
+    /// Keyset position: `(sort_key, id)` of the last row of the previous page.
     pub after: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProjectRow {
     pub id: String,
+    /// Stored normalized name ([`crate::db::sort_key`]); used for cursors, not sent to clients.
+    #[serde(skip)]
+    pub sort_key: String,
     pub name: String,
     pub path: String,
     pub sources: Vec<String>,
@@ -60,10 +63,11 @@ pub fn list_projects(
 
     let sql = format!(
         "SELECT id, name, canonical_path, first_seen_at,
-                (SELECT group_concat(source) FROM (SELECT source FROM project_sources s WHERE s.project_id = projects.id ORDER BY source))
+                (SELECT group_concat(source) FROM (SELECT source FROM project_sources s WHERE s.project_id = projects.id ORDER BY source)),
+                sort_key
          FROM projects
-         WHERE {filter} AND (?2 IS NULL OR (lower(name), id) {cmp} (?2, ?3))
-         ORDER BY lower(name) {dir}, id {dir}
+         WHERE {filter} AND (?2 IS NULL OR (sort_key, id) {cmp} (?2, ?3))
+         ORDER BY sort_key {dir}, id {dir}
          LIMIT ?4"
     );
     let (after_name, after_id) = match &p.after {
@@ -89,6 +93,7 @@ pub fn list_projects(
                 let sources: Option<String> = r.get(4)?;
                 Ok(ProjectRow {
                     id: r.get(0)?,
+                    sort_key: r.get(5)?,
                     name: r.get(1)?,
                     path: r.get(2)?,
                     first_seen_at: r.get(3)?,
@@ -153,6 +158,13 @@ pub fn find_session(
         },
     )
     .optional()
+}
+
+/// Live session ids, most recently used first (tests and diagnostics).
+pub fn session_ids_by_use(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    conn.prepare("SELECT id FROM auth_sessions ORDER BY last_used_at DESC, created_at DESC")?
+        .query_map([], |r| r.get(0))?
+        .collect()
 }
 
 pub fn count_sessions(conn: &Connection) -> rusqlite::Result<u64> {

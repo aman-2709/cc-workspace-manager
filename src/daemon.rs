@@ -13,12 +13,13 @@ use crate::discovery::status::SharedStatus;
 use crate::discovery::walk::{scan, ScanOptions};
 use crate::error::{Error, Result};
 use crate::instance::{remove_instance, write_instance, InstanceInfo, InstanceLock};
-use crate::paths::{current_home, Dirs, EnvVars};
-use crate::sandbox::{self, SandboxReport};
+use crate::paths::{self, current_home, Dirs, EnvVars, Owner};
+use crate::sandbox::{self, Policy, SandboxReport};
 use crate::service::{Service, VERSION};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
@@ -47,11 +48,19 @@ pub fn init_logging() {
     }
 }
 
-fn session_dir(home: &Path) -> PathBuf {
-    match std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from) {
-        Some(p) if p.is_absolute() => p,
-        _ => home.join(".claude"),
-    }
+/// Expired browser sessions are purged this often (and once at startup).
+const SESSION_PURGE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Everything `run` needs that was resolved on the main thread before the sandbox was applied.
+struct Prepared {
+    uid: u32,
+    dirs: Dirs,
+    config: Config,
+    roots: Vec<PathBuf>,
+    home: PathBuf,
+    session_dir: PathBuf,
+    policy: Policy,
+    report: SandboxReport,
 }
 
 /// Run the daemon until SIGTERM/SIGINT. Called on the main thread.
@@ -66,11 +75,14 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
 
     let home = current_home(uid)?;
-    let dirs = Dirs::resolve(&EnvVars::from_process(), &home);
-    dirs.ensure(uid)?;
+    let owner = Owner::current(uid);
+    let env = EnvVars::from_process();
+    let dirs = Dirs::resolve(&env, &home);
+    dirs.ensure(&owner)?;
 
+    // Read before the sandbox exists, so the config's directory is never granted (M1.1, M2).
     let config_path = args.config.clone().unwrap_or_else(|| dirs.config_file());
-    let mut config = Config::load(&config_path)?;
+    let mut config = Config::load(&config_path, &owner)?;
     if let Some(port) = args.port {
         validate_port(port)?;
         config.server.port = port;
@@ -83,10 +95,10 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
 
     // Canonical directories for the sandbox and the discovery boundaries (they exist now).
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let session_dir = paths::session_dir(&env, &home);
     let policy = sandbox::daemon_policy(
         &roots.iter().map(|r| canon(r)).collect::<Vec<_>>(),
-        &canon(&session_dir(&home)),
-        config_path.parent().map(canon).as_deref(),
+        &canon(&session_dir),
         &Dirs {
             config: canon(&dirs.config),
             data: canon(&dirs.data),
@@ -95,7 +107,9 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         },
         config.server.port,
     );
-    let report = sandbox::apply(&policy).unwrap_or_else(|e| SandboxReport::disabled(e.to_string()));
+    let mut report =
+        sandbox::apply(&policy).unwrap_or_else(|e| SandboxReport::disabled(e.to_string()));
+    report.flag_broad_reads(&policy.read, &canon(&home));
 
     // Only now (single-threaded so far) start the runtime and everything that spawns threads.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -104,17 +118,44 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         .enable_all()
         .build()
         .map_err(|e| Error::io("cannot start the async runtime", &e))?;
-    runtime.block_on(run(uid, dirs, config, roots, home, report))
+    runtime.block_on(run(Prepared {
+        uid,
+        dirs,
+        config,
+        roots,
+        home,
+        session_dir,
+        policy,
+        report,
+    }))
 }
 
-async fn run(
-    uid: u32,
-    dirs: Dirs,
-    config: Config,
-    roots: Vec<PathBuf>,
-    home: PathBuf,
-    report: SandboxReport,
-) -> Result<()> {
+/// M1.1 (M4): verify from a worker thread and a blocking-pool thread, both created after the
+/// sandbox was applied, that they are confined too.
+async fn probe_runtime_threads(policy: &Policy, report: &mut SandboxReport) {
+    let target = sandbox::probe_target(policy);
+    let t = target.clone();
+    let worker = tokio::spawn(async move { sandbox::probe_read(t.as_deref()) })
+        .await
+        .unwrap_or_else(|_| "error:panicked".into());
+    let blocking = tokio::task::spawn_blocking(move || sandbox::probe_read(target.as_deref()))
+        .await
+        .unwrap_or_else(|_| "error:panicked".into());
+    report.record_thread_probes(&worker, &blocking);
+}
+
+async fn run(p: Prepared) -> Result<()> {
+    let Prepared {
+        uid,
+        dirs,
+        config,
+        roots,
+        home,
+        session_dir,
+        policy,
+        mut report,
+    } = p;
+    probe_runtime_threads(&policy, &mut report).await;
     tracing::info!("{}", report.summary());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let _lock = InstanceLock::acquire(&dirs)?;
@@ -184,7 +225,7 @@ async fn run(
             max_depth: config.discovery.max_depth,
             same_file_system: config.discovery.same_file_system,
             home,
-            boundaries: dirs.hard_boundaries(),
+            boundaries: dirs.hard_boundaries(&session_dir),
             fuse_mounts: current_fuse_mount_points(),
         };
         let (writer, status, clock, cancel) = (
@@ -223,6 +264,25 @@ async fn run(
         })
     };
 
+    let purge = {
+        let (writer, clock, mut stop) = (Arc::clone(&writer), Arc::clone(&clock), stop_rx.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SESSION_PURGE_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        match writer.purge_expired_sessions(clock.now()).await {
+                            Ok(n) if n > 0 => tracing::info!(purged = n, "expired browser sessions removed"),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "session purge failed"),
+                        }
+                    }
+                    () = async { let _ = stop.wait_for(|s| *s).await; } => break,
+                }
+            }
+        })
+    };
+
     let mut sigterm = signal(SignalKind::terminate())
         .map_err(|e| Error::io("cannot install SIGTERM handler", &e))?;
     let mut sigint = signal(SignalKind::interrupt())
@@ -231,13 +291,20 @@ async fn run(
         tokio::select! { _ = sigterm.recv() => {}, _ = sigint.recv() => {} }
         tracing::info!("shutting down");
     };
-    let served = crate::http::serve(listener, Arc::clone(&service), shutdown).await;
+    let served = crate::http::serve(
+        listener,
+        Arc::clone(&service),
+        crate::http::ServeOptions::new(uid),
+        shutdown,
+    )
+    .await;
 
     // Graceful teardown: stop discovery, close the socket, flush the writer, remove runtime files.
     cancel.store(true, Ordering::Relaxed);
     let _ = stop_tx.send(true);
     let _ = scan_task.await;
     let _ = ipc.await;
+    let _ = purge.await;
     let flushed = writer.shutdown().await;
     let _ = std::fs::remove_file(dirs.socket_path());
     remove_instance(&dirs);

@@ -90,7 +90,10 @@ async fn handle(stream: UnixStream, service: &Service, daemon_uid: u32) {
         Ok(Ok(n)) if n > 0 && n <= MAX_REQUEST_BYTES && line.ends_with(b"\n") => {
             match std::str::from_utf8(&line) {
                 Ok(text) => match parse_request(text) {
-                    Ok(req) => dispatch(service, req).await,
+                    Ok(req) => {
+                        tracing::trace!(op = ?req, "socket request");
+                        dispatch(service, req).await
+                    }
                     Err(e) => Err(e),
                 },
                 Err(_) => Err(ApiError::invalid("request is not valid UTF-8")),

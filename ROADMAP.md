@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **M1 complete — waiting for the maintainer's go-ahead for M2.**
+Current position: **M1.1 (security hardening) complete — waiting for the maintainer's go-ahead for M2.**
 
 ---
 
@@ -29,10 +29,24 @@ cached projects immediately; security acceptance tests **1, 6, 7, 9, 11** pass.
 - [x] UI: embedded `index.html`/`app.css`/`app.js`; fragment → `replaceState` → exchange; polling; card list; loading/empty/error/unauthenticated/partial-progress states; unofficial footer; no `innerHTML`
 - [x] Synthetic environment generator (`ccwm-synth`, shared with tests)
 - [x] `scripts/inspect-session-schema.py` (tested on synthetic data only; handed to the maintainer, never run by the agent on real data)
-- [x] `deny.toml` network-crate bans written; **not yet run** (`cargo-deny` is not installed on this host; the dependency tree was checked by hand with `cargo tree`)
+- [x] `deny.toml` network-crate bans written (first run in M1.1, see below)
 - [x] Tests: unit + HTTP + process-level + acceptance **1, 6, 7, 9, 11**
 - [x] Manual acceptance run in a synthetic env (see CLAUDE.md "How to run"); the UI was exercised with a Node DOM stub, **not in a real browser** (the Chrome extension was not connected)
 - [x] fmt / clippy / test green; docs + roadmap updated; local commit
+
+## M1.1 — Security hardening (review of M1, `docs/reviews/m1-security-review.md`)
+No new features. Spec changes approved by the maintainer and applied to REQUIREMENTS.md §11 and SECURITY.md.
+
+- [x] L6 (first): schema script masks every key of a data-keyed object (> 12 distinct keys over the corpus, 64 at the record top level), independent of record order; tag labels only from the script's own table; timestamp shapes keep only digits→9 and `-:.TZ+`; canary tests
+- [x] H1/H2: TCP peer-UID check on every accepted connection (`/proc/net/tcp{,6}`, fail closed, per connection); bootstrap TTL 30 s; `hidepid=invisible` documented as optional; impostor fake UI documented as residual risk
+- [x] M1: Landlock scopes `AbstractUnixSocket | Signal` (ABI 6, best effort, reported); `sandbox::child_command` drops `DBUS_*`/`XDG_RUNTIME_DIR`/agent/display/systemd IPC variables; network reported as `tcp_only`; UDP and path-based Unix connect listed in `unconfined`
+- [x] M2: no read grant for the `--config` directory; read rules that are `/` or an ancestor of home are flagged in the report
+- [x] M3: descriptor-based walk (`openat(O_DIRECTORY|O_NOFOLLOW)` + `(dev, ino)` check; entries read from the fd; markers via `openat2(RESOLVE_BENEATH)` with a strict fallback); `skipped.changed` counter
+- [x] M4: `apply` requires `/proc/self/task` = 1 entry, else `not_enforced`; worker and blocking-pool thread probes recorded in the report
+- [x] L1 overdue token accepted only on `/auth/rotate` · L2 UI follows `storage` events, a 401 clears storage only if the stored token was the rejected one · L3 hourly purge + cap of 10 live sessions (LRU revoked), `ccwm open` revokes nothing · L4 ownership/mode checks of the config file and every ancestor of the XDG dirs (private-group rule) · L5 64-connection cap before `accept` + 10 s header-read timeout (hyper http1), Unix socket usable under load · L7 `CLAUDE_CONFIG_DIR` always a hard boundary · L8 stored `sort_key` (migration 2) for ORDER BY and cursors
+- [x] Tests: 11 (harness-less, real `daemon_policy()`, exact errnos, threads and grandchildren, scopes, Unix-connect residual, `CCWM_REQUIRE_LANDLOCK=1`; real daemon's report and probes), 7 (`--config`, XDG vars, `CLAUDE_CONFIG_DIR`, symlink-swap race with mutation check), 9 (names from `paths.rs`, `instance.json.tmp`, in-repo synthetic env, fail in CI without git), 6 (concurrent rotation, logout/revoke-all in grace, simulated TCP peer-UID mismatch, overdue rotation), 1 (XDG dirs inside the walked home), log check at `CCWM_LOG=trace`, WAL/SHM modes
+- [x] `cargo deny check` run and clean (cargo-deny 0.21.0 in `target/tools/`): unused license allowances removed, known `syn` 2/3 duplicate skipped with a reason
+- [x] fmt / clippy / test / cargo deny green; docs updated; local commit
 
 ## M2 — Activity tracking
 Accept: editing a file moves its project to the top live; creating `CLAUDE.md` in a watched area registers a
@@ -71,6 +85,8 @@ cargo-deny bans) green; benchmarks documented.
 
 - [ ] CLI `start/stop/restart/status/scan/doctor/service/auth`; dedicated exit codes (port in use, lock held) in `RestartPreventExitStatus=`
 - [ ] systemd unit (+ optional `ProtectSystem`/`ProtectHome` only after testing the real daemon); `scripts/install.sh`/`uninstall.sh`
+- [ ] Seccomp filter denying `socket()` after the TCP and Unix listeners are bound (deferred from M1.1; needs a dependency justified in ARCHITECTURE §4 first) — closes UDP and path-based Unix-socket connect
+- [ ] Security acceptance test 5 fallback where `unshare -rn` is unavailable: strace `connect` of the daemon and children, assert no non-loopback connect
 - [ ] Security + performance pass with measured numbers; docs (README, SECURITY, CONTRIBUTING, CHANGELOG, LICENSE, config reference, discovery semantics, inotify troubleshooting, retention, service mgmt)
 - [ ] CI (fmt, clippy, test, cargo-deny, gitleaks, hygiene; SHA-pinned; least privilege) + release workflow (musl)
 - [ ] History/secret audit before first publication; naming-conflict check (needs maintainer OK)

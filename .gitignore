@@ -24,6 +24,7 @@
 *.lock
 !Cargo.lock
 instance.json
+instance.json.tmp
 /run/
 /state/
 /data/
@@ -57,6 +58,7 @@ credentials.json
 
 # ---- Local configuration (commit only config.example.toml) ----
 /config.toml
+**/ccwm/config.toml
 config.local.toml
 *.local.toml
 .claude/settings.local.json
@@ -70,8 +72,10 @@ config.local.toml
 .session-aliases
 
 # ---- Synthetic environments generated for manual runs ----
+# (ccwm-synth also writes a `.gitignore` containing `*` into every environment it creates.)
 /synthetic-env/
 /synth-env/
+ccwm-synth-*/
 /tmp/
 /scratch/
 

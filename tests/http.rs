@@ -5,6 +5,8 @@ mod common;
 
 use axum::body::Body;
 use axum::http::Request;
+use cc_workspace_manager::auth::bootstrap::BOOTSTRAP_TTL_SECS;
+use cc_workspace_manager::clock::Clock;
 use common::{code, env, json, PORT, START};
 
 const DAY: i64 = 24 * 3600;
@@ -334,19 +336,32 @@ async fn wrong_authorization_schemes_and_duplicate_headers_are_rejected() {
     assert_eq!(s, 200, "the scheme is case-insensitive");
 }
 
+/// Rotate over HTTP; `None` if refused.
+async fn rotate(e: &common::Env, token: &str) -> Option<String> {
+    let (s, v) = json(e.post("/api/v1/auth/rotate", Some(token), "").await).await;
+    (s == 200).then(|| v["session_token"].as_str().unwrap().to_string())
+}
+
 #[tokio::test]
 async fn expired_tokens_are_rejected_and_use_slides_the_expiry() {
     let e = env().await;
     let token = e.login().await;
     e.clock.advance(20 * DAY);
-    assert_eq!(e.get("/api/v1/stats", Some(&token)).await.status(), 200); // slides to day 50
+    let token = rotate(&e, &token).await.expect("rotation slides to day 50");
+    assert_eq!(e.get("/api/v1/stats", Some(&token)).await.status(), 200);
     e.writer.flush().await.unwrap();
     e.clock.advance(20 * DAY); // day 40 since login: valid only because of the slide
+    let token = rotate(&e, &token).await.expect("still valid on day 40");
     assert_eq!(e.get("/api/v1/stats", Some(&token)).await.status(), 200);
     e.writer.flush().await.unwrap();
     e.clock.advance(31 * DAY);
     let (s, v) = json(e.get("/api/v1/stats", Some(&token)).await).await;
     assert_eq!((s, code(&v)), (401, "unauthorized"));
+    assert_eq!(
+        rotate(&e, &token).await,
+        None,
+        "an expired token cannot rotate"
+    );
 }
 
 #[tokio::test]
@@ -354,11 +369,46 @@ async fn an_unused_token_expires_after_thirty_days() {
     let e = env().await;
     let token = e.login().await;
     e.clock.advance(30 * DAY - 1);
-    assert_eq!(e.get("/api/v1/stats", Some(&token)).await.status(), 200);
+    assert!(rotate(&e, &token).await.is_some());
     let e2 = env().await;
     let token2 = e2.login().await;
     e2.clock.advance(30 * DAY);
+    assert_eq!(rotate(&e2, &token2).await, None);
     assert_eq!(e2.get("/api/v1/stats", Some(&token2)).await.status(), 401);
+}
+
+/// L1: once rotation is overdue (24 h + 60 s slack), the token works only on /auth/rotate.
+#[tokio::test]
+async fn an_overdue_token_is_accepted_only_for_rotation() {
+    let e = env().await;
+    let token = e.login().await;
+    e.clock.advance(DAY + 59);
+    assert_eq!(
+        e.get("/api/v1/stats", Some(&token)).await.status(),
+        200,
+        "inside the slack after rotate_after"
+    );
+    e.clock.advance(1);
+    for path in [
+        "/api/v1/stats",
+        "/api/v1/projects",
+        "/api/v1/service/status",
+    ] {
+        let (s, v) = json(e.get(path, Some(&token)).await).await;
+        assert_eq!((s, code(&v)), (401, "unauthorized"), "{path}");
+    }
+    assert_eq!(
+        e.post("/api/v1/auth/logout", Some(&token), "")
+            .await
+            .status(),
+        401
+    );
+    let fresh = rotate(&e, &token).await.expect("rotation is still allowed");
+    assert_eq!(e.get("/api/v1/stats", Some(&fresh)).await.status(), 200);
+    // The overdue token keeps only its 60 s rotation grace, like any rotated-out token.
+    assert_eq!(e.get("/api/v1/stats", Some(&token)).await.status(), 200);
+    e.clock.advance(60);
+    assert_eq!(e.get("/api/v1/stats", Some(&token)).await.status(), 401);
 }
 
 #[tokio::test]
@@ -425,7 +475,8 @@ async fn rotation_issues_a_new_token_and_keeps_the_old_one_for_sixty_seconds() {
 async fn exchange_consumes_the_bootstrap_token() {
     let e = env().await;
     let b = e.service.auth_bootstrap().unwrap();
-    assert_eq!((b.expires_in, b.port), (60, PORT));
+    assert_eq!((b.expires_in, b.port), (BOOTSTRAP_TTL_SECS, PORT));
+    assert_eq!(BOOTSTRAP_TTL_SECS, 30);
     let body = format!(r#"{{"bootstrap_token":"{}"}}"#, b.bootstrap_token);
     let (s, v) = json(e.post("/api/v1/auth/exchange", None, &body).await).await;
     assert_eq!(s, 200);
@@ -781,4 +832,363 @@ fn web_sources_never_use_dangerous_dom_apis() {
         checked += 1;
     }
     assert!(checked >= 3);
+}
+
+// ---- M1.1: rotation races, grace window, session cap ------------------------------------------------
+
+#[tokio::test]
+async fn two_concurrent_rotations_with_the_same_token_yield_exactly_one_new_token() {
+    let e = env().await;
+    let token = e.login().await;
+    let (a, b) = tokio::join!(rotate(&e, &token), rotate(&e, &token));
+    let winners: Vec<String> = [a, b].into_iter().flatten().collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "rotation is atomic: one wins, the other is refused"
+    );
+    let new = &winners[0];
+    assert_eq!(e.get("/api/v1/stats", Some(new)).await.status(), 200);
+    assert_eq!(
+        e.get("/api/v1/stats", Some(&token)).await.status(),
+        200,
+        "the old token is still inside its grace window"
+    );
+    assert_eq!(
+        rotate(&e, &token).await,
+        None,
+        "a rotated-out token cannot rotate"
+    );
+}
+
+#[tokio::test]
+async fn logout_with_the_old_token_during_the_grace_window_ends_the_whole_session() {
+    let e = env().await;
+    let old = e.login().await;
+    let new = rotate(&e, &old).await.unwrap();
+    assert_eq!(
+        e.post("/api/v1/auth/logout", Some(&old), "").await.status(),
+        204
+    );
+    for t in [&old, &new] {
+        assert_eq!(e.get("/api/v1/stats", Some(t)).await.status(), 401);
+    }
+}
+
+#[tokio::test]
+async fn revoke_all_during_the_grace_window_kills_both_tokens() {
+    let e = env().await;
+    let old = e.login().await;
+    let new = rotate(&e, &old).await.unwrap();
+    let other = e.login().await;
+    assert_eq!(e.service.auth_revoke_all().await.unwrap(), 2);
+    for t in [&old, &new, &other] {
+        assert_eq!(e.get("/api/v1/stats", Some(t)).await.status(), 401);
+    }
+}
+
+/// L3: at most 10 live sessions; the least recently used one is revoked, the others survive.
+#[tokio::test]
+async fn an_eleventh_session_revokes_the_least_recently_used_one() {
+    let e = env().await;
+    let mut tokens = Vec::new();
+    for _ in 0..cc_workspace_manager::db::writer::MAX_LIVE_SESSIONS {
+        tokens.push(e.login().await);
+        e.clock.advance(1);
+    }
+    // Use the oldest session so that the second-oldest becomes the least recently used.
+    e.clock
+        .advance(cc_workspace_manager::auth::sessions::TOUCH_INTERVAL_SECS);
+    assert_eq!(e.get("/api/v1/stats", Some(&tokens[0])).await.status(), 200);
+    e.writer.flush().await.unwrap();
+    let newest = e.login().await;
+    assert_eq!(e.get("/api/v1/stats", Some(&newest)).await.status(), 200);
+    assert_eq!(e.get("/api/v1/stats", Some(&tokens[0])).await.status(), 200);
+    assert_eq!(
+        e.get("/api/v1/stats", Some(&tokens[1])).await.status(),
+        401,
+        "least recently used"
+    );
+    for t in &tokens[2..] {
+        assert_eq!(e.get("/api/v1/stats", Some(t)).await.status(), 200);
+    }
+}
+
+#[tokio::test]
+async fn creating_a_session_purges_expired_ones_first_and_purge_runs_on_demand() {
+    let e = env().await;
+    let stale = e.login().await;
+    e.clock.advance(31 * DAY);
+    let fresh = e.login().await;
+    assert_eq!(e.get("/api/v1/stats", Some(&fresh)).await.status(), 200);
+    let count = e
+        .service
+        .reader
+        .with(cc_workspace_manager::db::queries::count_sessions)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "the expired session was purged when the new one was created"
+    );
+    assert_eq!(e.get("/api/v1/stats", Some(&stale)).await.status(), 401);
+    e.clock.advance(31 * DAY);
+    assert_eq!(
+        e.writer
+            .purge_expired_sessions(e.clock.now())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+// ---- M1.1: TCP peer UID, connection cap, header timeout (real sockets) ----------------------------
+
+mod sockets {
+    use super::common::{self, PORT};
+    use cc_workspace_manager::http::{self, peer::PeerUidLookup, ServeOptions};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn me() -> u32 {
+        nix::unistd::geteuid().as_raw()
+    }
+
+    struct Server {
+        addr: SocketAddr,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+        _env: common::Env,
+    }
+
+    impl Server {
+        async fn stop(mut self) {
+            let _ = self.stop.take().unwrap().send(());
+            self.task.await.unwrap().unwrap();
+        }
+    }
+
+    async fn serve(lookup: PeerUidLookup, max: usize, header_timeout: Duration) -> Server {
+        let env = common::env().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let opts = ServeOptions {
+            daemon_uid: me(),
+            peer_uid: lookup,
+            max_connections: max,
+            header_read_timeout: header_timeout,
+        };
+        let task = tokio::spawn(http::serve(listener, env.service.clone(), opts, async {
+            let _ = rx.await;
+        }));
+        Server {
+            addr,
+            stop: Some(tx),
+            task,
+            _env: env,
+        }
+    }
+
+    /// Send a request (Host is the service's port, which the Host check expects) and read it all.
+    async fn get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+        let mut s = TcpStream::connect(addr).await?;
+        s.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+            .await
+            .map_err(|_| std::io::Error::other("timed out"))??;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    #[tokio::test]
+    async fn the_real_lookup_serves_our_own_connections() {
+        let srv = serve(http::peer::procfs_lookup(), 8, Duration::from_secs(5)).await;
+        let resp = get(srv.addr, "/api/v1/health").await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        srv.stop().await;
+    }
+
+    /// Test 6: a client socket owned by another UID (simulated lookup) gets no response at all,
+    /// not even for public endpoints; so do unknown owners and failed lookups.
+    #[tokio::test]
+    async fn connections_from_another_uid_or_an_unknown_owner_are_closed_unanswered() {
+        let other = me() + 1;
+        let lookups: [PeerUidLookup; 3] = [
+            Arc::new(move |_, _| Ok(Some(other))),
+            Arc::new(|_, _| Ok(None)),
+            Arc::new(|_, _| Err(std::io::Error::other("procfs unreadable"))),
+        ];
+        for lookup in lookups {
+            let srv = serve(lookup, 8, Duration::from_secs(5)).await;
+            for path in ["/api/v1/health", "/", "/api/v1/projects"] {
+                match get(srv.addr, path).await {
+                    Ok(resp) => assert!(resp.is_empty(), "{path}: got {resp:?}"),
+                    Err(e) => assert!(
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                        ),
+                        "{path}: {e}"
+                    ),
+                }
+            }
+            srv.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_lookup_sees_the_client_and_server_addresses_and_runs_once_per_connection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (c, s2) = (Arc::clone(&calls), Arc::clone(&seen));
+        let lookup: PeerUidLookup = Arc::new(move |client, server| {
+            c.fetch_add(1, Ordering::SeqCst);
+            s2.lock().unwrap().push((client, server));
+            Ok(Some(nix::unistd::geteuid().as_raw()))
+        });
+        let srv = serve(lookup, 8, Duration::from_secs(5)).await;
+        // Two requests on one keep-alive connection: one lookup.
+        let mut s = TcpStream::connect(srv.addr).await.unwrap();
+        let local = s.local_addr().unwrap();
+        let req = format!("GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n\r\n");
+        let close = format!(
+            "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        s.write_all(close.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out.matches("HTTP/1.1 200").count(), 2, "{out}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.lock().unwrap()[0], (local, srv.addr));
+        srv.stop().await;
+    }
+
+    /// L5: a client that never completes its request head is disconnected.
+    #[tokio::test]
+    async fn incomplete_request_heads_time_out() {
+        let srv = serve(http::peer::procfs_lookup(), 8, Duration::from_millis(500)).await;
+        for partial in ["", "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1"] {
+            let mut s = TcpStream::connect(srv.addr).await.unwrap();
+            s.write_all(partial.as_bytes()).await.unwrap();
+            let started = Instant::now();
+            let mut buf = Vec::new();
+            let r = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+            assert!(r.is_ok(), "the server kept a stalled connection open");
+            assert!(
+                started.elapsed() >= Duration::from_millis(400),
+                "closed too early"
+            );
+            let text = String::from_utf8_lossy(&buf);
+            assert!(!text.contains("200"), "{text}");
+        }
+        srv.stop().await;
+    }
+
+    /// L5: the connection cap holds extra clients in the backlog until a slot frees up.
+    #[tokio::test]
+    async fn the_connection_cap_queues_extra_clients_until_a_slot_frees() {
+        let srv = serve(http::peer::procfs_lookup(), 2, Duration::from_secs(30)).await;
+        let a = TcpStream::connect(srv.addr).await.unwrap();
+        let b = TcpStream::connect(srv.addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let addr = srv.addr;
+        let third = tokio::spawn(async move { get(addr, "/api/v1/health").await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !third.is_finished(),
+            "the third client must wait for a slot"
+        );
+        drop(a);
+        let resp = tokio::time::timeout(Duration::from_secs(5), third)
+            .await
+            .expect("served once a slot was free")
+            .unwrap()
+            .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        drop(b);
+        srv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_even_with_idle_connections_open() {
+        let srv = serve(http::peer::procfs_lookup(), 8, Duration::from_secs(30)).await;
+        let _idle = TcpStream::connect(srv.addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        srv.stop().await;
+        assert!(started.elapsed() < Duration::from_secs(7));
+    }
+}
+
+/// L8: the cursor and ORDER BY share one stored normalization, so non-ASCII names are neither
+/// skipped nor repeated across pages, in both directions.
+#[tokio::test]
+async fn pagination_over_non_ascii_names_visits_every_project_exactly_once() {
+    let e = env().await;
+    let names = [
+        "École",
+        "ecole2",
+        "Éclair",
+        "ÉZ",
+        "éa",
+        "Ärger",
+        "apfel",
+        "Zebra",
+        "zz",
+        "Ωmega",
+        "ωa",
+        "İstanbul",
+        "istanbul",
+        "ß",
+        "SS",
+        "ǅemal",
+    ];
+    e.seed(&names).await;
+    let token = e.login().await;
+    for (order, limit) in [("asc", 1), ("asc", 2), ("desc", 3)] {
+        let mut seen = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let path = format!("/api/v1/projects?sort=name&order={order}&limit={limit}{cursor}");
+            let (s, v) = json(e.get(&path, Some(&token)).await).await;
+            assert_eq!(s, 200, "{v}");
+            for item in v["items"].as_array().unwrap() {
+                seen.push(item["name"].as_str().unwrap().to_string());
+            }
+            match v["next_cursor"].as_str() {
+                Some(c) => cursor = format!("&cursor={c}"),
+                None => break,
+            }
+        }
+        let mut want: Vec<String> = names.iter().map(ToString::to_string).collect();
+        want.sort_by_key(|n| cc_workspace_manager::db::sort_key(n));
+        if order == "desc" {
+            want.reverse();
+        }
+        assert_eq!(seen.len(), names.len(), "{order}/{limit}: {seen:?}");
+        let mut a = seen.clone();
+        a.sort();
+        let mut b = want.clone();
+        b.sort();
+        assert_eq!(a, b, "{order}/{limit}: every name exactly once");
+        let keys: Vec<String> = seen
+            .iter()
+            .map(|n| cc_workspace_manager::db::sort_key(n))
+            .collect();
+        let want_keys: Vec<String> = want
+            .iter()
+            .map(|n| cc_workspace_manager::db::sort_key(n))
+            .collect();
+        assert_eq!(keys, want_keys, "{order}/{limit}: sorted by the stored key");
+    }
 }

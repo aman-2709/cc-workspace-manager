@@ -32,6 +32,16 @@ impl SynthEnv {
         ]
     }
 
+    /// ccwm's own four directories (`<xdg>/ccwm`), which ccwm may write.
+    pub fn ccwm_dirs(&self) -> [PathBuf; 4] {
+        [
+            self.config_home.join("ccwm"),
+            self.data_home.join("ccwm"),
+            self.state_home.join("ccwm"),
+            self.runtime_dir.join("ccwm"),
+        ]
+    }
+
     /// Project directories (relative to `home`) that marker discovery must find.
     pub fn expected_projects(&self, bulk: usize) -> Vec<String> {
         let mut v: Vec<String> = [
@@ -78,9 +88,24 @@ fn git_dir(dir: &Path) -> io::Result<()> {
     write(&dir.join(".git/HEAD"), "ref: refs/heads/main\n")
 }
 
+/// Where the XDG and Claude config directories live relative to the walked home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Next to `home/` (`c/ d/ s/ r/ claude/`).
+    Separate,
+    /// Inside the walked home under **non-hidden** names (like the real default
+    /// `~/.local/share/ccwm`, but not pruned by the hidden-directory rule), each ccwm directory and
+    /// the Claude config directory seeded with a decoy `CLAUDE.md` that must never be registered.
+    InsideHome,
+}
+
 /// Generate the environment under `root` (which must not exist or be empty). `bulk` extra trivial
 /// projects are added under `home/bulk/` for load and pagination tests.
 pub fn generate(root: &Path, bulk: usize) -> io::Result<SynthEnv> {
+    generate_with(root, bulk, Layout::Separate)
+}
+
+pub fn generate_with(root: &Path, bulk: usize, layout: Layout) -> io::Result<SynthEnv> {
     if root.exists() && fs::read_dir(root)?.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -92,15 +117,32 @@ pub fn generate(root: &Path, bulk: usize) -> io::Result<SynthEnv> {
         .mode(0o700)
         .create(root)?;
     let root = fs::canonicalize(root)?;
+    // Whatever directory the environment is created in (even inside a repository), Git ignores it.
+    fs::write(
+        root.join(".gitignore"),
+        "# synthetic ccwm environment: never commit\n*\n",
+    )?;
+    let home = root.join("home");
+    let base = match layout {
+        Layout::Separate => root.clone(),
+        Layout::InsideHome => home.clone(),
+    };
+    let name = |separate: &str, inside: &str| {
+        base.join(match layout {
+            Layout::Separate => separate,
+            Layout::InsideHome => inside,
+        })
+    };
     let env = SynthEnv {
-        home: root.join("home"),
-        config_home: root.join("c"),
-        data_home: root.join("d"),
-        state_home: root.join("s"),
-        runtime_dir: root.join("r"),
-        claude_dir: root.join("claude"),
+        config_home: name("c", "xdg-config"),
+        data_home: name("d", "xdg-data"),
+        state_home: name("s", "xdg-state"),
+        runtime_dir: name("r", "xdg-run"),
+        claude_dir: name("claude", "claude-config"),
+        home,
         root,
     };
+    mkdir(&env.home)?;
     // XDG_RUNTIME_DIR must already exist and be private, like /run/user/<uid>.
     for d in [
         &env.config_home,
@@ -110,8 +152,21 @@ pub fn generate(root: &Path, bulk: usize) -> io::Result<SynthEnv> {
     ] {
         fs::DirBuilder::new().mode(0o700).create(d)?;
     }
-    mkdir(&env.home)?;
     let home = &env.home;
+    if layout == Layout::InsideHome {
+        for d in env.ccwm_dirs() {
+            fs::DirBuilder::new().mode(0o700).create(&d)?;
+            write(&d.join("CLAUDE.md"), "# decoy: ccwm's own directory\n")?;
+        }
+        write(
+            &env.claude_dir.join("CLAUDE.md"),
+            "# decoy: the Claude config directory\n",
+        )?;
+        write(
+            &env.claude_dir.join("projects/-decoy/CLAUDE.md"),
+            "# decoy inside the Claude config directory\n",
+        )?;
+    }
 
     // Projects.
     project(home, "dev/alpha")?;
@@ -216,6 +271,23 @@ mod tests {
         assert!(env.home.join("dev/alpha/CLAUDE.md").is_file());
         assert!(env.claude_dir.join("projects").is_dir());
         assert_eq!(env.expected_projects(3).len(), 11);
+    }
+
+    #[test]
+    fn inside_home_layout_puts_every_xdg_dir_under_the_walked_home() {
+        let t = tempfile::tempdir().unwrap();
+        let env = generate_with(&t.path().join("env"), 0, Layout::InsideHome).unwrap();
+        for (k, p) in env.env_pairs() {
+            if k != "HOME" {
+                assert!(p.starts_with(&env.home), "{k} = {}", p.display());
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                assert!(!name.starts_with('.'), "{k} must not be hidden");
+            }
+        }
+        for d in env.ccwm_dirs() {
+            assert!(d.join("CLAUDE.md").is_file());
+        }
+        assert!(env.claude_dir.join("CLAUDE.md").is_file());
     }
 
     #[test]

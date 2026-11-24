@@ -471,3 +471,156 @@ fn roots_that_reach_a_hard_boundary_by_dotdot_or_symlink_are_forbidden() {
         );
     }
 }
+
+/// L7: Claude Code's config directory is a hard boundary even when it is not hidden, with the
+/// boundaries built exactly as the daemon builds them.
+#[test]
+fn a_non_hidden_claude_config_dir_and_xdg_dirs_inside_home_are_hard_boundaries() {
+    use cc_workspace_manager::paths::{session_dir, Dirs, EnvVars};
+    let f = fixture();
+    f.marker("dev/real");
+    let env = EnvVars {
+        xdg_config_home: Some(f.home.join("xdg-config").into()),
+        xdg_data_home: Some(f.home.join("xdg-data").into()),
+        xdg_state_home: Some(f.home.join("xdg-state").into()),
+        xdg_runtime_dir: Some(f.home.join("xdg-run").into()),
+        claude_config_dir: Some(f.home.join("claude-cfg").into()),
+    };
+    let dirs = Dirs::resolve(&env, &f.home);
+    let claude = session_dir(&env, &f.home);
+    for d in dirs.all() {
+        f.marker(d.strip_prefix(&f.home).unwrap().to_str().unwrap());
+    }
+    f.marker("claude-cfg");
+    f.marker("claude-cfg/projects/-x");
+    f.marker("xdg-config/other-app"); // not ccwm's: an ordinary directory
+    let mut o = f.opts();
+    o.boundaries = dirs.hard_boundaries(&claude);
+    let (mut found, s) = f.run(&o);
+    found.sort();
+    assert_eq!(found, ["dev/real", "xdg-config/other-app"]);
+    assert!(s.skipped.excluded >= 5, "{:?}", s.skipped);
+
+    // The same through a symlinked spelling of CLAUDE_CONFIG_DIR (boundaries are canonicalized).
+    symlink(f.home.join("claude-cfg"), f.home.join("cfg-link")).unwrap();
+    let mut o = f.opts();
+    o.boundaries = dirs.hard_boundaries(&f.home.join("cfg-link"));
+    let (found, _) = f.run(&o);
+    assert!(
+        !found.iter().any(|p| p.starts_with("claude-cfg")),
+        "{found:?}"
+    );
+
+    // A root inside the Claude config directory is refused outright.
+    let mut o = f.opts();
+    o.roots = vec![f.home.join("claude-cfg/projects")];
+    o.boundaries = dirs.hard_boundaries(&claude);
+    let status = SharedStatus::default();
+    scan(&o, &AtomicBool::new(false), &status, &mut |_| true);
+    assert_eq!(status.snapshot().roots[0].state, "forbidden");
+}
+
+/// Acceptance test 1 for the inside-home layout, through the scanner alone.
+#[test]
+fn the_inside_home_synthetic_layout_yields_exactly_the_expected_projects() {
+    use cc_workspace_manager::paths::{session_dir, Dirs, EnvVars};
+    use cc_workspace_manager::synth::{generate_with, Layout};
+    let t = tempfile::tempdir().unwrap();
+    let env = generate_with(&t.path().join("e"), 3, Layout::InsideHome).unwrap();
+    let vars = EnvVars {
+        xdg_config_home: Some(env.config_home.clone().into()),
+        xdg_data_home: Some(env.data_home.clone().into()),
+        xdg_state_home: Some(env.state_home.clone().into()),
+        xdg_runtime_dir: Some(env.runtime_dir.clone().into()),
+        claude_config_dir: Some(env.claude_dir.clone().into()),
+    };
+    let dirs = Dirs::resolve(&vars, &env.home);
+    let before = snapshot(&env.root);
+    let opts = ScanOptions {
+        roots: vec![env.home.clone()],
+        exclude: vec![],
+        max_depth: 10,
+        same_file_system: true,
+        home: env.home.clone(),
+        boundaries: dirs.hard_boundaries(&session_dir(&vars, &env.home)),
+        fuse_mounts: vec![],
+    };
+    let mut found = Vec::new();
+    scan(
+        &opts,
+        &AtomicBool::new(false),
+        &SharedStatus::default(),
+        &mut |b| {
+            found.extend(b.into_iter().map(|c| {
+                c.canonical_path
+                    .strip_prefix(env.home.to_str().unwrap())
+                    .unwrap()
+                    .trim_start_matches('/')
+                    .to_string()
+            }));
+            true
+        },
+    );
+    found.sort();
+    assert_eq!(found, env.expected_projects(3));
+    assert_eq!(snapshot(&env.root), before);
+}
+
+/// Test 7 / M3: another user swaps walked directories for symlinks to somewhere else, as fast as
+/// possible, while discovery runs. The walk must never enter a symlink's target. (Probabilistic by
+/// nature; with the old path-based walk this fails within the first few hundred scans. The
+/// deterministic version of the race is in `discovery::dirfd` unit tests.)
+#[test]
+fn a_directory_swapped_for_a_symlink_during_the_walk_is_never_followed() {
+    use nix::fcntl::{renameat2, RenameFlags, AT_FDCWD};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    const PAIRS: usize = 8;
+    let f = fixture();
+    let outside = f.home.parent().unwrap().join("outside");
+    fs::create_dir_all(outside.join("only-outside")).unwrap();
+    fs::write(outside.join("only-outside/CLAUDE.md"), "x").unwrap();
+    let stash = f.mkdir(".stash");
+    let mut pairs = Vec::new();
+    for p in 0..PAIRS {
+        f.marker(&format!("shared/sub{p}/inner"));
+        for i in 0..10 {
+            f.mkdir(&format!("shared/sub{p}/inner/d{i}"));
+        }
+        symlink(&outside, stash.join(format!("sub{p}"))).unwrap();
+        pairs.push((
+            f.home.join(format!("shared/sub{p}")),
+            stash.join(format!("sub{p}")),
+        ));
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let swapper = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut swaps = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                for (a, b) in &pairs {
+                    // Atomic exchange: each name is always the real directory or the symlink.
+                    if renameat2(AT_FDCWD, a, AT_FDCWD, b, RenameFlags::RENAME_EXCHANGE).is_ok() {
+                        swaps += 1;
+                    }
+                }
+            }
+            swaps
+        })
+    };
+    let mut changed = 0;
+    for _ in 0..3000 {
+        let (found, s) = f.run(&f.opts());
+        assert!(
+            found.iter().all(|p| !p.contains("only-outside")),
+            "the walk followed a swapped-in symlink: {found:?}"
+        );
+        changed += s.skipped.changed;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let swaps = swapper.join().unwrap();
+    assert!(swaps > 0, "the swapper never ran");
+    eprintln!("swaps={swaps} changed-directory skips observed={changed}");
+}

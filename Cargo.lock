@@ -178,6 +178,8 @@ dependencies = [
  "base64",
  "clap",
  "getrandom",
+ "hyper",
+ "hyper-util",
  "ignore",
  "landlock",
  "nix",

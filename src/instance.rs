@@ -49,7 +49,7 @@ impl InstanceLock {
 
 pub fn write_instance(dirs: &Dirs, info: &InstanceInfo) -> Result<()> {
     let path = dirs.instance_path();
-    let tmp = path.with_extension("json.tmp");
+    let tmp = dirs.instance_tmp_path();
     let json = serde_json::to_vec(info)
         .map_err(|e| Error::new(format!("cannot encode instance info: {e}")))?;
     let mut file = OpenOptions::new()
@@ -84,15 +84,20 @@ mod tests {
             xdg_data_home: Some(t.join("d").into()),
             xdg_state_home: Some(t.join("s").into()),
             xdg_runtime_dir: Some(t.join("r").into()),
+            claude_config_dir: None,
         };
         let d = Dirs::resolve(&env, t);
-        d.ensure(nix::unistd::geteuid().as_raw()).unwrap();
+        d.ensure(&crate::paths::Owner {
+            uid: nix::unistd::geteuid().as_raw(),
+            private_gid: None,
+        })
+        .unwrap();
         d
     }
 
     #[test]
     fn second_acquire_fails_until_the_first_is_dropped() {
-        let t = tempfile::tempdir().unwrap();
+        let t = crate::paths::private_tempdir();
         let d = dirs(t.path());
         let first = InstanceLock::acquire(&d).unwrap();
         let err = InstanceLock::acquire(&d).unwrap_err().to_string();
@@ -104,7 +109,7 @@ mod tests {
     #[test]
     fn instance_json_roundtrip_is_private_and_atomic() {
         use std::os::unix::fs::PermissionsExt;
-        let t = tempfile::tempdir().unwrap();
+        let t = crate::paths::private_tempdir();
         let d = dirs(t.path());
         let info = InstanceInfo {
             pid: 42,
@@ -122,14 +127,14 @@ mod tests {
                 & 0o777,
             0o600
         );
-        assert!(!d.runtime.join("instance.json.tmp").exists());
+        assert!(!d.instance_tmp_path().exists());
         remove_instance(&d);
         assert_eq!(read_instance(&d.instance_path()), None);
     }
 
     #[test]
     fn garbage_instance_file_reads_as_none() {
-        let t = tempfile::tempdir().unwrap();
+        let t = crate::paths::private_tempdir();
         let p = t.path().join("i.json");
         fs::write(&p, "{nope").unwrap();
         assert_eq!(read_instance(&p), None);

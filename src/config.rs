@@ -1,6 +1,7 @@
 //! `config.toml` model. Read at startup only (§14); unknown keys are errors so typos fail loudly.
 
 use crate::error::{Error, Result};
+use crate::paths::Owner;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -66,8 +67,10 @@ impl Config {
         Ok(cfg)
     }
 
-    /// A missing file means defaults; any other problem is an error.
-    pub fn load(path: &Path) -> Result<Self> {
+    /// A missing file means defaults; any other problem is an error. The file and every
+    /// directory above it must be trusted by `owner` (no other user can modify or replace them):
+    /// the config chooses the discovery roots and the port.
+    pub fn load(path: &Path, owner: &Owner) -> Result<Self> {
         let md = match std::fs::metadata(path) {
             Ok(md) => md,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
@@ -84,6 +87,9 @@ impl Config {
                 path.display()
             )));
         }
+        owner
+            .verify_trusted(path)
+            .map_err(|e| Error::new(format!("untrusted config file: {e}")))?;
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::io(format!("cannot read config {}", path.display()), &e))?;
         Self::parse(&text).map_err(|e| Error::new(format!("{} ({})", e, path.display())))
@@ -174,18 +180,61 @@ mod tests {
         );
     }
 
+    /// Independent of the test process's umask (002 would make the file group-writable).
+    fn private(p: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn me() -> Owner {
+        Owner {
+            uid: nix::unistd::geteuid().as_raw(),
+            private_gid: None,
+        }
+    }
+
+    #[test]
+    fn load_rejects_a_config_file_other_users_can_modify() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = crate::paths::private_tempdir();
+        let p = t.path().join("c.toml");
+        std::fs::write(&p, "[server]\nport = 9001\n").unwrap();
+        for mode in [0o666, 0o646, 0o664] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = Config::load(&p, &me()).unwrap_err().to_string();
+            assert!(err.contains("untrusted config"), "{mode:o}: {err}");
+        }
+        // Group write by the user's private group is not write by others.
+        let gid = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&p).unwrap());
+        let private = Owner {
+            private_gid: Some(gid),
+            ..me()
+        };
+        assert_eq!(Config::load(&p, &private).unwrap().server.port, 9001);
+        let foreign = Owner {
+            uid: me().uid + 1,
+            private_gid: None,
+        };
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(Config::load(&p, &foreign).is_err(), "owned by someone else");
+    }
+
     #[test]
     fn load_missing_file_gives_defaults_and_bad_file_errors() {
-        let t = tempfile::tempdir().unwrap();
+        let t = crate::paths::private_tempdir();
         assert_eq!(
-            Config::load(&t.path().join("none.toml")).unwrap(),
+            Config::load(&t.path().join("none.toml"), &me()).unwrap(),
             Config::default()
         );
         let p = t.path().join("c.toml");
         std::fs::write(&p, "[server]\nport = 9001\n").unwrap();
-        assert_eq!(Config::load(&p).unwrap().server.port, 9001);
+        private(&p);
+        assert_eq!(Config::load(&p, &me()).unwrap().server.port, 9001);
         std::fs::write(&p, "not toml [").unwrap();
-        assert!(Config::load(&p).unwrap_err().to_string().contains("c.toml"));
-        assert!(Config::load(t.path()).is_err()); // a directory is not a config file
+        assert!(Config::load(&p, &me())
+            .unwrap_err()
+            .to_string()
+            .contains("c.toml"));
+        assert!(Config::load(t.path(), &me()).is_err()); // a directory is not a config file
     }
 }

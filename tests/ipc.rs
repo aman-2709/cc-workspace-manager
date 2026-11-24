@@ -73,7 +73,10 @@ async fn ping_bootstrap_status_and_revoke_all_work_over_the_socket() {
 
     let issued = srv.call("auth.bootstrap").await.unwrap();
     assert_eq!(issued["port"], common::PORT);
-    assert_eq!(issued["expires_in"], 60);
+    assert_eq!(
+        issued["expires_in"],
+        cc_workspace_manager::auth::bootstrap::BOOTSTRAP_TTL_SECS
+    );
     let token = issued["bootstrap_token"].as_str().unwrap();
     let session = e.service.auth_exchange(token).await.unwrap(); // the token really works
     assert_eq!(

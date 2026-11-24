@@ -50,6 +50,12 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for ApiQuery<T> {
     }
 }
 
+/// The presented `Authorization: Bearer <token>`, **not** yet authenticated. Only `/auth/rotate`
+/// uses it directly, because the service must also accept a token whose rotation is overdue there.
+pub struct Bearer {
+    pub token: String,
+}
+
 /// An authenticated browser session (`Authorization: Bearer <session token>`).
 pub struct SessionAuth {
     pub token: String,
@@ -68,6 +74,17 @@ fn bearer(parts: &Parts) -> Option<&str> {
         .then_some(token.trim())
 }
 
+impl<S: Send + Sync> FromRequestParts<S> for Bearer {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, ApiError> {
+        let token = bearer(parts)
+            .ok_or_else(ApiError::unauthorized)?
+            .to_string();
+        Ok(Self { token })
+    }
+}
+
 impl FromRequestParts<Arc<AppState>> for SessionAuth {
     type Rejection = ApiError;
 
@@ -75,9 +92,7 @@ impl FromRequestParts<Arc<AppState>> for SessionAuth {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, ApiError> {
-        let token = bearer(parts)
-            .ok_or_else(ApiError::unauthorized)?
-            .to_string();
+        let Bearer { token } = Bearer::from_request_parts(parts, state).await?;
         state.service.authenticate(&token).await?;
         Ok(Self { token })
     }

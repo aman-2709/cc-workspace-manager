@@ -3,7 +3,7 @@
 use crate::client;
 use crate::daemon::{self, ServeArgs};
 use crate::error::{Error, Result};
-use crate::paths::{current_home, Dirs, EnvVars};
+use crate::paths::{current_home, Dirs, EnvVars, Owner};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -56,7 +56,7 @@ fn open(print_only: bool) -> Result<()> {
     let uid = nix::unistd::geteuid().as_raw();
     let home = current_home(uid)?;
     let dirs = Dirs::resolve(&EnvVars::from_process(), &home);
-    dirs.verify_runtime(uid)?;
+    dirs.verify_runtime(&Owner::current(uid))?;
     let issued = client::call(&dirs.socket_path(), uid, "auth.bootstrap")?;
     let token = issued.get("bootstrap_token").and_then(|v| v.as_str());
     let port = issued
@@ -82,7 +82,10 @@ fn open(print_only: bool) -> Result<()> {
         .spawn()
     {
         Ok(_) => {
-            println!("Opening the dashboard in your browser (the sign-in link is single-use and expires in 60 seconds).");
+            println!(
+                "Opening the dashboard in your browser (the sign-in link is single-use and expires in {} seconds).",
+                crate::auth::bootstrap::BOOTSTRAP_TTL_SECS
+            );
             Ok(())
         }
         Err(_) => {

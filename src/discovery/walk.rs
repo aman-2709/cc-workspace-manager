@@ -1,18 +1,21 @@
 //! The marker-discovery walk (REQUIREMENTS.md §4).
 //!
-//! An iterative preorder DFS over `std::fs::read_dir` (not `ignore::Walk`: that hides `.git`, interleaves
-//! files with sub-directories, and so cannot answer "does a registered project already contain me?"
-//! deterministically). Only directory entries and metadata are read. Symlinked directories are never
-//! followed; excluded directories are pruned before descending; nothing here ever writes.
+//! An iterative preorder DFS (not `ignore::Walk`: that hides `.git`, interleaves files with
+//! sub-directories, and so cannot answer "does a registered project already contain me?"
+//! deterministically). Only directory entries and metadata are read. Every directory is opened by
+//! descriptor relative to its parent and verified by `(dev, ino)` ([`super::dirfd`]), so a
+//! directory swapped for a symlink mid-walk is skipped, never followed. Excluded directories are
+//! pruned before descending; nothing here ever writes.
 
+use super::dirfd::{DirHandle, Identity, Kind, OpenError};
 use super::exclusions::Exclusions;
 use super::status::{Phase, RootStatus, SharedStatus, Skipped};
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -71,22 +74,21 @@ fn record_io_error(skipped: &mut Skipped, e: &io::Error) {
     }
 }
 
-/// A symlinked `CLAUDE.md` is a marker only if it resolves to a regular file inside `dir`.
-fn symlink_marker_ok(dir: &Path) -> bool {
-    let (Ok(target), Ok(dir_c)) = (
-        fs::canonicalize(dir.join(MARKER_NAME)),
-        fs::canonicalize(dir),
-    ) else {
-        return false;
-    };
-    target.starts_with(&dir_c) && fs::metadata(&target).is_ok_and(|m| m.is_file())
-}
-
-fn is_git_root(dir: &Path) -> bool {
-    fs::symlink_metadata(dir.join(".git")).is_ok()
+/// How to open a frame's directory.
+enum Open {
+    /// A walk root, already opened.
+    Root(DirHandle),
+    /// `name` inside `parent`, which must still be the directory `expected` that was listed.
+    Child {
+        parent: Rc<DirHandle>,
+        name: OsString,
+        expected: Identity,
+    },
 }
 
 struct Frame {
+    open: Open,
+    /// Built from the root's canonical path and the entry names; never resolved through symlinks.
     path: PathBuf,
     depth: usize,
     /// A registered project already contains this directory.
@@ -173,6 +175,13 @@ impl Walker<'_> {
         }
     }
 
+    fn count_open_error(&mut self, e: OpenError) {
+        match e {
+            OpenError::Replaced => self.summary.skipped.changed += 1,
+            OpenError::Io(e) => record_io_error(&mut self.summary.skipped, &e),
+        }
+    }
+
     fn scan_root(&mut self, root: &Path) {
         let display = root.to_string_lossy().into_owned();
         let canonical = match self.root_state(root) {
@@ -201,20 +210,25 @@ impl Walker<'_> {
                 return;
             }
         };
-        let Ok(root_md) = fs::metadata(&canonical) else {
-            self.roots.push(RootStatus {
-                path: display,
-                state: "unreadable",
-            });
-            return;
+        let handle = match DirHandle::open_root(&canonical) {
+            Ok(h) => h,
+            Err(e) => {
+                self.count_open_error(e);
+                self.roots.push(RootStatus {
+                    path: display,
+                    state: "unreadable",
+                });
+                return;
+            }
         };
         self.roots.push(RootStatus {
             path: display,
             state: "ok",
         });
-        let root_dev = root_md.dev();
+        let root_dev = handle.identity().dev;
 
         let mut stack = vec![Frame {
+            open: Open::Root(handle),
             path: canonical,
             depth: 0,
             inside_project: false,
@@ -243,53 +257,49 @@ impl Walker<'_> {
         {
             self.publish_progress();
         }
-        let entries = match fs::read_dir(&frame.path) {
-            Ok(rd) => rd,
-            Err(e) => {
-                record_io_error(&mut self.summary.skipped, &e);
-                return;
-            }
+        let mut dir = match frame.open {
+            Open::Root(h) => h,
+            Open::Child {
+                parent,
+                name,
+                expected,
+            } => match parent.open_child(&name, expected) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.count_open_error(e);
+                    return;
+                }
+            },
         };
+        let (entries, errors) = dir.entries();
+        for e in &errors {
+            record_io_error(&mut self.summary.skipped, e);
+        }
 
         let mut marker_valid = false;
-        let mut subdirs: Vec<(OsString, u64)> = Vec::new();
+        let mut has_git = false;
+        let mut subdirs: Vec<(OsString, Identity)> = Vec::new();
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    record_io_error(&mut self.summary.skipped, &e);
-                    continue;
-                }
-            };
-            let file_type = match entry.file_type() {
-                Ok(t) => t,
-                Err(e) => {
-                    record_io_error(&mut self.summary.skipped, &e);
-                    continue;
-                }
-            };
-            let name = entry.file_name();
-            if name == MARKER_NAME && (file_type.is_file() || file_type.is_symlink()) {
-                if file_type.is_file() || symlink_marker_ok(&frame.path) {
-                    marker_valid = true;
-                } else {
-                    self.summary.skipped.rejected_markers += 1;
-                }
-                continue; // (a *directory* named CLAUDE.md is not a marker; it is walked like any other)
+            if entry.name == ".git" {
+                has_git = true; // any kind: a .git file marks a worktree or submodule
             }
-            if file_type.is_dir() {
-                match entry.metadata() {
-                    Ok(md) => subdirs.push((name, md.dev())),
-                    Err(e) => record_io_error(&mut self.summary.skipped, &e),
+            match entry.kind {
+                Kind::File if entry.name == MARKER_NAME => marker_valid = true,
+                Kind::Symlink if entry.name == MARKER_NAME => {
+                    if dir.symlink_resolves_to_file_beneath(&entry.name) {
+                        marker_valid = true;
+                    } else {
+                        self.summary.skipped.rejected_markers += 1;
+                    }
                 }
+                // (a *directory* named CLAUDE.md is not a marker; it is walked like any other)
+                Kind::Dir(id) => subdirs.push((entry.name, id)),
+                Kind::File | Kind::Symlink | Kind::Other => {}
             }
         }
 
         let mut inside_project = frame.inside_project;
-        if marker_valid
-            && frame.path != self.opts.home
-            && (!inside_project || is_git_root(&frame.path))
-        {
+        if marker_valid && frame.path != self.opts.home && (!inside_project || has_git) {
             self.register(&frame.path);
             inside_project = true;
         }
@@ -297,20 +307,26 @@ impl Walker<'_> {
         if frame.depth >= self.opts.max_depth {
             return;
         }
-        subdirs.sort();
-        for (name, dev) in subdirs.into_iter().rev() {
+        subdirs.sort_by(|a, b| a.0.cmp(&b.0));
+        let dir = Rc::new(dir);
+        for (name, id) in subdirs.into_iter().rev() {
             if name.to_str().is_none() {
                 self.summary.skipped.non_utf8 += 1;
                 continue;
             }
             let child = frame.path.join(&name);
             if exclusions.exclude_dir(&child, &name).is_some()
-                || (self.opts.same_file_system && dev != root_dev)
+                || (self.opts.same_file_system && id.dev != root_dev)
             {
                 self.summary.skipped.excluded += 1;
                 continue;
             }
             stack.push(Frame {
+                open: Open::Child {
+                    parent: Rc::clone(&dir),
+                    name,
+                    expected: id,
+                },
                 path: child,
                 depth: frame.depth + 1,
                 inside_project,
