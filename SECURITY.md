@@ -70,6 +70,11 @@ environment without `DBUS_*`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK` and similar IPC
   origin. It can read what the page stored (the session token) but cannot use it (peer-UID check),
   and `ccwm open` never talks to it. It can still show you false information. Prefer starting ccwm
   at login (systemd user unit, M4).
+- **Same-user proxies.** The peer-UID check identifies the process that opened the connection to
+  ccwm, not the client behind it. A TCP forwarder running as you (`ssh -L`, `socat`, an IDE's port
+  forwarding) opens its own connection and passes the check, so another local user who can reach the
+  forwarder's port can use a leaked sign-in link or session token through it. Don't forward ccwm's
+  port, or bind forwarders only where other users cannot connect.
 - **Not confined by the sandbox:** UDP and other non-TCP socket families, and `connect()` to
   path-based Unix sockets (no Landlock right for it before ABI 9; ccwm does not request it in v0.1).
   A seccomp `socket()` filter is planned for M4.
