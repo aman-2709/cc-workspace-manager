@@ -27,6 +27,14 @@ fn main() {
     });
     match synth::generate(&dir, bulk) {
         Ok(env) => {
+            let git_note = match synth::init_git(&env) {
+                Ok(true) => "Git projects (dev/beta, dev/beta/packages/inner, dev/monorepo) are real repositories.\n",
+                Ok(false) => "git is not installed: Git projects have placeholder .git directories only.\n",
+                Err(e) => {
+                    eprintln!("ccwm-synth: cannot create the synthetic Git repositories: {e}");
+                    std::process::exit(1);
+                }
+            };
             let lines: String = env
                 .env_pairs()
                 .iter()
@@ -36,7 +44,7 @@ fn main() {
                 eprintln!("ccwm-synth: cannot write env file: {e}");
                 std::process::exit(1);
             }
-            println!("Synthetic environment created in {}\n\n{lines}\nUse it for ccwm only (never for cargo):\n  env $(cat {}/env) target/debug/ccwm serve --port 0", env.root.display(), env.root.display());
+            println!("Synthetic environment created in {}\n{git_note}\n{lines}\nUse it for ccwm only (never for cargo):\n  env $(cat {}/env) target/debug/ccwm serve --port 0", env.root.display(), env.root.display());
         }
         Err(e) => {
             eprintln!("ccwm-synth: {e}");

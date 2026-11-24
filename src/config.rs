@@ -13,6 +13,9 @@ const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 pub struct Config {
     pub server: ServerConfig,
     pub discovery: DiscoveryConfig,
+    pub watch: WatchConfig,
+    pub activity: ActivityConfig,
+    pub git: GitConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -37,6 +40,10 @@ pub struct DiscoveryConfig {
     pub exclude: Vec<String>,
     pub max_depth: usize,
     pub same_file_system: bool,
+    /// Seconds between background reconciliation scans (§4.5).
+    pub scan_interval_secs: u64,
+    /// Missing projects are purged after this many days (§4.5).
+    pub missing_retention_days: u32,
 }
 
 impl Default for DiscoveryConfig {
@@ -46,8 +53,57 @@ impl Default for DiscoveryConfig {
             exclude: Vec::new(),
             max_depth: 10,
             same_file_system: true,
+            scan_interval_secs: 600,
+            missing_retention_days: 30,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct WatchConfig {
+    /// Maximum inotify watches; 0 = automatic: `min(8192, 25 % of max_user_watches)` (§5.1).
+    pub budget: u32,
+    /// File events of one project are coalesced for this long (§5.1).
+    pub debounce_ms: u64,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            budget: 0,
+            debounce_ms: 2000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ActivityConfig {
+    /// Calendar days since the last modification from which a project is *inactive* (§5.3).
+    pub inactive_after_days: u32,
+    /// Calendar days from which a project is *dormant*.
+    pub dormant_after_days: u32,
+    /// Recent file events kept per project (§5.2).
+    pub events_per_project: u32,
+}
+
+impl Default for ActivityConfig {
+    fn default() -> Self {
+        Self {
+            inactive_after_days: 7,
+            dormant_after_days: 30,
+            events_per_project: 200,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct GitConfig {
+    /// Run worktree `git status` even when Git is too old (< 2.41.0) to pass `--attr-source`,
+    /// i.e. without the filter-driver protection of §6. Off by default.
+    pub allow_unhardened_status: bool,
 }
 
 pub fn validate_port(port: u16) -> Result<()> {
@@ -117,6 +173,40 @@ impl Config {
             }
         }
         crate::discovery::exclusions::validate_patterns(&d.exclude).map_err(Error::new)?;
+        if !(60..=86_400).contains(&d.scan_interval_secs) {
+            return Err(Error::new(
+                "discovery.scan_interval_secs must be between 60 and 86400",
+            ));
+        }
+        if !(1..=3650).contains(&d.missing_retention_days) {
+            return Err(Error::new(
+                "discovery.missing_retention_days must be between 1 and 3650",
+            ));
+        }
+        let w = &self.watch;
+        if w.budget > 1_048_576 {
+            return Err(Error::new(
+                "watch.budget must be 0 (automatic) or at most 1048576",
+            ));
+        }
+        if !(100..=60_000).contains(&w.debounce_ms) {
+            return Err(Error::new(
+                "watch.debounce_ms must be between 100 and 60000",
+            ));
+        }
+        let a = &self.activity;
+        if !(1..a.dormant_after_days).contains(&a.inactive_after_days)
+            || a.dormant_after_days > 3650
+        {
+            return Err(Error::new(
+                "activity thresholds must satisfy 1 <= inactive_after_days < dormant_after_days <= 3650",
+            ));
+        }
+        if !(1..=10_000).contains(&a.events_per_project) {
+            return Err(Error::new(
+                "activity.events_per_project must be between 1 and 10000",
+            ));
+        }
         Ok(())
     }
 }
@@ -131,6 +221,51 @@ mod tests {
         assert_eq!(c.server.port, 8765);
         assert!(c.discovery.roots.is_empty() && c.discovery.same_file_system);
         assert_eq!(c.discovery.max_depth, 10);
+        assert_eq!(
+            (
+                c.discovery.scan_interval_secs,
+                c.discovery.missing_retention_days
+            ),
+            (600, 30)
+        );
+        assert_eq!((c.watch.budget, c.watch.debounce_ms), (0, 2000));
+        assert_eq!(
+            (
+                c.activity.inactive_after_days,
+                c.activity.dormant_after_days,
+                c.activity.events_per_project
+            ),
+            (7, 30, 200)
+        );
+        assert!(!c.git.allow_unhardened_status);
+    }
+
+    #[test]
+    fn the_example_config_is_valid_and_matches_the_defaults() {
+        let example = include_str!("../config.example.toml");
+        assert_eq!(Config::parse(example).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn parses_m2_sections() {
+        let c = Config::parse(
+            "[discovery]\nscan_interval_secs = 120\nmissing_retention_days = 7\n[watch]\nbudget = 100\ndebounce_ms = 500\n[activity]\ninactive_after_days = 3\ndormant_after_days = 10\nevents_per_project = 50\n[git]\nallow_unhardened_status = true\n",
+        )
+        .unwrap();
+        assert_eq!(c.discovery.scan_interval_secs, 120);
+        assert_eq!(c.discovery.missing_retention_days, 7);
+        assert_eq!((c.watch.budget, c.watch.debounce_ms), (100, 500));
+        assert_eq!(
+            (
+                c.activity.inactive_after_days,
+                c.activity.dormant_after_days
+            ),
+            (3, 10)
+        );
+        assert_eq!(c.activity.events_per_project, 50);
+        assert!(c.git.allow_unhardened_status);
+        assert!(Config::parse("[watch]\nrecursive = true").is_err());
+        assert!(Config::parse("[git]\nallow = true").is_err());
     }
 
     #[test]
@@ -167,6 +302,15 @@ mod tests {
             "[discovery]\nexclude = [\"\"]",
             "[discovery]\nexclude = [\"a\\u0000b\"]",
             "[discovery]\nexclude = [\"bad\\\\\"]",
+            "[discovery]\nscan_interval_secs = 59",
+            "[discovery]\nscan_interval_secs = 86401",
+            "[discovery]\nmissing_retention_days = 0",
+            "[watch]\nbudget = 2000000",
+            "[watch]\ndebounce_ms = 99",
+            "[activity]\ninactive_after_days = 0",
+            "[activity]\ninactive_after_days = 30",
+            "[activity]\ndormant_after_days = 5000",
+            "[activity]\nevents_per_project = 0",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

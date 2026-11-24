@@ -15,6 +15,9 @@ pub enum Request {
     AuthBootstrap,
     AuthRevokeAll,
     ServiceStatus,
+    /// Coalesced reconciliation (`ccwm scan`).
+    ScanRefresh,
+    DiscoveryStatus,
 }
 
 /// Exactly `{"op": "<name>"}` and nothing else (serde cannot reject extra fields on tagged unit variants).
@@ -27,19 +30,30 @@ pub fn parse_request(line: &str) -> Result<Request, ApiError> {
         "auth.bootstrap" => Ok(Request::AuthBootstrap),
         "auth.revoke_all" => Ok(Request::AuthRevokeAll),
         "service.status" => Ok(Request::ServiceStatus),
+        "scan.refresh" => Ok(Request::ScanRefresh),
+        "discovery.status" => Ok(Request::DiscoveryStatus),
         _ => Err(bad()),
     }
 }
 
 pub async fn dispatch(service: &Service, req: Request) -> Result<Value, ApiError> {
     match req {
-        Request::Ping => Ok(json!({ "version": crate::service::VERSION })),
+        Request::Ping => Ok(json!({
+            "version": crate::service::VERSION,
+            "commit": crate::service::COMMIT,
+        })),
         Request::AuthBootstrap => {
             Ok(serde_json::to_value(service.auth_bootstrap()?).map_err(ApiError::internal)?)
         }
         Request::AuthRevokeAll => Ok(json!({ "revoked": service.auth_revoke_all().await? })),
         Request::ServiceStatus => {
             Ok(serde_json::to_value(service.service_status()).map_err(ApiError::internal)?)
+        }
+        Request::ScanRefresh => {
+            Ok(serde_json::to_value(service.refresh()?).map_err(ApiError::internal)?)
+        }
+        Request::DiscoveryStatus => {
+            Ok(serde_json::to_value(service.discovery_status()).map_err(ApiError::internal)?)
         }
     }
 }
@@ -83,6 +97,14 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"op":"service.status"}"#).unwrap(),
             Request::ServiceStatus
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"scan.refresh"}"#).unwrap(),
+            Request::ScanRefresh
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"discovery.status"}"#).unwrap(),
+            Request::DiscoveryStatus
         );
     }
 

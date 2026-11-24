@@ -17,7 +17,8 @@ has run it (see `ROADMAP.md`).
 | claude | 2.1.331; `claude --help` lists `--resume <session-id>` |
 | systemd | 255 (`systemctl --user` works); `Linger=no` |
 | Landlock | `landlock` in `/sys/kernel/security/lsm`; ABI **8** (queried via `landlock_create_ruleset`) ⇒ filesystem + TCP rules available |
-| `unshare -rn` | **fails** (`apparmor_restrict_unprivileged_userns=1`) ⇒ security acceptance test 5 is skipped on this host |
+| `unshare -rn` | **fails** (`apparmor_restrict_unprivileged_userns=1`), as does `unshare --user --map-current-user --net` ⇒ test 5 runs its **strace** variant here |
+| strace / node | strace 6.8 (traces children; `kernel.yama.ptrace_scope=1` allows tracing our own children); node v22.22.0 (UI helper tests) |
 | inotify | `max_user_watches=65536` ⇒ default budget `min(8192, 25 %)` = 8192; `max_user_instances=128` with ≥109 already used by other processes ⇒ ccwm uses exactly one instance |
 | Env | uid 1000; `XDG_RUNTIME_DIR=/run/user/1000`; other XDG vars unset; `CLAUDE_CONFIG_DIR` unset |
 | Not installed | `musl-tools`; `cargo-deny` is not installed system-wide (M1.1 installs 0.21.0 into the ignored `target/tools/` to run it — 0.22 needs rustc 1.95) |
@@ -52,8 +53,18 @@ src/
                   #     M1.1: peer.rs (TCP peer UID via /proc/net/tcp{,6})
   synth.rs        # M1: synthetic environment generator (feature `synth`; also used by tests)
   bin/ccwm-synth.rs   # M1: CLI for the generator (required-features = ["synth"])
-  watch/ activity/ git/        # M2   (git/ is the only module that spawns `git`)
+  activity.rs     # M2: calendar-day buckets (jiff, system time zone), filter ranges, stats boundaries
+  git/            # M2: mod.rs (Git: detect, allowlisted inspect), run.rs (timeout + process-group kill, bounded output), parse.rs
+                  #     (porcelain v2 -z, config -z, log, version, remote-URL sanitizing). The ONLY module that spawns `git`.
+  watch/          # M2: mod.rs (Monitor actor: one inotify instance, watch table, budget, polled mode, debounce, rename pairing,
+                  #     meaningful-activity rules -> Signals), tree.rs (fd-based project-tree walk + in-process gitignore matcher)
+  tracker.rs      # M2: reconciliation loop, missing/purge, enrollment (walk -> inferred activity -> Git -> move matching -> watches),
+                  #     handling of the monitor's Signals, GitQueue (4 concurrent, one refresh per project, rerun-once)
+  events.rs       # M2: Notifier (bounded change queue), coalesced batches, Hub (broadcast of pre-serialized JSON), until_stopped
+  view.rs         # M2: API/WS JSON shape of projects (display_path, activity status, git summary/detail, monitoring)
+  http/ws.rs      # M2: GET /api/v1/ws
   claude/ privacy.rs           # M3   (claude/ is the only module that knows Claude's file formats)
+build.rs                       # M2-pre: CCWM_GIT_COMMIT = 12-hex HEAD (+ "-dirty"), or "unknown"; runs git on THIS repo at build time only
 web/ index.html app.css app.js # embedded with include_str!
 scripts/ inspect-session-schema.py   # §19: maintainer-run, structure-only
 tests/ …                       # integration tests; tests/fixtures/** reviewed synthetic fixtures only
@@ -77,9 +88,11 @@ flowchart LR
     R[(db::reader<br/>RO pool)]
     HTTP[axum on 127.0.0.1:port]
     IPC[ipc server<br/>unix socket, SO_PEERCRED]
-    WATCH[watch M2]
+    WATCH[watch::Monitor<br/>1 inotify instance]
+    TRK[tracker<br/>reconcile + signals]
+    PUB[publisher -> Hub]
     SESS[claude:: M3]
-    GIT[git:: M2]
+    GIT[git:: GitQueue x4]
   end
   FS[(home / roots)] -->|dir entries + metadata| SCAN
   SCAN -->|batches| W
@@ -91,11 +104,18 @@ flowchart LR
   SVC --> R
   BROWSER[browser] <-->|Bearer session token| HTTP
   CLI[ccwm open / scan / ...] <-->|JSON lines, peer-uid verified both ways| IPC
-  WATCH -.-> W
+  FS -->|inotify events| WATCH
+  WATCH -->|Signals| TRK
+  TRK -->|Cmd: Plan/Add/Remove| WATCH
+  TRK --> SCAN
+  TRK --> GIT
+  GIT -->|git_cache| W
+  TRK --> W
+  W -.->|after commit: Notifier| PUB
+  PUB -->|ws events| HTTP
   SESS -.-> W
-  GIT -.-> W
 ```
-Solid = M1. The CLI never uses TCP and never reads a token file; the browser never reaches the socket.
+Dashed = M3. The CLI never uses TCP and never reads a token file; the browser never reaches the socket.
 
 ### Start sequence (`ccwm serve`)
 1. Refuse if `geteuid()==0`. `umask(0o077)`. Parse args/config path.
@@ -105,14 +125,14 @@ Solid = M1. The CLI never uses TCP and never reads a token file; the browser nev
 5. Build the Tokio runtime; probe a worker and a blocking-pool thread (read of `/` must fail with `EACCES`); log the `SandboxReport`. Take the `flock` (lock file in the runtime dir). Open SQLite (`temp_store=MEMORY` so no temp files are needed under the sandbox), migrate, spawn writer + reader pool.
 6. Bind TCP `127.0.0.1:port` (failure ⇒ clear message naming the port; exit 1 in M1, dedicated code in M4) and the Unix socket (remove a stale socket only if it is a socket we own; the lock proves no live daemon).
 7. Write `instance.json` (pid, port, version, started_at; atomic rename).
-8. Spawn discovery (background), the hourly session purge, and serve. Cached projects are readable immediately.
-9. SIGTERM/SIGINT: stop accepting → cancel discovery → writer `Flush` + join → remove socket and `instance.json` → exit 0.
+8. Detect `git` on `PATH` (version, hardened?); create the single inotify instance (failure ⇒ every project polled, reported); build Tracker, Monitor, Service; spawn the monitor, the reconciler (first scan immediately), the signal handler, the WebSocket publisher, the hourly session purge, and serve. Cached projects are readable immediately.
+9. SIGTERM/SIGINT: stop accepting → cancel discovery → stop monitor/tracker/publisher → writer `Flush` + join → remove socket and `instance.json` → exit 0.
 
 ---
 
 ## 4. Dependencies (justification required by §3)
 
-Spec-named: `axum` (`ws` from M2), `tokio`, `notify` (M2), `rusqlite` (`bundled`), `serde`, `serde_json`, `clap`,
+Spec-named: `axum` (`ws` from M2), `tokio`, `notify` (M2, `default-features = false`: inotify backend only), `rusqlite` (`bundled`), `serde`, `serde_json`, `clap`,
 `tracing`, `tracing-subscriber`, `toml`, `ignore`, `landlock`. Approved by the maintainer: `nix`, `sha2`,
 `subtle`, `getrandom`, `base64`, `jiff` (M2), `regex` (M3). **Rejected: `ureq`; all HTTP/DNS client crates are
 banned (§11.5).**
@@ -124,6 +144,9 @@ banned (§11.5).**
 | `landlock` | §11.5 sandbox |
 | `hyper` (`server`,`http1`), `hyper-util` (`tokio`,`service`) — M1.1 | already in the tree through axum with exactly these features (no new crate): the serve loop needs hyper's http1 builder for the header-read timeout, which `axum::serve` does not expose |
 | `ignore` (`gitignore` module only in M1) | user exclusion patterns with gitignore syntax; gitignore matching in M2 |
+| `jiff` (M2, approved) | calendar days in the system time zone (DST-correct day boundaries) |
+| `notify` 9 (M2) | the single inotify watcher; brings `inotify`, `inotify-sys` (ISC), `mio`, `walkdir`, `xxhash-rust` (BSL-1.0); `notify` itself is CC0-1.0 — licenses added to `deny.toml` (flagged for review) |
+| `axum` `ws` (M2) | WebSocket upgrade; brings `tokio-tungstenite`/`tungstenite`, `sha1` 0.10, `base64` 0.22, `rand` 0.9 (`getrandom` 0.3). **axum enables `tokio-tungstenite`'s default `connect` feature** (a WebSocket client entry point): no extra crate, never called, TCP connect denied by Landlock; noted in SECURITY.md. Duplicate-version warnings (base64, digest/sha1 vs sha2, getrandom) are accepted (`multiple-versions = "warn"`) |
 | dev: `tempfile` | temp dirs/repos |
 
 Not added: `ureq`/`reqwest`/any client; `rust-embed` (`include_str!` for three files); `tracing-journald`
@@ -173,8 +196,19 @@ carry the stored `sort_key`, so SQL and Rust can never disagree (L8).
 **Sessions (M1.1):** creating a session first purges expired ones, then keeps the 10 most recently used
 (the new one always kept). `PurgeExpiredSessions` also clears previous-token hashes whose grace has ended.
 
-Later: **M2** `ignored_paths`, `file_events`, `git_cache`, activity/missing/monitoring columns, sort indexes;
-**M3** `sessions` (aggregates only: min/max timestamps, first/last cwd, title, `is_sidechain`) and
+### Migration 3 (M2)
+`projects` + `marker_hash BLOB` (SHA-256 of ≤256 KiB of `CLAUDE.md`, move matching), `missing_since`,
+`activity_at`, `activity_kind` (`inferred|observed`), `activity_path`; indexes `(activity_at, sort_key, id)`,
+`(missing_since)`. `ignored_paths(canonical_path PK, ignored_at)`. `file_events(id, project_id → CASCADE, at,
+kind ∈ create|modify|delete|rename, path)`, trimmed to `activity.events_per_project`. `git_cache(project_id PK →
+CASCADE, fetched_at, state, branch, detached, upstream, ahead, behind, staged, modified, untracked, files JSON
+(≤200 per list), head_commit/subject/author/time, remote_url sanitized)`; NULL counts = status not run.
+Writer commands added: `RecordActivity` (never moves backwards; same second: observed may upgrade an inference
+or name a newer file; `path = NULL` keeps the file), `StoreGit`, `MarkMissing`, `PurgeMissing`, `MoveProject`
+(deletes a duplicate row already at the new path, keeps the id, moves the ignore entry), `SetIgnored`; `UpsertProjects`
+now returns per-row `{id, inserted, revived}` and clears `missing_since`.
+
+Later: **M3** `sessions` (aggregates only: min/max timestamps, first/last cwd, title, `is_sidechain`) and
 `session_file_checkpoints`; prompt text only if the opt-in "Store prompt text" is on. No per-record table.
 
 **Writer:** one `std::thread`, `sync_channel(1024)` of `WriteCmd` (`UpsertProjects`, `CreateSession`,
@@ -197,8 +231,11 @@ exclude = []                 # extra gitignore-syntax patterns, relative to each
 max_depth = 10
 same_file_system = true
 ```
-`deny_unknown_fields`. Symlink-following is not configurable in v0.1 (never followed). M2+ adds keys as used
-(`git.allow_unhardened_status`, scan interval, watch budget, thresholds, retention, …).
+`deny_unknown_fields`. Symlink-following is not configurable in v0.1 (never followed). M2 keys (all in
+`config.example.toml`, which a unit test parses and compares with the defaults):
+`discovery.scan_interval_secs` (600, 60–86400), `discovery.missing_retention_days` (30), `watch.budget` (0 = auto),
+`watch.debounce_ms` (2000), `activity.inactive_after_days` (7), `activity.dormant_after_days` (30),
+`activity.events_per_project` (200), `git.allow_unhardened_status` (false).
 
 ---
 
@@ -216,6 +253,53 @@ and cannot compare exact entry names without extra work).
 6. Phases `idle → scanning → idle`; `last_success_at` persisted in `meta`. M1 scans once at startup; vanished projects are **not** removed in M1 (missing state is M2).
 
 ---
+
+## 7a. M2 activity tracking
+
+**Actors.** `watch::Monitor` (one task) owns the notify watcher and the watch table; it never touches SQLite.
+`tracker::Tracker` runs two tasks: the reconciler and the signal handler. `GitQueue` runs Git refreshes (≤4,
+one per project, a request during a refresh schedules exactly one more). `Service::run_publisher` turns
+`Notifier` changes (bounded queue, coalesced 200 ms) into WebSocket messages.
+
+**Reconciliation** (startup, every `scan_interval_secs`, or on request; never overlapping; failures back off ×2 up
+to 1 h): full discovery scan (batches upserted and published progressively) → projects not found are marked
+missing, except under a root whose scan state is not `ok` → new/revived projects are enrolled → (startup) every
+present project is walked and handed to the monitor as one **Plan**; (later) polled projects are walked for newer
+mtimes and re-added → purge of projects missing longer than the retention → `scans_finished += 1`.
+`POST /refresh` returns `done_at_scans_finished` (current + 1, or + 2 while a scan runs).
+
+**Enrollment** (new project, revived, un-ignored, `.gitignore` changed, renamed): fd-based tree walk
+(`watch/tree.rs`: same exclusions as discovery, other projects' subtrees pruned, `.gitignore` +
+`.git/info/exclude` layers when the project is in a Git work tree below home, ≤100 000 entries, future mtimes
+clamped to now) → newest file = *inferred* activity → Git inspection → for a newly inserted project while
+missing projects exist: **move matching** (exactly one missing project with the same HEAD commit and the same
+sanitized remote, or — without a commit — the same marker hash and no Git head; ambiguity ⇒ no match) ⇒ the old id
+moves to the new path and the new row is deleted → Git cache stored → `Cmd::Add` to the monitor.
+
+**Watch plan / budget.** Budget = `min(8192, max_user_watches/4)` or `watch.budget`. Allocation for a plan (projects
+most-recent first): every project root, then the parents of project roots (sibling detection, inside the
+configured roots only), then for each project its `.git` directory and the rest of its eligible directories. A
+project that does not fit completely, hits `ENOSPC` (kernel limit), has a truncated tree, or exists while the
+inotify instance is unavailable is **polled** (reason reported). Watches are non-recursive, `IN_DONT_FOLLOW`,
+`IN_ONLYDIR`.
+
+**Events → signals.** Paths are attributed to the innermost registered project (longest prefix). In a project:
+`.git/…` (not `*.lock`) ⇒ Git refresh only; gitignored files and excluded directories ⇒ nothing; other changes ⇒
+activity (debounced per project for `debounce_ms`; one `Activity` signal with the latest file, the events and a
+Git-refresh flag); a new eligible directory is walked and watched and re-discovered (it may hold a nested project);
+a new `CLAUDE.md` or `.git` in a subdirectory ⇒ re-discovery of that directory (subtree scan with the full-scan
+rules and the caller-supplied nesting state); `.gitignore` changed ⇒ re-walk. On a project root (from its parent's
+watch): removed ⇒ `Vanished` (missing at once), created ⇒ re-discovery. In a sibling-detection directory: a new
+directory is watched one level deep and re-discovered; a new `CLAUDE.md` ⇒ re-discovery. Renames: notify reports
+`From`, `To` and a paired `Both` with one cookie; halves wait 200 ms for their partner; `Both` touching project roots
+⇒ `Moved` (ids kept if the new location still qualifies, else missing); unpaired halves ⇒ removal / creation.
+`IN_Q_OVERFLOW` or our 8192-event queue full ⇒ `Rescan`: the next reconciliation walks every project and re-plans
+all watches, then `OverflowRecovered`.
+
+**Activity status and sorting.** `activity::Classifier` (system time zone via jiff; UTC fallback) computes the
+status per row and the `[from, until)` ranges used by the `activity` filter and the stats, from the same day
+boundaries. Sort keys: `k1` = negated time for "newest first", time for "oldest first", `i64::MAX` for unknown (last
+in both orders), then `sort_key`, then `id`; the cursor carries `(k1, sort_key, id)`.
 
 ## 8. API and IPC contracts
 
@@ -241,16 +325,36 @@ Errors: `{"error":{"code":"…","message":"…"}}` — codes `invalid_argument 4
 ### Browser endpoints (M1)
 | | | |
 |---|---|---|
-| `GET /health` | Public | `{"status":"ok","version":"0.1.0"}` — never proof of identity |
+| `GET /health` | Public | `{"status":"ok","version":"0.1.0","commit":"<12 hex>[-dirty]"\|"unknown"}` — never proof of identity |
 | `POST /auth/exchange` | Public + Origin | `{"bootstrap_token"}` → `{"session_token","expires_at","rotate_after"}`; bad/used/expired ⇒ identical 401 |
 | `POST /auth/rotate` | Bearer (authenticated by the service; the only route an overdue token may use) | → new `session_token` (+ times); the old token stays valid 60 s |
 | `POST /auth/logout` | Session | revokes the session → 204 |
-| `GET /projects` | Session | `q`, `sort` (`activity`\|`name`), `order`, `limit` 1–200 (default 50), `cursor` → `{"items":[{"id","name","path","sources","first_seen_at"}],"next_cursor","total"}`. In M1 `activity` has no timestamps, so (unknown sorts last, ties by name) it equals name order. Other §12 filters arrive with their milestone and are rejected as unknown until then. |
-| `GET /stats` | Session | `{"total_projects":n}`; later milestones add fields — unknown values are never emitted as `0` |
+| `GET /projects` | Session | `q` (name, path, branch), `sort` (`activity` default \| `name` \| `commit`), `order` (default `desc` for times, `asc` for names), `activity` (`all`\|`today`\|`week`\|`inactive`\|`dormant`\|`unknown`), `dirty`, `include_missing`, `include_ignored` (`1`\|`0`\|`true`\|`false`), `limit` 1–200 (default 50), `cursor` → `{"items":[project],"next_cursor","total"}`; `has_sessions`, `sort=session`, `privacy` are rejected until M3 |
+| `GET /projects/{id}` | Session | project + `git_detail{head{hash,short,subject,author,time},remote_url,files{staged,modified,untracked}}`; malformed or unknown id ⇒ 404 |
+| `PUT` / `DELETE /projects/{id}/ignore` | Session + Origin | ignore / un-ignore (by canonical path; idempotent) → the project |
+| `POST /refresh` | Session + Origin | 202 `{"status":"accepted","done_at_scans_finished":n}` |
+| `GET /ws` | Origin required; auth by first message | see below |
+| `GET /stats` | Session | `{"total_projects","modified_today","modified_this_week","inactive","dormant","unknown_activity","uncommitted_changes","missing"}` over present, non-ignored projects (missing counted separately); `total_sessions` arrives in M3 |
 | `GET /discovery/status` | Session | `{"phase","dirs_visited","projects_found","skipped":{…},"roots":[{"path","state"}],"last_success_at","next_scan_at"}` |
 | `GET /service/status` | Session | M1 subset: `version`, `uptime_s`, `port`, `sandbox{abi,status,filesystem,network:"tcp_only"\|"none",abstract_unix_socket,signal,no_new_privs,threads_at_apply,thread_probes{worker,blocking},broad_read_rules[],unconfined[],notes[]}`, `discovery{phase,last_success_at}` |
 
 "Session" = a valid token whose rotation is not overdue (rotated within 24 h + 60 s).
+
+**Project** (list items, events): `{"id","name","path","display_path" ("~/…" inside home),"sources",
+"first_seen_at","activity":{"status","at","kind","path"},"git":null|{"state","branch","detached","upstream",
+"ahead","behind","staged","modified","untracked","dirty","commit":{"subject","time"}|null,"checked_at"},
+"missing_since","ignored","monitoring":"watched"|"polled"|null,"monitoring_reason"}`. Git states: `ok`,
+`not_git`, `git_missing`, `unsafe_repository`, `status_disabled_old_git`, `status_disabled_unsafe_config`,
+`timeout`, `error`. `/discovery/status` adds `scans_finished`; `/service/status` adds `commit`, `discovery.next_scan_at`,
+`monitoring{watcher,watches,budget,max_user_watches,watched_projects,polled_projects,overflows,
+recovering_overflow,pending_projects,degraded,advice[]}`, `git{program,version,hardened_status,
+unhardened_status_allowed}`, `queues{git_in_flight,websocket_clients}`.
+
+**WebSocket** (`/api/v1/ws`): exact Origin on upgrade (403 otherwise); client messages ≤ 4 KiB; first message
+`{"type":"auth","token":…}` (unknown fields rejected) within 5 s else close 4401; then `{"type":"ready"}` and events
+`project` (`{"project":…}`), `project_removed` (`{"id"}`), `stats`, `discovery`, `monitoring`, `resync` (a lagging
+client, or lost changes: fetch a fresh snapshot). Revalidation on revocation (logout, revoke-all, hourly purge) and
+every 10 s ⇒ 4401. The UI reconnects with back-off 1 s…30 s and refetches after every `ready`.
 
 Keyset cursors: base64url JSON `{s,o,k,i}`; a cursor whose `s`/`o` differ from the request, or is malformed, ⇒ 400.
 
@@ -266,6 +370,9 @@ owned by the user, verified; socket `0600`; path must be ≤ 107 bytes or startu
 {"op":"auth.bootstrap"}      → {"ok":{"bootstrap_token":"…","expires_in":30,"port":8765}}
 {"op":"auth.revoke_all"}     → {"ok":{"revoked":3}}
 {"op":"service.status"}      → {"ok":{…same body as GET /service/status…}}
+{"op":"scan.refresh"}        → {"ok":{"status":"accepted","done_at_scans_finished":n}}   (M2; `ccwm scan`)
+{"op":"discovery.status"}    → {"ok":{…same body as GET /discovery/status…}}               (M2)
+{"op":"ping"} also returns "commit"; `ccwm status` warns when it differs from the CLI's build.
 errors                       → {"error":{"code":"…","message":"…"}}   (same codes as HTTP)
 ```
 `ccwm open` uses `auth.bootstrap` only; the URL's port comes from the daemon, not from `instance.json` or a TCP
@@ -302,7 +409,9 @@ confined, a path-based Unix connect outside **succeeds** (documented residual), 
 time ⇒ `not_enforced`, and `child_command` children see no IPC variables. `tests/process.rs` checks the
 real daemon's report (`fully_enforced`, `threads_at_apply = 1`, both thread probes `eacces`).
 `CCWM_REQUIRE_LANDLOCK=1` turns "Landlock unavailable" into a failure. The Git-subprocess variant of test
-11 lands with the Git module (M2).
+11 (M2): the confined child runs plain Git with `protocol.allow=always` against a listener (`git ls-remote
+git://127.0.0.1:…` ⇒ `EACCES`, the listener receives nothing) and `git init` outside (⇒ `EACCES`), and ccwm's hardened
+`Git::inspect` of a repository in the read set succeeds (`ok`).
 
 ---
 
@@ -313,6 +422,7 @@ real daemon's report (`fully_enforced`, `threads_at_apply = 1`, both thread prob
 - **Process-level (real `ccwm` in a synthetic env, `--port 0`):** serve → `open --print` → exchange → list projects → rotate → logout; SIGTERM clean exit; restart serves cached projects before the new scan completes; second instance exits; **impostor**: with no daemon, a TCP listener on the would-be port receives **zero** connections from `ccwm open`; startup log and `service.status` show the sandbox report.
 - **Security acceptance tests in M1 (strengthened in M1.1):** **1** (hash the whole synthetic tree incl. mtimes/modes before/after a full discovery; also with the XDG and Claude config dirs *inside* the walked home), **6** (no token, expired, revoked, wrong Origin, wrong Host, simulated Unix-socket peer-UID mismatch, simulated **TCP** peer-UID mismatch / unknown owner / failed lookup ⇒ connection closed unanswered, concurrent rotation, logout and revoke-all during the grace window, overdue rotation; cross-user check documented as manual), **7** (traversal and symlink escapes in project ids, static paths, markers; untrusted `--config` (world-writable, in a world-writable dir, symlinked there, FIFO), untrusted XDG dirs, non-hidden `CLAUDE_CONFIG_DIR`, and a concurrent directory↔symlink swap race during the walk), **9** (`tests/hygiene.rs`: every runtime file name from the `paths.rs` constants incl. `instance.json.tmp` and WAL/SHM, a real synthetic env generated inside the repo, sensitive patterns; skipped with notice if git is absent, **failure** if `CI` is set), **11** (above). Log check runs at `info` and at `CCWM_LOG=trace`. WAL/SHM modes `0600` asserted (unit and process level).
 - `web/` grep test: no `innerHTML|outerHTML|insertAdjacentHTML|document.write|eval(|new Function`. `app.js` logic is exercised by `node --test` only if node exists (not a build requirement); otherwise documented manual steps.
+- **M2 tests:** `tests/git.rs` (real repositories: states, upstream/remote, worktrees, unborn, home repo, timeouts via a stand-in, old-Git gate; acceptance **3** and **4** with control runs), `tests/watch.rs` (monitor with a recording fake backend: eligible-only non-recursive watches, budget/kernel/no-instance polled modes, debounce, ignore rules, nested attribution, rename pairing, overflow, live discovery), `tests/tracker.rs` (full stack with real inotify + Git: live activity, live registration, missing/revived, rename keeps the id, moves while stopped (marker hash, HEAD + remote), purge, Git refresh, ignore), `tests/db.rs` (activity, Git cache, filters, keyset with unknown-last, stats, moves), `tests/http.rs` (detail/ignore/refresh; WebSocket origin, 5 s auth timeout, bad first messages, nothing before auth, revocation/expiry/rotation-out/overdue ⇒ 4401; a valid token over a peer-UID-rejected connection), `tests/process.rs` (M2 acceptance over the real WebSocket; acceptance 1 + 3 with watching and `ccwm scan`; acceptance **5**), `tests/sandbox.rs` (test 11 Git variant), `tests/ui/app.test.js` (query building, view toggle keeps filters, prefs, relative time, Git summary, pagination, back-off). Tests that need an inotify instance hold a lock (this host has few left) and skip with a notice if none can be created, unless `CCWM_REQUIRE_INOTIFY=1`.
 - All tests use temp dirs and synthetic data; none reads the real `$HOME` or `~/.claude`. Cargo itself runs with the normal environment, **never** under the synthetic `HOME` (`CARGO_HOME`/`RUSTUP_HOME` are not redirected; the synthetic env is applied only to spawned `ccwm` processes).
 - **Synthetic environment generator** (`src/synth.rs`, `ccwm-synth <dir>`): creates `home/`, XDG dirs and `claude/` (`CLAUDE_CONFIG_DIR`) under the given dir (default a fresh `/tmp/ccwm-synth-XXXX`), populates projects (marker, symlinked marker, nested git/non-git, excluded dirs, symlink loop, non-UTF-8 name, deep tree, decoys like `claude.md`) and minimal synthetic session files, and prints the `env` line to use. Shared by tests and manual runs (DRY).
 - **Schema inspection script** (`scripts/inspect-session-schema.py`): structure-only per §19; written and tested **only against synthetic data**; the maintainer runs it. Output: key paths + value types, values of an allowlisted set of low-cardinality discriminators (each value must match `^[A-Za-z0-9_.:-]{1,32}$` or is replaced by `<other>`), per-type record counts, file counts and directory-shape patterns (UUIDs → `<uuid>`); no other strings, no real paths.
@@ -399,6 +509,23 @@ codes go in `RestartPreventExitStatus=`.
 - Race test (`tests/discovery.rs`): 8 directories swapped with symlinks by `renameat2(RENAME_EXCHANGE)` during 3,000 scans — ~100 k swaps, ~9 k swaps caught inside the list→open window (`skipped.changed`), the outside target never entered. Mutation check: with `O_NOFOLLOW` and the identity check removed, the test failed in 5/5 runs.
 - `cargo deny check` (cargo-deny 0.21.0, installed into `target/tools/`): see the M1.1 report in `ROADMAP.md`.
 
+## 13c. M2 verification notes (what was actually run, 2026-11-24)
+
+- Pre-M2 test 5: **strace variant** (strace 6.8): daemon + Git children traced through discovery, live edits, Git
+  refreshes, a new project and a socket-triggered reconciliation; every `connect()` was a Unix socket or loopback,
+  Git execs present in the trace. The network-namespace variant has **not run anywhere** (AppArmor blocks it here).
+- Real daemon in a synthetic environment (30 bulk projects, real Git repos from `ccwm-synth`): `landlock
+  fully_enforced abi=8`, `git 2.43.0 hardened_status=true`, 48 watches for 38 projects, `ccwm status`/`ccwm scan`.
+- **Real browser** (Chrome via the extension, against the synthetic daemon): sign-in, cards with uniform heights and
+  left-ellipsized `~/…` paths, table view, an edited project moved to the top and a new `CLAUDE.md` project appeared
+  without reload, daemon stop ⇒ "disconnected" banner, restart ⇒ reconnect and fresh snapshot. No console errors.
+- Process tests: M2 acceptance over the real WebSocket; acceptance 1 + 3 with watching, Git and two `ccwm scan`s:
+  the monitored tree (incl. every `.git`) and the Claude directory unchanged with mtimes/modes.
+- Found and fixed while testing: rename of a project root built `…/name/` (trailing slash) and marked it missing;
+  `ccwm scan` compared one-second timestamps and could wait 10 min (now `scans_finished`); same-second inferred
+  updates could downgrade an observation; `log.showSignature` + `gpg.program` executed during `log -1` (control
+  run) ⇒ `--no-show-signature`; filter names with `=` could not be nulled ⇒ fail closed.
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -417,7 +544,13 @@ means more than 24 h + 60 s since the last rotation (the slack covers a client t
 sending). **L6:** a nested object with more than 12 distinct keys over the whole corpus (record top level:
 64) is data-keyed and fully masked; tag labels come only from the script's own table.
 
+Decided 2026-11-24: M1.1 spec additions L1, L3, L4, L5 (§11) approved; pre-M2 requests (test 5 strace fallback,
+home-relative left-ellipsized paths, licensing, forwarder residual risk + test, build commit in `/health` and
+`ccwm status`).
+
 Open:
+- **O5 (M2, needs approval):** the REQUIREMENTS.md changes listed in the M2 report (Appendix A rows marked "M2"/"pre-M2").
+- **O6:** new dependency licenses ISC, CC0-1.0, BSL-1.0 (via `notify`) allowed in `deny.toml`; review.
 - **O1 (M3):** Landlock vs. "roots change without restart" (§4.1): roots added later outside the startup read set need a restart; Settings must say so. Not a blocker for M1.
 - **O2 (M3):** `suggestion_accepted` prompts; `claude` binary outside allowed system paths.
 - **O3 (M4):** crate/GitHub/distro naming-conflict check needs outbound requests — needs the maintainer's OK.

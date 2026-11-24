@@ -1,7 +1,7 @@
 //! Typed read queries. All SQL is parameterized; `LIKE` input is escaped.
 
+use rusqlite::types::Value;
 use rusqlite::{params_from_iter, Connection, OptionalExtension};
-use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
@@ -9,25 +9,74 @@ pub enum Order {
     Desc,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListParams {
-    pub q: Option<String>,
-    pub order: Order,
-    pub limit: u32,
-    /// Keyset position: `(sort_key, id)` of the last row of the previous page.
-    pub after: Option<(String, String)>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortBy {
+    /// Latest meaningful modification (§5.4 default).
+    Activity,
+    Name,
+    /// Latest Git commit.
+    Commit,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Filters {
+    pub q: Option<String>,
+    pub include_missing: bool,
+    pub include_ignored: bool,
+    /// Only projects with uncommitted changes (staged, modified or untracked).
+    pub dirty: bool,
+    pub activity: Option<crate::activity::Range>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListParams {
+    pub filters: Filters,
+    pub sort: SortBy,
+    pub order: Order,
+    pub limit: u32,
+    /// Keyset position: `(k1, sort_key, id)` of the last row of the previous page.
+    pub after: Option<(i64, String, String)>,
+}
+
+/// The Git cache of one project as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRow {
+    pub fetched_at: i64,
+    pub state: String,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub upstream: Option<String>,
+    pub ahead: Option<i64>,
+    pub behind: Option<i64>,
+    pub staged: Option<i64>,
+    pub modified: Option<i64>,
+    pub untracked: Option<i64>,
+    pub head_commit: Option<String>,
+    pub head_subject: Option<String>,
+    pub head_author: Option<String>,
+    pub head_time: Option<i64>,
+    pub remote_url: Option<String>,
+    /// JSON file lists; only read for the detail view.
+    pub files: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRow {
     pub id: String,
-    /// Stored normalized name ([`crate::db::sort_key`]); used for cursors, not sent to clients.
-    #[serde(skip)]
+    /// Stored normalized name ([`crate::db::sort_key`]); used for cursors.
     pub sort_key: String,
+    /// The primary keyset value for the requested sort (see [`list_projects`]).
+    pub k1: i64,
     pub name: String,
     pub path: String,
     pub sources: Vec<String>,
     pub first_seen_at: i64,
+    pub activity_at: Option<i64>,
+    pub activity_kind: Option<String>,
+    pub activity_path: Option<String>,
+    pub missing_since: Option<i64>,
+    pub ignored: bool,
+    pub git: Option<GitRow>,
 }
 
 /// Escape `%`, `_` and `\` so user text is matched literally.
@@ -44,67 +93,264 @@ pub fn like_pattern(q: &str) -> String {
     out
 }
 
+const PROJECT_COLUMNS: &str = "p.id, p.name, p.canonical_path, p.first_seen_at,
+    (SELECT group_concat(source) FROM (SELECT source FROM project_sources s WHERE s.project_id = p.id ORDER BY source)),
+    p.sort_key, p.activity_at, p.activity_kind, p.activity_path, p.missing_since,
+    (i.canonical_path IS NOT NULL),
+    g.fetched_at, g.state, g.branch, g.detached, g.upstream, g.ahead, g.behind, g.staged, g.modified,
+    g.untracked, g.head_commit, g.head_subject, g.head_author, g.head_time, g.remote_url";
+
+const PROJECT_JOINS: &str = "FROM projects p
+    LEFT JOIN git_cache g ON g.project_id = p.id
+    LEFT JOIN ignored_paths i ON i.canonical_path = p.canonical_path";
+
+/// Rows are read with [`PROJECT_COLUMNS`] at indexes 0..26, then `k1` and `files` if selected.
+fn project_from_row(
+    r: &rusqlite::Row<'_>,
+    k1_at: Option<usize>,
+    files_at: Option<usize>,
+) -> rusqlite::Result<ProjectRow> {
+    let sources: Option<String> = r.get(4)?;
+    let git = match r.get::<_, Option<i64>>(11)? {
+        None => None,
+        Some(fetched_at) => Some(GitRow {
+            fetched_at,
+            state: r.get(12)?,
+            branch: r.get(13)?,
+            detached: r.get::<_, Option<bool>>(14)?.unwrap_or(false),
+            upstream: r.get(15)?,
+            ahead: r.get(16)?,
+            behind: r.get(17)?,
+            staged: r.get(18)?,
+            modified: r.get(19)?,
+            untracked: r.get(20)?,
+            head_commit: r.get(21)?,
+            head_subject: r.get(22)?,
+            head_author: r.get(23)?,
+            head_time: r.get(24)?,
+            remote_url: r.get(25)?,
+            files: files_at.map(|i| r.get(i)).transpose()?.flatten(),
+        }),
+    };
+    Ok(ProjectRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        path: r.get(2)?,
+        first_seen_at: r.get(3)?,
+        sources: sources
+            .map(|s| s.split(',').map(str::to_string).collect())
+            .unwrap_or_default(),
+        sort_key: r.get(5)?,
+        activity_at: r.get(6)?,
+        activity_kind: r.get(7)?,
+        activity_path: r.get(8)?,
+        missing_since: r.get(9)?,
+        ignored: r.get(10)?,
+        git,
+        k1: k1_at.map(|i| r.get(i)).transpose()?.unwrap_or(0),
+    })
+}
+
+/// The `WHERE` clause for [`Filters`], using parameters `?1`..`?7`.
+const FILTER_SQL: &str =
+    "(?1 IS NULL OR p.name LIKE ?1 ESCAPE '\\' OR p.canonical_path LIKE ?1 ESCAPE '\\'
+                           OR g.branch LIKE ?1 ESCAPE '\\')
+     AND (?2 OR p.missing_since IS NULL)
+     AND (?3 OR i.canonical_path IS NULL)
+     AND (NOT ?4 OR coalesce(g.staged, 0) + coalesce(g.modified, 0) + coalesce(g.untracked, 0) > 0)
+     AND (?5 IS NULL OR p.activity_at >= ?5)
+     AND (?6 IS NULL OR p.activity_at < ?6)
+     AND (NOT ?7 OR p.activity_at IS NULL)";
+
+fn filter_values(f: &Filters) -> Vec<Value> {
+    let range = f.activity.unwrap_or_default();
+    let opt = |v: Option<i64>| v.map_or(Value::Null, Value::Integer);
+    vec![
+        f.q.as_deref()
+            .map(like_pattern)
+            .map_or(Value::Null, Value::Text),
+        Value::Integer(i64::from(f.include_missing)),
+        Value::Integer(i64::from(f.include_ignored)),
+        Value::Integer(i64::from(f.dirty)),
+        opt(range.from),
+        opt(range.until),
+        Value::Integer(i64::from(range.unknown)),
+    ]
+}
+
+/// The primary sort key `k1`, ascending in every case: a time sort maps "newest first" to the
+/// negated time, and unknown times to `i64::MAX`, so unknowns sort last in both orders and the
+/// tie-break by name stays ascending. Name sorts use a constant and flip the whole order instead.
+fn k1_expr(sort: SortBy, order: Order) -> &'static str {
+    match (sort, order) {
+        (SortBy::Activity, Order::Desc) => "coalesce(-p.activity_at, 9223372036854775807)",
+        (SortBy::Activity, Order::Asc) => "coalesce(p.activity_at, 9223372036854775807)",
+        (SortBy::Commit, Order::Desc) => "coalesce(-g.head_time, 9223372036854775807)",
+        (SortBy::Commit, Order::Asc) => "coalesce(g.head_time, 9223372036854775807)",
+        (SortBy::Name, _) => "0",
+    }
+}
+
 /// One page of projects plus the total number of matches (ignoring the cursor).
 pub fn list_projects(
     conn: &Connection,
     p: &ListParams,
 ) -> rusqlite::Result<(Vec<ProjectRow>, u64)> {
-    let pattern = p.q.as_deref().map(like_pattern);
-    let (dir, cmp) = match p.order {
-        Order::Asc => ("ASC", ">"),
-        Order::Desc => ("DESC", "<"),
-    };
-    let filter = "(?1 IS NULL OR name LIKE ?1 ESCAPE '\\' OR canonical_path LIKE ?1 ESCAPE '\\')";
+    let mut values = filter_values(&p.filters);
     let total: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM projects WHERE {filter}"),
-        [&pattern],
+        &format!("SELECT count(*) {PROJECT_JOINS} WHERE {FILTER_SQL}"),
+        params_from_iter(values.iter()),
         |r| r.get(0),
     )?;
-
-    let sql = format!(
-        "SELECT id, name, canonical_path, first_seen_at,
-                (SELECT group_concat(source) FROM (SELECT source FROM project_sources s WHERE s.project_id = projects.id ORDER BY source)),
-                sort_key
-         FROM projects
-         WHERE {filter} AND (?2 IS NULL OR (sort_key, id) {cmp} (?2, ?3))
-         ORDER BY sort_key {dir}, id {dir}
-         LIMIT ?4"
-    );
-    let (after_name, after_id) = match &p.after {
-        Some((n, i)) => (Some(n.clone()), Some(i.clone())),
-        None => (None, None),
+    let (dir, cmp) = match (p.sort, p.order) {
+        (SortBy::Name, Order::Desc) => ("DESC", "<"),
+        _ => ("ASC", ">"),
     };
+    let k1 = k1_expr(p.sort, p.order);
+    let sql = format!(
+        "SELECT {PROJECT_COLUMNS}, {k1} AS k1 {PROJECT_JOINS}
+         WHERE {FILTER_SQL} AND (?8 IS NULL OR ({k1}, p.sort_key, p.id) {cmp} (?8, ?9, ?10))
+         ORDER BY k1 {dir}, p.sort_key {dir}, p.id {dir}
+         LIMIT ?11"
+    );
+    match &p.after {
+        Some((k, key, id)) => values.extend([
+            Value::Integer(*k),
+            Value::Text(key.clone()),
+            Value::Text(id.clone()),
+        ]),
+        None => values.extend([Value::Null, Value::Null, Value::Null]),
+    }
+    values.push(Value::Integer(i64::from(p.limit)));
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(
-            params_from_iter([
-                pattern
-                    .map(rusqlite::types::Value::Text)
-                    .unwrap_or(rusqlite::types::Value::Null),
-                after_name
-                    .map(rusqlite::types::Value::Text)
-                    .unwrap_or(rusqlite::types::Value::Null),
-                after_id
-                    .map(rusqlite::types::Value::Text)
-                    .unwrap_or(rusqlite::types::Value::Null),
-                rusqlite::types::Value::Integer(i64::from(p.limit)),
-            ]),
-            |r| {
-                let sources: Option<String> = r.get(4)?;
-                Ok(ProjectRow {
-                    id: r.get(0)?,
-                    sort_key: r.get(5)?,
-                    name: r.get(1)?,
-                    path: r.get(2)?,
-                    first_seen_at: r.get(3)?,
-                    sources: sources
-                        .map(|s| s.split(',').map(str::to_string).collect())
-                        .unwrap_or_default(),
-                })
-            },
-        )?
+        .query_map(params_from_iter(values.iter()), |r| {
+            project_from_row(r, Some(26), None)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok((rows, u64::try_from(total).unwrap_or(0)))
+}
+
+/// One project with its Git file lists, whatever its missing/ignored state.
+pub fn get_project(conn: &Connection, id: &str) -> rusqlite::Result<Option<ProjectRow>> {
+    conn.query_row(
+        &format!("SELECT {PROJECT_COLUMNS}, 0, g.files {PROJECT_JOINS} WHERE p.id = ?1"),
+        [id],
+        |r| project_from_row(r, None, Some(27)),
+    )
+    .optional()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatCounts {
+    pub total: u64,
+    pub today: u64,
+    pub week: u64,
+    pub inactive: u64,
+    pub dormant: u64,
+    pub unknown: u64,
+    pub dirty: u64,
+    pub missing: u64,
+}
+
+/// Counts over present, non-ignored projects (missing ones counted separately), bucketed with
+/// the same boundaries as the activity filters.
+pub fn stat_counts(
+    conn: &Connection,
+    b: &crate::activity::Boundaries,
+) -> rusqlite::Result<StatCounts> {
+    let n = |v: Option<i64>| u64::try_from(v.unwrap_or(0)).unwrap_or(0);
+    conn.query_row(
+        &format!(
+            "SELECT count(*) FILTER (WHERE p.missing_since IS NULL),
+                    count(*) FILTER (WHERE p.missing_since IS NULL AND p.activity_at >= ?1),
+                    count(*) FILTER (WHERE p.missing_since IS NULL AND p.activity_at >= ?2),
+                    count(*) FILTER (WHERE p.missing_since IS NULL AND p.activity_at >= ?3 AND p.activity_at < ?2),
+                    count(*) FILTER (WHERE p.missing_since IS NULL AND p.activity_at < ?3),
+                    count(*) FILTER (WHERE p.missing_since IS NULL AND p.activity_at IS NULL),
+                    count(*) FILTER (WHERE p.missing_since IS NULL
+                        AND coalesce(g.staged, 0) + coalesce(g.modified, 0) + coalesce(g.untracked, 0) > 0),
+                    count(*) FILTER (WHERE p.missing_since IS NOT NULL)
+             {PROJECT_JOINS} WHERE i.canonical_path IS NULL"
+        ),
+        rusqlite::params![b.today, b.recent, b.inactive],
+        |r| {
+            Ok(StatCounts {
+                total: n(r.get(0)?),
+                today: n(r.get(1)?),
+                week: n(r.get(2)?),
+                inactive: n(r.get(3)?),
+                dormant: n(r.get(4)?),
+                unknown: n(r.get(5)?),
+                dirty: n(r.get(6)?),
+                missing: n(r.get(7)?),
+            })
+        },
+    )
+}
+
+/// What the tracker needs to know about every registered project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tracked {
+    pub id: String,
+    pub path: String,
+    pub missing: bool,
+    pub ignored: bool,
+    pub activity_at: Option<i64>,
+}
+
+pub fn tracked_projects(conn: &Connection) -> rusqlite::Result<Vec<Tracked>> {
+    conn.prepare(&format!(
+        "SELECT p.id, p.canonical_path, p.missing_since IS NOT NULL, i.canonical_path IS NOT NULL, p.activity_at
+         {PROJECT_JOINS} ORDER BY coalesce(-p.activity_at, 9223372036854775807), p.sort_key, p.id"
+    ))?
+    .query_map([], |r| {
+        Ok(Tracked {
+            id: r.get(0)?,
+            path: r.get(1)?,
+            missing: r.get(2)?,
+            ignored: r.get(3)?,
+            activity_at: r.get(4)?,
+        })
+    })?
+    .collect()
+}
+
+/// Missing projects that a newly registered project `new_id` is a moved copy of (§4.5): the same
+/// HEAD commit and remote for Git projects (`head` given), else the same marker hash without Git.
+pub fn move_sources(
+    conn: &Connection,
+    new_id: &str,
+    head: Option<&str>,
+    remote: Option<&str>,
+) -> rusqlite::Result<Vec<String>> {
+    conn.prepare(
+        "SELECT o.id FROM projects n
+           JOIN projects o ON o.missing_since IS NOT NULL AND o.id <> n.id
+           LEFT JOIN git_cache og ON og.project_id = o.id
+         WHERE n.id = ?1 AND (
+           (?2 IS NOT NULL AND og.head_commit = ?2 AND og.remote_url IS ?3)
+           OR (?2 IS NULL AND n.marker_hash IS NOT NULL AND o.marker_hash = n.marker_hash
+               AND og.head_commit IS NULL))",
+    )?
+    .query_map(rusqlite::params![new_id, head, remote], |r| r.get(0))?
+    .collect()
+}
+
+pub fn project_path(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT canonical_path FROM projects WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Recent file events of a project, newest first (tests and diagnostics).
+pub fn file_events(conn: &Connection, id: &str) -> rusqlite::Result<Vec<(i64, String, String)>> {
+    conn.prepare("SELECT at, kind, path FROM file_events WHERE project_id = ?1 ORDER BY id DESC")?
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect()
 }
 
 pub fn count_projects(conn: &Connection) -> rusqlite::Result<u64> {

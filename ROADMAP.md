@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **M1.1 (security hardening) complete — waiting for the maintainer's go-ahead for M2.**
+Current position: **M2 (activity tracking) complete, including the pre-M2 items — waiting for the maintainer's go-ahead for M3.**
 
 ---
 
@@ -47,22 +47,31 @@ No new features. Spec changes approved by the maintainer and applied to REQUIREM
 - [x] Tests: 11 (harness-less, real `daemon_policy()`, exact errnos, threads and grandchildren, scopes, Unix-connect residual, `CCWM_REQUIRE_LANDLOCK=1`; real daemon's report and probes), 7 (`--config`, XDG vars, `CLAUDE_CONFIG_DIR`, symlink-swap race with mutation check), 9 (names from `paths.rs`, `instance.json.tmp`, in-repo synthetic env, fail in CI without git), 6 (concurrent rotation, logout/revoke-all in grace, simulated TCP peer-UID mismatch, overdue rotation), 1 (XDG dirs inside the walked home), log check at `CCWM_LOG=trace`, WAL/SHM modes
 - [x] `cargo deny check` run and clean (cargo-deny 0.21.0 in `target/tools/`): unused license allowances removed, known `syn` 2/3 duplicate skipped with a reason
 - [x] fmt / clippy / test / cargo deny green; docs updated; local commit
+- [x] Spec additions L1, L3, L4, L5 (§11) approved by the maintainer (2026-11-24)
+
+## Pre-M2 (maintainer requests, 2026-11-24)
+- [x] Test 5: strace fallback (`strace -f -e trace=connect,execve`, every `connect()` of the daemon and its Git children must be loopback or a Unix socket; Git execs must appear in the trace); network-namespace variant (`unshare --user --map-current-user --net`, probed with the exact wrapper) used where it works. **Ran here: the strace variant** (unshare blocked by AppArmor)
+- [x] UI: home-relative paths (`display_path`, `~/…`), single line, left-ellipsized, full path in the tooltip; uniform card heights. Nested `CLAUDE.md` with/without its own Git root covered by `tests/discovery.rs::nested_projects_follow_the_git_root_rule` (`e/f`, `g/h` vs `c/d`, `a/b`); synthetic `dev/beta/packages/inner` is the **with its own Git root** case
+- [x] Licensing: LICENSE holder, `license = "MIT"`, README with the trademark line, CONTRIBUTING (MIT inbound = outbound, DCO, no CLA); §17 `THIRD_PARTY_LICENSES` via `cargo-about` (M4)
+- [x] SECURITY.md: same-user forwarders bypass the peer-UID check; test: a valid token over a peer-UID-rejected connection is still rejected (every endpoint, incl. the WebSocket upgrade)
+- [x] Build commit in `/health`, `service.status` and `ccwm status`; `ccwm status` warns on a mismatch (pulled `ccwm status` and `ccwm scan` forward from M4; systemd state stays M4)
 
 ## M2 — Activity tracking
 Accept: editing a file moves its project to the top live; creating `CLAUDE.md` in a watched area registers a
 project without reload; Git status is correct; security acceptance tests **3, 4, 5** pass (5 needs a host with
 unprivileged user namespaces — skipped with notice on the development host).
 
-- [ ] One notify watcher / one inotify instance (polled fallback if creation fails); non-recursive watches; dynamic add/remove; budget `min(8192, 25 %)`; priority roots → recent
-- [ ] Degraded/polled mode (budget, kernel limit, `IN_Q_OVERFLOW`) + banner + doctor text
-- [ ] Reconciliation (10 min, non-overlapping, bounded, back-off, coalesced refresh) + `POST /refresh` + socket op
-- [ ] Meaningful-activity rules (in-process gitignore matcher), inferred vs observed, bounded `file_events`; buckets (0/1/6/7/29/30, DST), "this week", sorting incl. unknown-last
-- [ ] `git/`: allowlist; hardened env/flags; `--attr-source` + all-scope filter nulling; min-version gate (2.41.0) with disabled state + `git.allow_unhardened_status`; 5 s timeout + process-group kill; concurrency 4; cache/invalidation; URL sanitization; no-git/detached/worktree/nested/`safe.directory`
-- [ ] Sentinel tests for every §16-test-4 vector; Git subprocess variant of Landlock test 11
-- [ ] Move/rename (paired events + fallback matcher), missing state, retention purge, ignore/un-ignore
-- [ ] WebSocket: auth message/5 s timeout/4401, nothing before auth, close on token expiry/rotation-out/revocation, events, reconnect with backoff + fresh snapshot
-- [ ] UI: card + table, search/sort/filters, ignore, missing filter, banners
-- [ ] `/projects/{id}`, ignore endpoints; fmt/clippy/test; docs; commit
+- [x] One notify watcher / one inotify instance (polled fallback if creation fails); non-recursive watches (`IN_DONT_FOLLOW`, `IN_ONLYDIR`); dynamic add/remove; budget `min(8192, 25 %)`; priority roots → parents → rest of each tree by recency
+- [x] Degraded/polled mode (budget, kernel limit, no instance, truncated tree, `IN_Q_OVERFLOW` or our queue full → full rescan) + UI banner + advice text in `service.status` (for `ccwm doctor`, M4)
+- [x] Reconciliation (10 min, non-overlapping, back-off, coalesced refresh, `scans_finished` counter) + `POST /refresh` + socket op `scan.refresh` + `ccwm scan`
+- [x] Meaningful-activity rules (in-process gitignore matcher), inferred vs observed, bounded `file_events`; buckets (0/1/6/7/29/30, midnight, DST), "this week", sorting incl. unknown-last in both orders
+- [x] `git/`: allowlist; hardened env/flags; `--attr-source` + all-scope filter nulling; unsafe driver names fail closed; `--no-show-signature`; min-version gate (2.41.0) with disabled state + `git.allow_unhardened_status`; 5 s timeout + process-group kill; concurrency 4; cache/invalidation by `.git` events, file activity and reconciliation; URL sanitization; no-git/detached/unborn/worktree/nested/home-repo/`safe.directory`
+- [x] Sentinel tests for every §16-test-4 vector (with control runs); acceptance test 3; Git subprocess variant of Landlock test 11
+- [x] Move/rename (paired events keep the id; fallback matcher: same HEAD + remote, or same marker hash, unique match only), missing state, retention purge, ignore/un-ignore (ignore follows a moved project)
+- [x] WebSocket: Origin, auth message/5 s timeout/4401, nothing before auth, close on revocation/expiry/rotation-out/overdue, events (project, project_removed, stats, discovery, monitoring, resync), reconnect with back-off + fresh snapshot
+- [x] UI: card + table (sortable columns, 100-row pages), search/sort/filters, stats, ignore/un-ignore, missing and ignored filters, degraded and reconnecting banners, theme (system/light/dark), view and theme persisted
+- [x] `/projects/{id}`, ignore endpoints; acceptance (synthetic env, real browser): an edit moves its project to the top live, a new `CLAUDE.md` registers a project without reload, Git status correct; tests 3, 4, 5 pass
+- [x] fmt / clippy / test / cargo deny green; docs; local commit
 
 ## M3 — Development continuity
 Accept: a project with sessions but no `CLAUDE.md` appears; detail panel shows last prompt (read on demand), Git
@@ -83,10 +92,15 @@ Accept: a fresh user account installs from the release archive; service starts a
 lingering); projects appear; all tests including the full security acceptance suite pass; CI (gitleaks +
 cargo-deny bans) green; benchmarks documented.
 
-- [ ] CLI `start/stop/restart/status/scan/doctor/service/auth`; dedicated exit codes (port in use, lock held) in `RestartPreventExitStatus=`
+- [ ] CLI `start/stop/restart/doctor/service/auth` (`status` and `scan` exist since M2; `status` gains the systemd state); dedicated exit codes (port in use, lock held) in `RestartPreventExitStatus=`
+- [ ] TCP peer-UID lookup via `sock_diag` (netlink) as an alternative to `/proc/net/tcp*` (§11.2), with the same fail-closed tests
+- [ ] Daemon-level write/connect probes: the running daemon attempts (and must be denied) a write outside its directories and an outbound TCP connect, reported in `service.status` (today only the read probe runs in the daemon; write/connect are tested in `tests/sandbox.rs`)
+- [ ] Manual two-user check (second local account): peer-UID rejection of TCP and Unix-socket connections, leaked link/token useless; documented procedure and result
+- [ ] `THIRD_PARTY_LICENSES` in release archives via `cargo-about` with a committed, pinned `about.toml`
 - [ ] systemd unit (+ optional `ProtectSystem`/`ProtectHome` only after testing the real daemon); `scripts/install.sh`/`uninstall.sh`
 - [ ] Seccomp filter denying `socket()` after the TCP and Unix listeners are bound (deferred from M1.1; needs a dependency justified in ARCHITECTURE §4 first) — closes UDP and path-based Unix-socket connect
-- [ ] Security acceptance test 5 fallback where `unshare -rn` is unavailable: strace `connect` of the daemon and children, assert no non-loopback connect
+- [x] Security acceptance test 5 fallback where `unshare -rn` is unavailable (done before M2: strace variant)
+- [ ] Test 5 in CI on a runner with unprivileged user namespaces (network-namespace variant has not run anywhere yet)
 - [ ] Security + performance pass with measured numbers; docs (README, SECURITY, CONTRIBUTING, CHANGELOG, LICENSE, config reference, discovery semantics, inotify troubleshooting, retention, service mgmt)
 - [ ] CI (fmt, clippy, test, cargo-deny, gitleaks, hygiene; SHA-pinned; least privilege) + release workflow (musl)
 - [ ] History/secret audit before first publication; naming-conflict check (needs maintainer OK)

@@ -33,6 +33,7 @@ pub fn validate_patterns(patterns: &[String]) -> Result<(), String> {
     Exclusions::new(Path::new("/"), Path::new("/"), patterns, &[], &[]).map(|_| ())
 }
 
+#[derive(Clone)]
 pub struct Exclusions {
     root: PathBuf,
     home: PathBuf,

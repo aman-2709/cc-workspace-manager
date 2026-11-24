@@ -7,17 +7,18 @@ Independent, unofficial tool to discover, track and resume Claude Code projects.
 2. `ARCHITECTURE.md` (modules, data flow, schema, contracts, verified findings), `ROADMAP.md` (checklists + §18 backlog). Keep all three current. §18 items are **not** v0.1.
 
 ## Current status
-**M1 — Foundation: complete (pushed by the maintainer). M1.1 — security hardening: complete (local commit, not pushed).** Waiting for the maintainer's go-ahead before M2. Implement only the approved milestone; after it, stop, report, and wait.
+**M1, M1.1: complete. Pre-M2 items and M2 — Activity tracking: complete (one local commit, not pushed).** Waiting for the maintainer's go-ahead before M3. Implement only the approved milestone; after it, stop, report, and wait.
 
-## Session handoff (2026-11-23, after M1.1)
-- **State:** M1.1 fixed every finding of `docs/reviews/m1-security-review.md` (H1–H2, M1–M4, L1–L8, weak tests 1/6/7/9/11) in one local commit `fix: M1.1 security hardening` (not pushed). Spec changes are in REQUIREMENTS.md §11 + Appendix A and in SECURITY.md (new).
-- **Next:** M2, only after the maintainer approves.
+## Session handoff (2026-11-24, after M2)
+- **State:** pre-M2 requests (test 5 strace fallback, `~/…` left-ellipsized paths + uniform cards, licensing/README/CONTRIBUTING, forwarder residual risk + test, build commit in `/health` and `ccwm status`) and all of M2 (watch engine, tracker/reconciliation, Git module, activity buckets, WebSocket, card/table UI, ignore, missing, moves) in one local commit. Spec changes are applied to REQUIREMENTS.md (Appendix A rows marked "pre-M2"/"M2") and **await approval**.
+- **Next:** M3, only after the maintainer approves M2 and the spec changes. M3 needs the maintainer's pasted output of `scripts/inspect-session-schema.py` (§19).
 - **Open items:**
-  - The maintainer has not run `scripts/inspect-session-schema.py` yet (they run it and paste the output; the agent never runs it). Its `--policy` output was shown in the M1.1 report.
-  - Security acceptance test 5: `unshare -rn` is unavailable here (AppArmor); the strace fallback is an M4 item.
-  - Seccomp `socket()` deny (closes UDP and path-based Unix connect) is deferred to M4.
-  - `cargo-deny` is not installed system-wide; it is installed into the ignored `target/tools/` (0.21.0; 0.22 needs rustc 1.95). `target/` is disposable, so reinstall after `cargo clean` (command in `deny.toml`).
-- **Build / test / run (synthetic environment only):** See **Commands** below.
+  - Test 5 ran as the **strace** variant only; the network-namespace variant (`unshare --user --map-current-user --net`) has never run (AppArmor blocks it here) — needs a CI runner.
+  - New licenses ISC, CC0-1.0, BSL-1.0 (through `notify`) allowed in `deny.toml`, pending maintainer review.
+  - axum's `ws` enables `tokio-tungstenite`'s `connect` feature (unused WebSocket client code); documented in SECURITY.md.
+  - M4 additions: `sock_diag` peer lookup, daemon-level write/connect probes, manual two-user check, `cargo-about`.
+  - Seccomp `socket()` deny still M4; `cargo-deny` lives in `target/tools/` (reinstall after `cargo clean`, command in `deny.toml`).
+- **Build / test / run (synthetic environment only):** see **Commands** below.
 
 ## Hard rules
 - **Never** push, add remotes, tag, publish, run `sudo`, or run `loginctl enable-linger`. Never write outside this repo except cargo's normal `~/.cargo` cache and `/tmp` synthetic environments. Never modify `~/.claude` or monitored projects.
@@ -32,15 +33,17 @@ cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings &&
 target/tools/bin/cargo-deny check        # install: cargo install --locked --root target/tools cargo-deny --version 0.21.0
 CCWM_REQUIRE_LANDLOCK=1 cargo test --test sandbox --test process   # fail (not skip) if Landlock is unavailable
 cargo build
-target/debug/ccwm-synth /tmp/ccwm-synth-demo --projects 30      # synthetic HOME/XDG/CLAUDE_CONFIG_DIR; writes <dir>/env
+target/debug/ccwm-synth /tmp/ccwm-synth-demo --projects 30      # synthetic HOME/XDG/CLAUDE_CONFIG_DIR (+ real Git repos if git exists); writes <dir>/env
 env $(cat /tmp/ccwm-synth-demo/env) target/debug/ccwm serve --port 8766 &   # the synthetic env goes to ccwm only, never to cargo
 env $(cat /tmp/ccwm-synth-demo/env) target/debug/ccwm open --print          # single-use sign-in link (open it in a browser)
+env $(cat /tmp/ccwm-synth-demo/env) target/debug/ccwm status               # daemon state + build-commit check
+env $(cat /tmp/ccwm-synth-demo/env) target/debug/ccwm scan                 # reconcile now, wait for it
 ```
-Tests: `cargo test` (unit + `tests/*.rs`; `tests/process.rs` spawns the real binary in a synthetic env; `tests/sandbox.rs` has its own `main` (`harness = false`) so Landlock is applied single-threaded; `tests/ui.rs` runs `node --test` if node exists). Tests that check paths ccwm trusts use 0700 temp dirs (`common::tempdir`, `paths::private_tempdir`): tempdirs follow the umask (0775 here).
+Tests: `cargo test` (unit + `tests/*.rs`; `tests/watch.rs` uses a fake watch backend, `tests/tracker.rs`/`process.rs` need real inotify instances (skip with notice unless `CCWM_REQUIRE_INOTIFY=1`) and Git; test 5 needs `strace` or user namespaces; `tests/process.rs` spawns the real binary in a synthetic env; `tests/sandbox.rs` has its own `main` (`harness = false`) so Landlock is applied single-threaded; `tests/ui.rs` runs `node --test` if node exists). Tests that check paths ccwm trusts use 0700 temp dirs (`common::tempdir`, `paths::private_tempdir`): tempdirs follow the umask (0775 here).
 
 ## Conventions
 - Rust stable, `rust-version = "1.94"` (only tested toolchain). `Cargo.lock` committed. New dependency ⇒ justify in ARCHITECTURE.md §4 first; HTTP/DNS client crates are **banned** (`deny.toml`).
-- Module boundaries: only `git/` spawns git; only `claude/` knows Claude formats; only `db/writer.rs` writes SQLite; no `rusqlite` on Tokio workers; bounded queues; transports (HTTP, Unix socket) call `service.rs` only.
+- Module boundaries: only `git/` spawns git (via `Git::command`: empty env + the six §6 vars, `BASE_ARGS`); only `watch/` touches notify; only `tracker` combines discovery, tree walk, Git and watches; only `claude/` knows Claude formats; only `db/writer.rs` writes SQLite; no `rusqlite` on Tokio workers; bounded queues; transports (HTTP, Unix socket) call `service.rs` only.
 - **Landlock is applied in `main` before any other thread exists.** Report what is active, never what was requested.
 - Security: bind `127.0.0.1` only; every TCP connection's peer UID verified (`http/peer.rs`) before anything is read; Host + Origin checks; tokens hashed (SHA-256), constant-time compared, never logged; parameterized SQL; clients never pass paths (opaque ids); session text never logged or rendered as HTML; CLI ↔ daemon only over the Unix socket with `SO_PEERCRED` verified on both sides; a TCP `/health` is never identity.
 - Every child process of the daemon is built with `sandbox::child_command` (drops session-IPC env vars). Directories are walked by descriptor (`discovery/dirfd.rs`), never re-opened by path. Paths ccwm trusts (config file, ancestors of its dirs) go through `paths::Owner::verify_trusted`.
@@ -49,10 +52,18 @@ Tests: `cargo test` (unit + `tests/*.rs`; `tests/process.rs` spawns the real bin
 - Inject clocks, roots, uid and dirs so tests never read the real environment.
 - User style: DRY (flag repetition); many tests > few; explicit over clever; "engineered enough"; handle edge cases; explain trade-offs. Invoke `andrej-karpathy-skills:karpathy-guidelines` before non-trivial code. When corrected or reviewed, ask whether to record the learning here.
 
-## Environment facts (2026-11-23)
-Ubuntu 24.04, rustc/cargo 1.94.0, git 2.43.0 (needs ≥2.41.0 for `--attr-source`), claude 2.1.331, systemd 255, Landlock ABI 8, `unshare -rn` unavailable (AppArmor) ⇒ acceptance test 5 skipped here, `max_user_instances` nearly exhausted (one inotify instance only).
+## Environment facts (2026-11-24)
+Ubuntu 24.04, rustc/cargo 1.94.0, git 2.43.0 (needs ≥2.41.0 for `--attr-source`), claude 2.1.331, systemd 255, Landlock ABI 8, strace 6.8, node 22; `unshare -rn` and `--map-current-user` unavailable (AppArmor) ⇒ test 5 runs the strace variant; inotify `max_user_instances` 128 with ~109 used by other processes (tests serialize their watchers).
 
 ## Gotchas learned
+- notify 9 reports a rename as `From`, `To` **and** a paired `Both` (same cookie) and drops watches of a moved directory itself; act on `Both`, expire unpaired halves (200 ms).
+- `Path::join("")` appends a trailing slash: the root of a moved tree moves to `to`, not `to.join("")`.
+- Timestamps are whole seconds: never detect "a new scan finished" by comparing times (use `scans_finished`); tests that need "newer" must cross a second boundary.
+- `log.showSignature=true` + `gpg.program` in repo config runs a program during `git log` ⇒ always `--no-show-signature`.
+- Git splits `-c` at the first `=`: a filter driver named `x=y` cannot be nulled ⇒ disable status (fail closed).
+- `watch::Ref` (from `wait_for`) is not `Send`: use `events::until_stopped` in spawned `select!`s.
+- `pkill -f <pattern>` matches the invoking shell's own command line when the pattern appears in it: use a `[x]yz` bracket pattern.
+- A test script used as a fake `ssh` must not read stdin (Git waits for it ⇒ deadlock).
 - `git status` runs `filter.*.clean` even with the basic hardening flags; needs `--attr-source=<empty tree>` **and** nulling every filter driver in every scope (ARCHITECTURE.md §12).
 - Landlock confines only the calling thread and its future children: apply it before spawning threads.
 - SQLite under Landlock: `temp_store=MEMORY` (no `/tmp` writes).
@@ -69,8 +80,8 @@ Ubuntu 24.04, rustc/cargo 1.94.0, git 2.43.0 (needs ≥2.41.0 for `--attr-source
 - `axum::serve` exposes no header-read timeout; the server loop uses hyper's http1 builder directly (`http/mod.rs`).
 - A gitignore pattern with an inner slash is anchored to the `.gitignore` directory: use `**/ccwm/config.toml`.
 
-## Module status (M1)
-`paths config clock error api_error sandbox instance db/{mod,writer,reader,queries} discovery/{walk,dirfd,exclusions,mounts,status} auth/{tokens,bootstrap,sessions} service ipc/{protocol,server} client http/{mod,peer,middleware,extract,routes,assets,error} daemon cli synth bin/ccwm-synth` + `web/*` + `scripts/inspect-session-schema.py` + `deny.toml` + `SECURITY.md`. Not built yet: `watch activity git claude privacy` (M2/M3).
+## Module status
+M1: `paths config clock error api_error sandbox instance db/{mod,writer,reader,queries} discovery/{walk,dirfd,exclusions,mounts,status} auth/{tokens,bootstrap,sessions} service ipc/{protocol,server} client http/{mod,peer,middleware,extract,routes,assets,error} daemon cli synth bin/ccwm-synth` + `web/*` + `scripts/inspect-session-schema.py` + `deny.toml` + `SECURITY.md`. M2: `activity git/{mod,run,parse} watch/{mod,tree} tracker events view http/ws build.rs` + migration 3 + README/CONTRIBUTING. Not built yet: `claude privacy` (M3).
 
 ## Open items
 See ARCHITECTURE.md §14 (O1–O4).

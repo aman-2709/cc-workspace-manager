@@ -252,6 +252,78 @@ pub fn generate_with(root: &Path, bulk: usize, layout: Layout) -> io::Result<Syn
     Ok(env)
 }
 
+/// Turn the synthetic Git projects (`dev/beta`, its nested `packages/inner`, `dev/monorepo`) into
+/// real repositories with one commit each, using `git` from `PATH`. Returns `false` (and leaves
+/// the placeholder `.git` directories) when Git is not installed. Only the synthetic tree is
+/// written; Git runs with the synthetic `HOME` and no system configuration.
+pub fn init_git(env: &SynthEnv) -> io::Result<bool> {
+    let Some(git) = crate::git::find_on_path(std::env::var_os("PATH").as_deref()) else {
+        return Ok(false);
+    };
+    let run = |dir: &Path, args: &[&str]| -> io::Result<()> {
+        let out = std::process::Command::new(&git)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &env.home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Synthetic Author")
+            .env("GIT_AUTHOR_EMAIL", "synthetic@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Synthetic Author")
+            .env("GIT_COMMITTER_EMAIL", "synthetic@example.invalid")
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+            .current_dir(dir)
+            .args(args)
+            .output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
+    };
+    let home = &env.home;
+    for (rel, files) in [
+        ("dev/beta/packages/inner", &["CLAUDE.md"][..]),
+        ("dev/beta", &["CLAUDE.md"][..]),
+        ("dev/monorepo", &["CLAUDE.md", "services/api/CLAUDE.md"][..]),
+    ] {
+        let dir = home.join(rel);
+        fs::remove_dir_all(dir.join(".git"))?;
+        run(&dir, &["init", "-q", "-b", "main"])?;
+        let mut add = vec!["add", "--"];
+        add.extend_from_slice(files);
+        run(&dir, &add)?;
+        run(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                &format!("Synthetic initial commit of {rel}"),
+            ],
+        )?;
+    }
+    // A remote with credentials in the URL: ccwm must store and show it without them.
+    run(
+        &home.join("dev/monorepo"),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://synthetic-user:synthetic-password@example.invalid/monorepo.git",
+        ],
+    )?;
+    // Uncommitted work in monorepo so the "uncommitted changes" filter has something to show.
+    fs::write(
+        home.join("dev/monorepo/NOTES.txt"),
+        "synthetic uncommitted file\n",
+    )?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +360,21 @@ mod tests {
             assert!(d.join("CLAUDE.md").is_file());
         }
         assert!(env.claude_dir.join("CLAUDE.md").is_file());
+    }
+
+    #[test]
+    fn init_git_makes_real_repositories_when_git_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let env = generate(&t.path().join("env"), 0).unwrap();
+        if !init_git(&env).unwrap() {
+            eprintln!("NOTICE: git not installed; placeholder .git directories kept");
+            return;
+        }
+        for rel in ["dev/beta", "dev/beta/packages/inner", "dev/monorepo"] {
+            assert!(env.home.join(rel).join(".git/HEAD").is_file(), "{rel}");
+            assert!(env.home.join(rel).join(".git/objects").is_dir(), "{rel}");
+        }
+        assert!(env.home.join("dev/monorepo/NOTES.txt").is_file());
     }
 
     #[test]

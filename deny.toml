@@ -49,7 +49,9 @@ version = 2
 [licenses]
 version = 2
 # Exactly the licenses in the dependency tree (cargo deny list); a new one must be reviewed and added.
-allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0", "Unlicense", "Zlib"]
+# M2 (all through the spec-named `notify` watcher, all permissive and MIT-compatible; flagged to the
+# maintainer for review): ISC (inotify, inotify-sys), CC0-1.0 (notify), BSL-1.0 (xxhash-rust).
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0", "Unlicense", "Zlib", "ISC", "CC0-1.0", "BSL-1.0"]
 
 [sources]
 unknown-registry = "deny"

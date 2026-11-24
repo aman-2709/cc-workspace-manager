@@ -11,12 +11,13 @@ mod extract;
 pub mod middleware;
 pub mod peer;
 mod routes;
+pub mod ws;
 
 use crate::api_error::{ApiError, Code};
 use crate::service::Service;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware::from_fn_with_state;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -76,6 +77,13 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/auth/rotate", post(routes::rotate))
         .route("/auth/logout", post(routes::logout))
         .route("/projects", get(routes::projects))
+        .route("/projects/{id}", get(routes::project))
+        .route(
+            "/projects/{id}/ignore",
+            put(routes::ignore).delete(routes::unignore),
+        )
+        .route("/refresh", post(routes::refresh))
+        .route("/ws", get(ws::upgrade))
         .route("/stats", get(routes::stats))
         .route("/discovery/status", get(routes::discovery_status))
         .route("/service/status", get(routes::service_status));
@@ -247,7 +255,7 @@ async fn connection(
     loop {
         tokio::select! {
             _ = served.as_mut() => break,
-            () = async { let _ = stop.wait_for(|s| *s).await; }, if !stopping => {
+            () = crate::events::until_stopped(&mut stop), if !stopping => {
                 stopping = true;
                 served.as_mut().graceful_shutdown();
             }

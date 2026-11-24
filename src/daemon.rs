@@ -3,26 +3,32 @@
 //! Order matters. Landlock is applied on the main thread before the Tokio runtime (and therefore any
 //! other thread) exists, because it only confines the calling thread and threads created afterwards.
 
+use crate::activity::Classifier;
 use crate::clock::{Clock, SystemClock};
 use crate::config::{validate_port, Config};
 use crate::db::queries;
 use crate::db::reader::{Reader, POOL_SIZE};
-use crate::db::writer::{ProjectUpsert, Source, Writer};
+use crate::db::writer::Writer;
 use crate::discovery::mounts::current_fuse_mount_points;
 use crate::discovery::status::SharedStatus;
-use crate::discovery::walk::{scan, ScanOptions};
+use crate::discovery::walk::ScanOptions;
 use crate::error::{Error, Result};
+use crate::events::Notifier;
+use crate::git::{find_on_path, Git};
 use crate::instance::{remove_instance, write_instance, InstanceInfo, InstanceLock};
 use crate::paths::{self, current_home, Dirs, EnvVars, Owner};
 use crate::sandbox::{self, Policy, SandboxReport};
-use crate::service::{Service, VERSION};
+use crate::service::{Deps, Service, VERSION};
+use crate::tracker::{Settings as TrackerSettings, Tracker};
+use crate::watch as watch_engine;
+use crate::watch::{Monitor, Settings as WatchSettings, SharedMonitor, WatchBackend};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Default, Clone)]
 pub struct ServeArgs {
@@ -186,14 +192,106 @@ async fn run(p: Prepared) -> Result<()> {
         .map_err(|e| Error::io("cannot read the bound port", &e))?
         .port();
 
-    let service = Arc::new(Service::new(
-        Arc::clone(&clock),
-        Arc::clone(&writer),
-        reader,
-        discovery.clone(),
-        report,
-        port,
+    // ---- tracking: Git, the single inotify instance, the monitor and the tracker (M2) ----
+    let git = Arc::new(Git::detect(
+        find_on_path(std::env::var_os("PATH").as_deref()),
+        &home,
+        config.git.allow_unhardened_status,
     ));
+    let gs = git.summary();
+    tracing::info!(
+        program = gs.program.as_deref().unwrap_or("none"),
+        version = gs.version.as_deref().unwrap_or("none"),
+        hardened_status = gs.hardened_status,
+        "git"
+    );
+    let (notifier, changes) = Notifier::channel();
+    let monitor_state = SharedMonitor::default();
+    let (monitor_tx, monitor_rx) = mpsc::channel(1024);
+    let (signals_tx, signals_rx) = mpsc::channel(4096);
+    let (raw_tx, raw_rx) = mpsc::channel(watch_engine::EVENT_QUEUE);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let backend: Option<Box<dyn WatchBackend>> = match watch_engine::inotify_backend(
+        raw_tx,
+        Arc::clone(&dropped),
+    ) {
+        Ok(w) => Some(Box::new(w)),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot create the inotify instance; every project will be polled");
+            None
+        }
+    };
+    let boundaries = dirs.hard_boundaries(&session_dir);
+    let fuse_mounts = current_fuse_mount_points();
+    let max_user_watches = watch_engine::read_max_user_watches();
+    let budget = match config.watch.budget {
+        0 => watch_engine::default_budget(max_user_watches),
+        n => n as usize,
+    };
+    let canonical_roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect();
+    let scan_opts = ScanOptions {
+        roots,
+        exclude: config.discovery.exclude.clone(),
+        max_depth: config.discovery.max_depth,
+        same_file_system: config.discovery.same_file_system,
+        home: home.clone(),
+        boundaries: boundaries.clone(),
+        fuse_mounts: fuse_mounts.clone(),
+    };
+    let tracker = Tracker::new(
+        Arc::clone(&writer),
+        reader.clone(),
+        Arc::clone(&clock),
+        notifier.clone(),
+        discovery.clone(),
+        git,
+        monitor_tx.clone(),
+        monitor_state.clone(),
+        TrackerSettings {
+            scan: scan_opts,
+            interval: Duration::from_secs(config.discovery.scan_interval_secs),
+            retention_secs: i64::from(config.discovery.missing_retention_days) * 86_400,
+            events_per_project: config.activity.events_per_project,
+        },
+    );
+    let monitor = Monitor::new(
+        backend,
+        WatchSettings {
+            roots: canonical_roots,
+            home: home.clone(),
+            exclude: config.discovery.exclude.clone(),
+            boundaries,
+            fuse_mounts,
+            max_depth: config.discovery.max_depth,
+            same_file_system: config.discovery.same_file_system,
+            budget,
+            max_user_watches,
+            debounce: Duration::from_millis(config.watch.debounce_ms),
+            events_per_project: config.activity.events_per_project as usize,
+        },
+        Arc::clone(&clock),
+        signals_tx,
+        monitor_tx,
+        monitor_state.clone(),
+        Some(notifier.clone()),
+    );
+
+    let service = Arc::new(Service::new(Deps {
+        clock: Arc::clone(&clock),
+        writer: Arc::clone(&writer),
+        reader,
+        discovery: discovery.clone(),
+        sandbox: report,
+        port,
+        home,
+        classifier: Classifier::system(&config.activity),
+        monitor: monitor_state,
+        notifier,
+        tracker: Some(Arc::clone(&tracker)),
+    }));
     let socket = crate::ipc::server::bind(&dirs.socket_path(), uid)?;
     write_instance(
         &dirs,
@@ -216,68 +314,31 @@ async fn run(p: Prepared) -> Result<()> {
         uid,
         stop_rx.clone(),
     ));
-
-    let cancel = Arc::new(AtomicBool::new(false));
-    let scan_task = {
-        let opts = ScanOptions {
-            roots,
-            exclude: config.discovery.exclude.clone(),
-            max_depth: config.discovery.max_depth,
-            same_file_system: config.discovery.same_file_system,
-            home,
-            boundaries: dirs.hard_boundaries(&session_dir),
-            fuse_mounts: current_fuse_mount_points(),
-        };
-        let (writer, status, clock, cancel) = (
-            Arc::clone(&writer),
-            discovery.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&cancel),
-        );
-        tokio::task::spawn_blocking(move || {
-            let summary = scan(&opts, &cancel, &status, &mut |batch| {
-                let now = clock.now();
-                let rows = batch
-                    .into_iter()
-                    .map(|c| ProjectUpsert {
-                        canonical_path: c.canonical_path,
-                        name: c.name,
-                        source: Source::Marker,
-                    })
-                    .collect();
-                writer.upsert_projects_blocking(rows, now).is_ok()
-            });
-            if !summary.cancelled {
-                let now = clock.now();
-                if writer
-                    .set_meta_blocking("last_scan_ok_at", &now.to_string())
-                    .is_ok()
-                {
-                    status.update(|s| s.last_success_at = Some(now));
-                }
-                tracing::info!(
-                    dirs = summary.dirs_visited,
-                    projects = summary.projects_found,
-                    "discovery finished"
-                );
-            }
-        })
-    };
+    let tasks = [
+        tokio::spawn(monitor.run(raw_rx, monitor_rx, dropped, stop_rx.clone())),
+        tokio::spawn(Arc::clone(&tracker).run_reconciler(stop_rx.clone())),
+        tokio::spawn(Arc::clone(&tracker).run_signals(signals_rx, stop_rx.clone())),
+        tokio::spawn(Arc::clone(&service).run_publisher(changes, stop_rx.clone())),
+    ];
 
     let purge = {
-        let (writer, clock, mut stop) = (Arc::clone(&writer), Arc::clone(&clock), stop_rx.clone());
+        let (service, clock, mut stop) =
+            (Arc::clone(&service), Arc::clone(&clock), stop_rx.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(SESSION_PURGE_INTERVAL);
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        match writer.purge_expired_sessions(clock.now()).await {
-                            Ok(n) if n > 0 => tracing::info!(purged = n, "expired browser sessions removed"),
+                        match service.writer.purge_expired_sessions(clock.now()).await {
+                            Ok(n) if n > 0 => {
+                                tracing::info!(purged = n, "expired browser sessions removed");
+                                service.revalidate_sockets();
+                            }
                             Ok(_) => {}
                             Err(e) => tracing::warn!(error = %e, "session purge failed"),
                         }
                     }
-                    () = async { let _ = stop.wait_for(|s| *s).await; } => break,
+                    () = crate::events::until_stopped(&mut stop) => break,
                 }
             }
         })
@@ -299,10 +360,13 @@ async fn run(p: Prepared) -> Result<()> {
     )
     .await;
 
-    // Graceful teardown: stop discovery, close the socket, flush the writer, remove runtime files.
-    cancel.store(true, Ordering::Relaxed);
+    // Graceful teardown: stop discovery and the watchers, close the socket, flush the writer,
+    // remove runtime files.
+    tracker.cancel();
     let _ = stop_tx.send(true);
-    let _ = scan_task.await;
+    for t in tasks {
+        let _ = t.await;
+    }
     let _ = ipc.await;
     let _ = purge.await;
     let flushed = writer.shutdown().await;

@@ -23,11 +23,11 @@ Status: **Approved for implementation** · Single source of truth · Supersedes 
 | Repository / Cargo package | `cc-workspace-manager` |
 | Executable | `ccwm` |
 | systemd user unit | `ccwm.service` |
-| License | MIT (maintainer confirms the copyright holder before publishing) |
+| License | MIT, "Copyright (c) 2026 Amandeep Kirpalsingh and contributors" (confirmed by the maintainer) |
 | Tagline | Discover, track, and resume your Claude Code projects. |
 | Default URL | `http://127.0.0.1:8765` |
 
-CC Workspace Manager is an **independent, unofficial** open-source project. It is not affiliated with or endorsed by Anthropic. README, `--help` and the UI footer must say so. Check for naming conflicts (crates.io, GitHub, common distro packages) before first publication.
+CC Workspace Manager is an **independent, unofficial** open-source project. It is not affiliated with or endorsed by Anthropic. README, `--help` and the UI footer must say so. The README also carries the trademark line: "Claude and Claude Code are trademarks of Anthropic, PBC. This project is independent and not affiliated with or endorsed by Anthropic." Check for naming conflicts (crates.io, GitHub, common distro packages) before first publication.
 
 It is a **project-centric workspace manager**, not a token/cost dashboard or a generic transcript viewer.
 
@@ -59,7 +59,7 @@ Non-goals for v0.1:
 - Hard safety boundaries that explicit roots can never override: `/proc`, `/sys`, `/dev`, `/run`, the ccwm data, config, state and runtime directories, and any path not readable by the user.
 - `same_file_system = true` by default. Symlinked directories are not followed by default. Max traversal depth defaults to 10 (configurable).
 - Paths that are not valid UTF-8 are skipped and counted (`non_utf8` in the discovery status); they are never registered.
-- Discovery reads **directory entries and metadata only**. File contents are read only for CLAUDE.md markers (bounded size) and Claude session files.
+- Discovery reads **directory entries and metadata only**. File contents are read only for CLAUDE.md markers (bounded size; a content hash is kept to recognise moved projects, §4.5), Claude session files, and `.gitignore` files and `.git/info/exclude` (bounded) for the in-process ignore evaluation of §5.2.
 
 ### 4.2 Default exclusions (configurable)
 Skip hidden directories by default (`.*`, which covers `.git`, `.cache`, `.local`, `.config`, `.ssh`, `.npm`, `.cargo`, `.rustup`, `.claude`, `.venv`, browser profiles, trash). Also skip `node_modules`, `target`, `build`, `dist`, `venv`, `__pycache__`, `~/snap`, cloud-sync and FUSE mounts (detected via mount type where possible, e.g. `fuse.*`), VM and container image directories (e.g. `~/VirtualBox VMs`, `~/.local/share/containers` already hidden), and generated artifact and log directories. Prune excluded directories **before** descending. `~/.claude` is read only by the session integration (§7).
@@ -100,8 +100,8 @@ Never a project: the home directory itself, `~/.claude`, anything under a hard s
 - Never generate activity from ccwm's own writes. The data, config and state directories are excluded unconditionally.
 
 ### 5.2 Meaningful activity
-- A modification is *meaningful* if the file is not excluded (§4.2), not inside a nested project (§4.4), and, for Git projects, not gitignored and not under `.git/`. Gitignore evaluation is done in-process (the `ignore` crate's matcher), never by running `git check-ignore`; it approximates Git's own behavior and the differences are documented.
-- Each project tracks: latest meaningful modification timestamp, latest modified file (relative path), and a bounded list of recent file events (default last 200 per project; create/modify/delete/rename; retention configurable).
+- A modification is *meaningful* if the file is not excluded (§4.2), not inside a nested project (§4.4), and, for Git projects, not gitignored and not under `.git/`. Hidden *files* count (§4.2 excludes hidden directories). Creating or removing a directory counts as activity but does not change the "latest modified file". Changes under `.git/` invalidate the Git cache (§6) instead. Gitignore evaluation is done in-process (the `ignore` crate's matcher), never by running `git check-ignore`; it approximates Git's own behavior and the differences are documented.
+- Each project tracks: latest meaningful modification timestamp, latest modified file (relative path), and a bounded list of recent file events (default last 200 per project; create/modify/delete/rename; retention configurable). Timestamps have one-second resolution and never move backwards; within the same second an observed timestamp is never replaced by an inferred one.
 - **Inferred vs observed:** the initial timestamp, computed by a bounded walk at first discovery, is labeled `inferred`. Timestamps from live events are labeled `observed`. The UI shows which it is. Unknown timestamps stay unknown and are never invented.
 
 ### 5.3 Activity classification
@@ -125,13 +125,14 @@ The thresholds are configurable. The **"Modified this week"** statistic = Today 
 ## 6. Git integration (v0.1)
 
 - A **single centralized module** runs all Git commands. Nothing else spawns `git`.
-- **Allowlisted invocations only:** `rev-parse` (top-level, git-dir, HEAD), `status --porcelain=v2 --branch --ignore-submodules=all` (branch, upstream, ahead/behind against local remote-tracking refs, staged/modified/untracked), `log -1` with a fixed `--format`, and `config --get remote.origin.url` (or the equivalent for the upstream remote). Any `diff` that is ever added must use `--no-ext-diff --no-textconv`.
-- **Always pass:** `--no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false -c core.hooksPath=/dev/null -c protocol.allow=never`.
+- **Allowlisted invocations only:** `--version`, `rev-parse` (top-level, git-dir, HEAD), `status --porcelain=v2 --branch --ignore-submodules=all -z -- .` (branch, upstream, ahead/behind against local remote-tracking refs, staged/modified/untracked; limited to the project directory), `log -1 --no-show-signature --no-notes` with a fixed `--format` (verifying a signature would run `gpg.program`, which repository config can choose), `config --get-regexp` for filter drivers (below), and `config --get` for `remote.origin.url` (or the URL of the upstream remote, found with `config --get branch.<branch>.remote`). Any `diff` that is ever added must use `--no-ext-diff --no-textconv`.
+- **Always pass:** `--no-pager --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false -c core.hooksPath=/dev/null -c protocol.allow=never`.
+- A repository whose top level is the home directory (e.g. a dotfiles repository) is not the repository of a project below it: such projects are reported as not Git.
 - **Environment:** start from an empty environment. Set only `PATH`, `HOME`, `LC_ALL=C`, `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_OPTIONAL_LOCKS=0`. Pass arguments as an argument array with no shell. Never pass untrusted strings as options (use `--` where applicable).
 - Timeout of 5 s per command (kill the process group on timeout). Global concurrency limit of 4. Results are cached per project and invalidated by relevant file events (`.git/HEAD`, refs, index) or by reconciliation.
 - Handle: no Git installed, non-Git projects, detached HEAD, worktrees, nested repositories, and Git refusing the repo because of `safe.directory` / dubious ownership. Report this as a status and never override it.
 - Sanitize remote URLs: strip userinfo and credentials before storing or displaying them.
-- **Filter drivers and attributes:** `git status` runs clean/process filter drivers when it re-hashes stat-dirty files, and with `--no-optional-locks` that happens on every call. Reading config never executes anything. Every `status` invocation therefore (a) passes `--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904` (the empty tree, a built-in object, so nothing is written) so `.gitattributes` in the worktree is not consulted, and (b) first enumerates drivers with `git config --get-regexp '^filter\..*\.(clean|smudge|process)$'` (includes and `includeIf` are resolved) and passes no-op `-c filter.<name>.clean= -c filter.<name>.smudge= -c filter.<name>.process= -c filter.<name>.required=false` for **every** driver in **every** scope (system, global, local, worktree, command line), because `.git/info/attributes` can select a driver even when (a) is in effect. Both are required: each alone leaves a verified bypass. Document the consequence: files whose status depends on attributes or filters (git-lfs, `text`/`eol` normalization) can be reported differently from the user's own `git status`.
+- **Filter drivers and attributes:** `git status` runs clean/process filter drivers when it re-hashes stat-dirty files, and with `--no-optional-locks` that happens on every call. Reading config never executes anything. Every `status` invocation therefore (a) passes `--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904` (the empty tree, a built-in object, so nothing is written) so `.gitattributes` in the worktree is not consulted, and (b) first enumerates drivers with `git config --get-regexp '^filter\..*\.(clean|smudge|process)$'` (includes and `includeIf` are resolved) and passes no-op `-c filter.<name>.clean= -c filter.<name>.smudge= -c filter.<name>.process= -c filter.<name>.required=false` for **every** driver in **every** scope (system, global, local, worktree, command line), because `.git/info/attributes` can select a driver even when (a) is in effect. Both are required: each alone leaves a verified bypass. Git splits `-c` at the first `=`, so a driver whose name contains `=` (or a control character) cannot be neutralized: worktree `status` is then **not run** for that repository (state "status disabled: unsafe filter configuration"; fail closed). Document the consequence: files whose status depends on attributes or filters (git-lfs, `text`/`eol` normalization) can be reported differently from the user's own `git status`.
 - **Minimum Git version:** `--attr-source` was introduced in Git 2.41.0 (Git release notes). The hardened `status` has been verified only on Git 2.43.0 and ccwm reports the versions it was tested on. With an older Git, worktree `status` is **disabled by default** and the project shows the state "status disabled: git too old to harden"; a documented opt-in setting (`git.allow_unhardened_status`, default `false`) re-enables it. `rev-parse`, `log -1` and `config --get` stay available. `git status` runs no hooks; `core.hooksPath` is still overridden.
 - Investigate every other repository-controlled configuration that can trigger command execution during the allowlisted commands (clean/process filters, fsmonitor, external diff/textconv, pager, credential and ssh helpers, includes), and document the findings in SECURITY.md. The flags are mitigations, **not a sandbox**; say so.
 - Git subprocesses inherit the daemon's Landlock sandbox (§11.5): read-only filesystem and no outbound network where the kernel supports it.
@@ -221,10 +222,10 @@ Applied consistently in cards, table, detail panel, search results and tooltips.
 - **Live sessions are bounded:** at most 10 live browser sessions; creating an 11th revokes the least recently used one. Expired sessions are purged periodically (and before a new one is created). `ccwm open` does not revoke the previous session.
 - REST requests use `Authorization: Bearer <session token>`. Browsers never send this automatically, which handles CSRF. State-changing requests additionally require an allowed `Origin`.
 - **TCP peer-UID verification:** on every accepted loopback TCP connection the daemon looks up the owner of the client's socket (the row of `/proc/net/tcp`/`tcp6` whose local address is the client's and whose remote address is the daemon's; `sock_diag` is an equivalent alternative) and serves the connection only if that UID equals the daemon's effective UID. The result is cached per connection (keep-alive requests inherit it), it is checked before any byte is read, and it fails closed (no row, ambiguous rows or an unreadable table mean "reject"). A leaked bootstrap or session token is therefore useless to another local user. This applies to every TCP endpoint, including `/health` and the static assets.
-- **WebSocket:** the `Origin` is validated on upgrade. The client must send `{"type":"auth","token":…}` as its first message within 5 s, or the connection is closed with code 4401. No data is sent before authentication succeeds. **Existing connections are revalidated:** when a session token expires, is rotated out or is revoked, the daemon closes every WebSocket bound to it with code 4401.
+- **WebSocket:** the `Origin` is validated on upgrade. The client must send `{"type":"auth","token":…}` as its first message within 5 s, or the connection is closed with code 4401. No data is sent before authentication succeeds. **Existing connections are revalidated:** when a session token expires, is rotated out or is revoked, the daemon closes every WebSocket bound to it with code 4401: immediately on sign-out, revoke-all and the expired-session purge, and otherwise within 10 s (periodic revalidation).
 - **Revocation:** a "Sign out" button in the UI (revokes the current session) and `ccwm auth revoke-all` over the Unix socket (revokes every browser session).
 - The server stores tokens **hashed** (SHA-256) and compares them in constant time. Tokens never appear in logs, error messages, URLs (apart from the single-use fragment) or the database in plaintext.
-- Unauthenticated TCP endpoints (still subject to the peer-UID check): `GET /api/v1/health` (status and version only), the static assets, and `POST /api/v1/auth/exchange`. A health response on TCP is **never** treated as proof of daemon identity; identity is established only over the Unix socket.
+- Unauthenticated TCP endpoints (still subject to the peer-UID check): `GET /api/v1/health` (status, version and the Git commit the binary was built from), the static assets, and `POST /api/v1/auth/exchange`. A health response on TCP is **never** treated as proof of daemon identity; identity is established only over the Unix socket.
 
 ### 11.3 HTTP hardening
 - Bind to `127.0.0.1` only. Non-loopback binding is not supported in v0.1.
@@ -235,7 +236,7 @@ Applied consistently in cards, table, detail panel, search results and tooltips.
 - **Connection limits:** at most 64 concurrent TCP connections (a slot is taken before `accept`, so excess clients wait in the kernel backlog and cost no file descriptor) and a 10 s header-read timeout. The Unix socket must stay usable while the TCP listener is saturated.
 - Validate and canonicalize every path input. Project IDs are opaque and validated. Prevent path traversal and symlink escapes. Use parameterized SQL only. The config file and every ancestor of ccwm's directories must be owned by the user or root and not writable by other users (a root-owned sticky directory such as `/tmp` is acceptable; group write is acceptable only for the user's private group: the user's primary group, named like the user, with no other listed members).
 - **Optional defense in depth:** mounting `/proc` with `hidepid=invisible` hides other users' command lines (where a sign-in link passed to the browser is visible). ccwm does not require it; the peer-UID check already makes a link seen there useless to another user.
-- **Residual risks, documented in SECURITY.md:** an XSS bug could steal the `localStorage` token (mitigated by the no-`innerHTML` rule and the CSP); a same-user process can read everything; the bootstrap fragment briefly exists in the browser history (it is single-use and expires in 30 s); **an impostor that binds the port while the daemon is down can show a fake UI** (and read what the page stores in its origin) — the peer-UID check makes any token it obtains useless to it, but it can still mislead the user, e.g. with a fake project list; `ccwm open` never talks to it.
+- **Residual risks, documented in SECURITY.md:** an XSS bug could steal the `localStorage` token (mitigated by the no-`innerHTML` rule and the CSP); a same-user process can read everything; the bootstrap fragment briefly exists in the browser history (it is single-use and expires in 30 s); **an impostor that binds the port while the daemon is down can show a fake UI** (and read what the page stores in its origin) — the peer-UID check makes any token it obtains useless to it, but it can still mislead the user, e.g. with a fake project list; `ccwm open` never talks to it. **Any forwarder or proxy running as the user** (`ssh -L`, `socat`, IDE port forwarding) bypasses the peer-UID check (the check sees the forwarder, not the client behind it); never forward the ccwm port.
 
 ### 11.4 Data protection
 - Data directory `0700`, files `0600`, process umask `0077`.
@@ -269,7 +270,7 @@ All endpoints live under `/api/v1`. They return JSON and use structured errors `
 | POST | `/auth/rotate` | Issue a new session token; the old one stays valid for 60 s |
 | POST | `/auth/logout` | Revoke the current session |
 | POST | `/auth/revoke-all` | **Unix socket only**: revoke all browser sessions |
-| GET | `/projects` | List; `q`, `sort`, `order`, `activity`, `dirty`, `has_sessions`, `include_missing`, `limit`, `cursor` |
+| GET | `/projects` | List; `q`, `sort` (`activity`, `name`, `commit`; `session` from M3), `order`, `activity` (`all`, `today`, `week`, `inactive`, `dormant`, `unknown`), `dirty`, `has_sessions` (M3), `include_missing`, `include_ignored`, `limit`, `cursor`. Boolean flags take `1`/`0`/`true`/`false`. |
 | GET | `/projects/{id}` | Project detail incl. Git status and latest session |
 | GET | `/projects/{id}/sessions` | Latest sessions (default 1, max 10) with resume command |
 | PUT | `/projects/{id}/ignore` | Ignore |
@@ -278,7 +279,7 @@ All endpoints live under `/api/v1`. They return JSON and use structured errors `
 | GET | `/discovery/status` | Discovery progress and health |
 | GET | `/service/status` | Version, uptime, watch count/budget, degraded projects, queue depths, last scan, CLI verification result |
 | GET / PUT | `/settings` | Read and update; the response lists changes that require a restart |
-| POST | `/refresh` | Trigger a coalesced reconciliation (202) |
+| POST | `/refresh` | Trigger a coalesced reconciliation (202); the response says at which value of the discovery status counter `scans_finished` the requested scan has finished |
 | POST | `/session-index/clear` | Clear derived session data |
 | GET | `/ws` | WebSocket (auth per §11.2) |
 
@@ -290,7 +291,7 @@ Privacy mode is a per-request flag (`privacy=1`) and a per-WebSocket subscriptio
 |---|---|
 | `ccwm serve [--port N] [--config PATH]` | Run the daemon in the foreground. This is what systemd runs. |
 | `ccwm start` / `stop` / `restart` | Wrap `systemctl --user … ccwm.service`. Clear error if the unit isn't installed. |
-| `ccwm status` | systemd state plus a `/service/status` summary |
+| `ccwm status` | systemd state plus a `/service/status` summary, including the Git commit of the daemon's build; warns when it differs from the CLI's own build |
 | `ccwm open [--print]` | Get a bootstrap token and open or print the URL |
 | `ccwm scan` | Trigger a refresh through the daemon over the Unix socket and report progress. **Never opens SQLite itself.** Errors clearly if no daemon is running. |
 | `ccwm doctor` | Checks: daemon running (verified over the Unix socket), port, inotify limits and usage, Git version, `claude` CLI and resume support, session directory found and readable, data directory permissions, active Landlock protections (filesystem/network, ABI level), lingering status. Suggests fixes and never applies them. |
@@ -336,7 +337,7 @@ Coverage must include:
   2. Claude session files are unchanged (hash before and after parsing, clearing the index and uninstalling).
   3. `.git/index`, `.git/config` and refs are unchanged after every Git operation.
   4. Malicious Git configurations cannot execute commands: local-scope `core.fsmonitor`, clean/smudge/process filters activated by `.gitattributes`, `diff.external`, textconv, `core.pager`, `core.sshCommand`, `include`/`includeIf` pulling in any of these. Each is asserted with a sentinel file that must not appear.
-  5. No external network connections: the daemon and its Git subprocesses run in a network namespace (`unshare -rn`, skipped with a notice where unavailable) through a full discovery, Git and session cycle, asserting that no non-loopback connect is attempted. `cargo-deny` network-crate bans pass.
+  5. No external network connections: through a full discovery, live-watch, Git and session cycle, assert that the daemon and its Git subprocesses attempt no non-loopback connect. Where unprivileged user namespaces work, they run in a network namespace (`unshare --user --map-current-user --net`; plain `unshare -rn` maps the user to root, which ccwm refuses); where `strace` exists, every `connect()` of the daemon and its children is traced (`strace -f -e trace=connect,execve`) and checked. Both are used when both are available; with neither, the test is skipped with a notice (a failure in CI). The test reports which variant ran. `cargo-deny` network-crate bans pass.
   6. Unauthorized access is rejected: no token, an expired token, a revoked token, a wrong Origin, a wrong Host, and a peer-UID mismatch on the Unix socket. A real cross-user check is documented as a manual procedure.
   7. Path traversal and symlink escapes are rejected in all path inputs and in marker reads.
   8. Logs contain no sensitive data: run with canary secrets planted in fixture prompts, tokens and remote URLs, and assert none appear in the captured logs at any level.
@@ -362,7 +363,8 @@ Required to pass before each milestone is complete: `cargo fmt --check`, `cargo 
   - `REQUIREMENTS.md`: this file.
   - `ARCHITECTURE.md`: modules, data flow diagram (Mermaid), schema, API contracts, verified session schema findings, Git hardening rationale.
   - `ROADMAP.md`: milestone checklist and the §18 backlog.
-  - `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md` (threat model, residual risks, reporting), `LICENSE`.
+  - `CHANGELOG.md`, `CONTRIBUTING.md` (contributions are MIT, inbound = outbound; every commit carries a DCO sign-off; no CLA), `SECURITY.md` (threat model, residual risks, reporting), `LICENSE`.
+- **Third-party licenses:** release archives (M4) ship `THIRD_PARTY_LICENSES`, generated with `cargo-about` from a committed `about.toml` that pins the accepted licenses (the same set `deny.toml` allows).
   - The docs must also cover a configuration reference, discovery semantics, inotify limits and troubleshooting, data retention and deletion, and service management.
 
 ## 18. Roadmap — v0.2 and later (do NOT implement in v0.1)
@@ -477,6 +479,13 @@ Built from the maintainer's pasted schema output (§19), using synthetic fixture
 | `XDG_RUNTIME_DIR` assumed set | Fallback `$XDG_STATE_HOME/ccwm/run/`, owner and mode verified, 108-byte limit (§11.2) |
 | Several inotify instances | Exactly one watcher, polled fallback (§5.1) |
 | Non-UTF-8 paths unspecified | Skipped and counted (§4.1) |
+| License holder to be confirmed | "Amandeep Kirpalsingh and contributors"; README trademark line; CONTRIBUTING (MIT inbound = outbound, DCO, no CLA); `THIRD_PARTY_LICENSES` via `cargo-about` (§1, §17; pre-M2) |
+| `/health` returns status and version only | Plus the build's Git commit; `ccwm status` warns on a mismatch (§11.2, §13; pre-M2) |
+| Test 5 only via `unshare -rn` | `unshare --user --map-current-user --net` and/or `strace` connect tracing (§16; pre-M2) |
+| File contents read only for markers and sessions | Also `.gitignore` / `.git/info/exclude`, bounded, for §5.2 (§4.1; M2) |
+| `log -1` with a fixed format | Plus `--no-show-signature --no-notes` (signature verification runs `gpg.program`) (§6; M2) |
+| Every filter driver neutralized with `-c` | A driver name `-c` cannot express disables status (fail closed) (§6; M2) |
+| `/projects` filters without `include_ignored` | `include_ignored` added, so ignored projects can be listed and un-ignored before Settings (M3) (§12; M2) |
 
 ## Appendix B — Assumptions and verdicts
 
@@ -491,4 +500,4 @@ Verdicts were recorded on 2026-11-23 on the development host (Ubuntu 24.04.4, Li
 | 5 | The systemd hardening directives chosen in §13 are accepted in user units on Ubuntu. | **True for `NoNewPrivileges`, `Nice`, `IOSchedulingClass`, `UMask`**, and for `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome=read-only`, `ProtectKernelTunables`, `RestrictNamespaces`, `RestrictAddressFamilies`, `MemoryDenyWriteExecute`, `LockPersonality`, `SystemCallArchitectures`. **`PrivateDevices=yes` is rejected.** The real daemon has not yet been tested under them (M4). |
 | 6 | Landlock ABI level (`/sys/kernel/security/lsm` contains `landlock`; ABI ≥ 4 for network rules), and a Landlock-restricted process can still bind its TCP port and serve its Unix socket. | **Kernel side confirmed:** `landlock` is in the LSM list and the ABI is 8 (queried with `landlock_create_ruleset`). The bind/serve claim is verified by the M1 tests. |
 | 7 | No-op `-c` overrides for filter drivers are honored by `git status` and prevent the driver from executing. | **True on 2.43.0** (sentinel test), but only together with `--attr-source` (§6). |
-| 8 | `unshare -rn` is available on the test host. | **False on this host:** `unshare -rn` fails (`apparmor_restrict_unprivileged_userns=1`). Test 5 is skipped with a notice here; it needs a host or CI runner that allows unprivileged user namespaces. |
+| 8 | `unshare -rn` is available on the test host. | **False on this host:** `unshare -rn` (and `--map-current-user`) fails (`apparmor_restrict_unprivileged_userns=1`). `unshare -rn` would also make ccwm run as uid 0 inside the namespace, which it refuses. Test 5 runs the **strace** variant here (strace 6.8, 2026-11-24). |

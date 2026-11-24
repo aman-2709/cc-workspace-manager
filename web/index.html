@@ -10,10 +10,18 @@
 <body>
 <header class="bar">
   <h1>CC Workspace Manager</h1>
-  <span id="discovery" class="muted" role="status" aria-live="polite"></span>
+  <span id="discovery" class="muted small" role="status" aria-live="polite"></span>
   <span class="spacer"></span>
+  <label class="inline small" hidden id="theme-wrap">Theme
+    <select id="theme">
+      <option value="system">System</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+  </label>
   <button id="signout" type="button" hidden>Sign out</button>
 </header>
+<div id="banners" aria-live="polite"></div>
 <main id="main" tabindex="-1"></main>
 <footer class="footer">
   CC Workspace Manager is an independent, unofficial open-source project. It is not affiliated with or endorsed by Anthropic.

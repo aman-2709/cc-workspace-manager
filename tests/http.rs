@@ -32,7 +32,17 @@ async fn health_is_public_and_minimal() {
     assert_eq!(s, 200);
     assert_eq!(
         v,
-        serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION")})
+        serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": cc_workspace_manager::service::COMMIT,
+        })
+    );
+    let commit = cc_workspace_manager::service::COMMIT;
+    assert!(
+        commit == "unknown"
+            || (commit.len() >= 12 && commit[..12].bytes().all(|b| b.is_ascii_hexdigit())),
+        "{commit}"
     );
 }
 
@@ -670,10 +680,26 @@ async fn projects_listing_validation_and_pagination() {
     );
     assert!(v["next_cursor"].is_null());
     let first = &v["items"][0];
-    for key in ["id", "name", "path", "sources", "first_seen_at"] {
+    for key in [
+        "id",
+        "name",
+        "path",
+        "display_path",
+        "sources",
+        "first_seen_at",
+        "activity",
+        "git",
+        "missing_since",
+        "ignored",
+        "monitoring",
+    ] {
         assert!(first.get(key).is_some(), "{key}");
     }
     assert_eq!(first["name"], "proj0");
+    assert_eq!(first["display_path"], "~/proj0");
+    assert_eq!(first["activity"]["status"], "unknown");
+    assert!(first["activity"]["at"].is_null() && first["git"].is_null());
+    assert_eq!(first["ignored"], false);
     assert_eq!(first["sources"], serde_json::json!(["marker"]));
 
     // walk pages of 3 with the cursor
@@ -728,11 +754,14 @@ async fn projects_query_validation_errors() {
         "limit=abc",
         "limit=",
         "sort=bogus",
+        "sort=session",
         "order=up",
-        "activity=today",
-        "dirty=true",
+        "activity=yesterday",
+        "activity=TODAY",
+        "dirty=yes",
+        "include_missing=2",
+        "include_ignored=x",
         "has_sessions=1",
-        "include_missing=1",
         "privacy=1",
         "unknown=1",
         "cursor=!!!",
@@ -781,7 +810,22 @@ async fn stats_discovery_and_service_status_shapes() {
     let token = e.login().await;
     e.seed(&["a", "b"]).await;
     let (s, v) = json(e.get("/api/v1/stats", Some(&token)).await).await;
-    assert_eq!((s, v), (200, serde_json::json!({"total_projects": 2})));
+    assert_eq!(
+        (s, v),
+        (
+            200,
+            serde_json::json!({
+                "total_projects": 2,
+                "modified_today": 0,
+                "modified_this_week": 0,
+                "inactive": 0,
+                "dormant": 0,
+                "unknown_activity": 2,
+                "uncommitted_changes": 0,
+                "missing": 0,
+            })
+        )
+    );
     let (s, v) = json(e.get("/api/v1/discovery/status", Some(&token)).await).await;
     assert_eq!(s, 200);
     for key in [
@@ -792,6 +836,7 @@ async fn stats_discovery_and_service_status_shapes() {
         "roots",
         "last_success_at",
         "next_scan_at",
+        "scans_finished",
     ] {
         assert!(v.get(key).is_some(), "{key}");
     }
@@ -799,11 +844,139 @@ async fn stats_discovery_and_service_status_shapes() {
     let (s, v) = json(e.get("/api/v1/service/status", Some(&token)).await).await;
     assert_eq!(s, 200);
     assert_eq!(v["port"], PORT);
+    assert_eq!(v["commit"], cc_workspace_manager::service::COMMIT);
     assert_eq!(v["sandbox"]["status"], "not_enforced");
+    for key in ["monitoring", "git", "queues", "discovery"] {
+        assert!(v.get(key).is_some(), "{key}");
+    }
+    assert!(v["discovery"].get("next_scan_at").is_some());
     assert!(v["uptime_s"].as_i64().unwrap() >= 0);
     e.clock.advance(90);
     let (_, v) = json(e.get("/api/v1/service/status", Some(&token)).await).await;
     assert_eq!(v["uptime_s"], 90);
+}
+
+// ---- M2: detail, ignore, refresh ------------------------------------------------------------------
+
+fn put(path: &str, token: &str, origin: bool) -> Request<Body> {
+    method_req("PUT", path, token, origin)
+}
+
+fn method_req(method: &str, path: &str, token: &str, origin: bool) -> Request<Body> {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", host())
+        .header("authorization", format!("Bearer {token}"));
+    if origin {
+        b = b.header("origin", format!("http://127.0.0.1:{PORT}"));
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+async fn first_id(e: &common::Env, token: &str) -> String {
+    let (_, v) = json(e.get("/api/v1/projects?sort=name", Some(token)).await).await;
+    v["items"][0]["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn project_detail_and_unknown_or_malformed_ids() {
+    let e = env().await;
+    let token = e.login().await;
+    e.seed(&["alpha", "beta"]).await;
+    let id = first_id(&e, &token).await;
+    let (s, v) = json(e.get(&format!("/api/v1/projects/{id}"), Some(&token)).await).await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        (v["id"].as_str(), v["name"].as_str()),
+        (Some(id.as_str()), Some("alpha"))
+    );
+    assert_eq!(v["display_path"], "~/alpha");
+    assert!(v["git_detail"].is_null(), "no Git inspection yet");
+    for bad in [
+        "0123456789abcdef0123456789abcdef",
+        "nothex",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "..%2F..%2Fetc%2Fpasswd",
+        "%00",
+    ] {
+        let (s, v) = json(
+            e.get(&format!("/api/v1/projects/{bad}"), Some(&token))
+                .await,
+        )
+        .await;
+        assert_eq!((s, code(&v)), (404, "not_found"), "{bad}");
+    }
+    let (s, _) = json(e.get(&format!("/api/v1/projects/{id}"), None).await).await;
+    assert_eq!(s, 401);
+}
+
+#[tokio::test]
+async fn ignore_and_unignore_need_origin_and_hide_the_project() {
+    let e = env().await;
+    let token = e.login().await;
+    e.seed(&["alpha", "beta"]).await;
+    let id = first_id(&e, &token).await;
+    let path = format!("/api/v1/projects/{id}/ignore");
+    let (s, v) = json(e.send(put(&path, &token, false)).await).await;
+    assert_eq!((s, code(&v)), (403, "origin_not_allowed"));
+    let (s, v) = json(e.send(put(&path, &token, true)).await).await;
+    assert_eq!((s, v["ignored"].as_bool()), (200, Some(true)));
+    assert!(v["monitoring"].is_null());
+    let (s, _) = json(e.send(put(&path, &token, true)).await).await;
+    assert_eq!(s, 200, "idempotent");
+    let (_, v) = json(e.get("/api/v1/projects", Some(&token)).await).await;
+    assert_eq!(v["total"], 1);
+    let (_, v) = json(
+        e.get("/api/v1/projects?include_ignored=1", Some(&token))
+            .await,
+    )
+    .await;
+    assert_eq!(v["total"], 2);
+    let (_, v) = json(e.get("/api/v1/stats", Some(&token)).await).await;
+    assert_eq!(v["total_projects"], 1, "ignored projects are not counted");
+    let (s, v) = json(e.send(method_req("DELETE", &path, &token, true)).await).await;
+    assert_eq!((s, v["ignored"].as_bool()), (200, Some(false)));
+    let (_, v) = json(e.get("/api/v1/projects", Some(&token)).await).await;
+    assert_eq!(v["total"], 2);
+    let (s, _) = json(
+        e.send(put(
+            "/api/v1/projects/0123456789abcdef0123456789abcdef/ignore",
+            &token,
+            true,
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(s, 404);
+}
+
+#[tokio::test]
+async fn refresh_needs_origin_and_a_session_and_ws_needs_an_upgrade() {
+    let e = env().await;
+    let token = e.login().await;
+    let (s, _) = json(
+        e.send(method_req("POST", "/api/v1/refresh", &token, false))
+            .await,
+    )
+    .await;
+    assert_eq!(s, 403);
+    let (s, _) = json(e.post("/api/v1/refresh", None, "").await).await;
+    assert_eq!(s, 401);
+    // Without the tracker (this test service), a refresh cannot be served.
+    let (s, v) = json(e.post("/api/v1/refresh", Some(&token), "").await).await;
+    assert_eq!((s, code(&v)), (500, "internal"));
+    // A plain GET of the WebSocket endpoint: Origin first, then the upgrade requirement.
+    let (s, v) = json(e.get("/api/v1/ws", None).await).await;
+    assert_eq!((s, code(&v)), (403, "origin_not_allowed"));
+    let r = Request::builder()
+        .uri("/api/v1/ws")
+        .header("host", host())
+        .header("origin", format!("http://127.0.0.1:{PORT}"))
+        .body(Body::empty())
+        .unwrap();
+    let (s, v) = json(e.send(r).await).await;
+    assert_eq!((s, code(&v)), (400, "invalid_argument"));
 }
 
 // ---- web/ source hygiene --------------------------------------------------------------------------------
@@ -1043,6 +1216,274 @@ mod sockets {
             }
             srv.stop().await;
         }
+    }
+
+    /// A raw request with extra headers; the whole response (empty if the server closed).
+    async fn request(
+        addr: SocketAddr,
+        path: &str,
+        headers: &[(&str, String)],
+    ) -> std::io::Result<String> {
+        let mut s = TcpStream::connect(addr).await?;
+        let mut req =
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nConnection: close\r\n");
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        s.write_all(req.as_bytes()).await?;
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+            .await
+            .map_err(|_| std::io::Error::other("timed out"))??;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    fn closed_unanswered(r: std::io::Result<String>) -> bool {
+        match r {
+            Ok(resp) => resp.is_empty(),
+            Err(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ),
+        }
+    }
+
+    /// Test 6 (M1.1 follow-up): a token that is valid is still useless on a connection whose
+    /// client socket belongs to another user. The request never reaches authentication.
+    #[tokio::test]
+    async fn a_valid_token_over_a_peer_uid_rejected_connection_is_still_rejected() {
+        let other = me() + 1;
+        let srv = serve(
+            Arc::new(move |_, _| Ok(Some(other))),
+            8,
+            Duration::from_secs(5),
+        )
+        .await;
+        let token = srv._env.login().await;
+        // The same token works through the service itself…
+        assert!(srv._env.service.authenticate(&token).await.is_ok());
+        // …but not over a connection owned by someone else, on any endpoint.
+        for path in [
+            "/api/v1/projects",
+            "/api/v1/stats",
+            "/api/v1/service/status",
+            "/api/v1/ws",
+        ] {
+            let r = request(
+                srv.addr,
+                path,
+                &[
+                    ("Authorization", format!("Bearer {token}")),
+                    ("Origin", format!("http://127.0.0.1:{PORT}")),
+                    ("Upgrade", "websocket".into()),
+                    ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==".into()),
+                    ("Sec-WebSocket-Version", "13".into()),
+                ],
+            )
+            .await;
+            assert!(closed_unanswered(r), "{path} answered a foreign connection");
+        }
+        // Control: with our own UID the same request is served.
+        let ok = serve(http::peer::procfs_lookup(), 8, Duration::from_secs(5)).await;
+        let token = ok._env.login().await;
+        let resp = request(
+            ok.addr,
+            "/api/v1/stats",
+            &[("Authorization", format!("Bearer {token}"))],
+        )
+        .await
+        .unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        srv.stop().await;
+        ok.stop().await;
+    }
+
+    // ---- WebSocket (§11.2) --------------------------------------------------------------------
+
+    use super::common::{Frame, WsClient};
+
+    fn origin() -> String {
+        format!("http://127.0.0.1:{PORT}")
+    }
+
+    async fn ws(addr: SocketAddr, origin: Option<String>) -> Result<WsClient, (u16, String)> {
+        tokio::task::spawn_blocking(move || WsClient::connect(addr, PORT, origin.as_deref()))
+            .await
+            .unwrap()
+    }
+
+    async fn recv(c: WsClient, secs: u64) -> (WsClient, Option<Frame>) {
+        tokio::task::spawn_blocking(move || {
+            let mut c = c;
+            let f = c.recv(Duration::from_secs(secs));
+            (c, f)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn recv_ms(c: WsClient, ms: u64) -> (WsClient, Option<Frame>) {
+        tokio::task::spawn_blocking(move || {
+            let mut c = c;
+            let f = c.recv(Duration::from_millis(ms));
+            (c, f)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn authed(srv: &Server, token: &str) -> WsClient {
+        let mut c = ws(srv.addr, Some(origin())).await.unwrap();
+        c.send_text(&format!(r#"{{"type":"auth","token":"{token}"}}"#));
+        let (c, f) = recv(c, 5).await;
+        assert_eq!(f, Some(Frame::Text(r#"{"type":"ready"}"#.into())));
+        c
+    }
+
+    fn own() -> PeerUidLookup {
+        Arc::new(|_, _| Ok(Some(nix::unistd::geteuid().as_raw())))
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_requires_the_exact_origin() {
+        let srv = serve(own(), 8, Duration::from_secs(5)).await;
+        for bad in [
+            None,
+            Some("http://evil.example".to_string()),
+            Some("null".into()),
+            Some(format!("http://localhost:{PORT}")),
+        ] {
+            let err = ws(srv.addr, bad.clone())
+                .await
+                .err()
+                .expect("must not upgrade");
+            assert_eq!(err.0, 403, "{bad:?}");
+        }
+        assert!(ws(srv.addr, Some(origin())).await.is_ok());
+        srv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn websocket_without_auth_message_is_closed_4401_after_five_seconds() {
+        let srv = serve(own(), 8, Duration::from_secs(30)).await;
+        let c = ws(srv.addr, Some(origin())).await.unwrap();
+        let started = Instant::now();
+        let (_c, f) = recv(c, 10).await;
+        assert_eq!(f, Some(Frame::Close(Some(4401))));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(4500) && took < Duration::from_secs(8),
+            "{took:?}"
+        );
+        srv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn bad_first_messages_are_closed_4401_and_get_no_data() {
+        let srv = serve(own(), 8, Duration::from_secs(5)).await;
+        let token = srv._env.login().await;
+        for first in [
+            r#"{"type":"auth","token":"nope"}"#.to_string(),
+            "garbage".to_string(),
+            r#"{"type":"hello"}"#.to_string(),
+            format!(r#"{{"type":"auth","token":"{token}","privacy":true}}"#),
+            format!(r#"{{"type":"Auth","token":"{token}"}}"#),
+        ] {
+            let mut c = ws(srv.addr, Some(origin())).await.unwrap();
+            c.send_text(&first);
+            let (_c, f) = recv(c, 5).await;
+            assert_eq!(f, Some(Frame::Close(Some(4401))), "{first}");
+        }
+        srv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_before_authentication_then_ready_then_events() {
+        let srv = serve(own(), 8, Duration::from_secs(5)).await;
+        let token = srv._env.login().await;
+        let c = ws(srv.addr, Some(origin())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        srv._env
+            .service
+            .hub
+            .send(&serde_json::json!({"type": "before"}));
+        let (mut c, f) = recv_ms(c, 500).await;
+        assert_eq!(f, None, "data arrived before authentication");
+        c.send_text(&format!(r#"{{"type":"auth","token":"{token}"}}"#));
+        let (c, f) = recv(c, 5).await;
+        assert_eq!(
+            f,
+            Some(Frame::Text(r#"{"type":"ready"}"#.into())),
+            "ready comes first"
+        );
+        srv._env
+            .service
+            .hub
+            .send(&serde_json::json!({"type": "after"}));
+        let (c, f) = recv(c, 5).await;
+        let f = match f {
+            Some(Frame::Text(t)) if t.contains("before") => recv(c, 5).await.1,
+            other => other,
+        };
+        assert_eq!(f, Some(Frame::Text(r#"{"type":"after"}"#.into())));
+        srv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn logout_and_revoke_all_close_bound_websockets_with_4401() {
+        let srv = serve(own(), 8, Duration::from_secs(5)).await;
+        let (a, b) = (srv._env.login().await, srv._env.login().await);
+        let ca = authed(&srv, &a).await;
+        let cb = authed(&srv, &b).await;
+        srv._env.service.auth_logout(&a).await.unwrap();
+        let (_ca, f) = recv(ca, 5).await;
+        assert_eq!(f, Some(Frame::Close(Some(4401))), "logged-out token");
+        let (cb, f) = recv_ms(cb, 300).await;
+        assert_eq!(f, None, "the other session stays open");
+        srv._env.service.auth_revoke_all().await.unwrap();
+        let (_cb, f) = recv(cb, 5).await;
+        assert_eq!(f, Some(Frame::Close(Some(4401))), "revoke-all");
+        srv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn expired_rotated_out_and_overdue_tokens_close_websockets_on_revalidation() {
+        use cc_workspace_manager::auth::sessions::{
+            ROTATE_AFTER_SECS, ROTATION_GRACE_SECS, SESSION_TTL_SECS,
+        };
+        // Rotated out: the old token works during the grace window, not after it.
+        let srv = serve(own(), 8, Duration::from_secs(5)).await;
+        let old = srv._env.login().await;
+        let c = authed(&srv, &old).await;
+        let fresh = srv
+            ._env
+            .service
+            .auth_rotate(&old)
+            .await
+            .unwrap()
+            .session_token;
+        srv._env.service.revalidate_sockets();
+        let (c, f) = recv_ms(c, 300).await;
+        assert_eq!(f, None, "still inside the 60 s grace window");
+        srv._env.clock.advance(ROTATION_GRACE_SECS + 1);
+        srv._env.service.revalidate_sockets();
+        let (_c, f) = recv(c, 5).await;
+        assert_eq!(f, Some(Frame::Close(Some(4401))), "rotated out");
+        // Overdue rotation: accepted only by /auth/rotate, so the socket closes.
+        let c = authed(&srv, &fresh).await;
+        srv._env.clock.advance(ROTATE_AFTER_SECS + 120);
+        srv._env.service.revalidate_sockets();
+        let (_c, f) = recv(c, 5).await;
+        assert_eq!(f, Some(Frame::Close(Some(4401))), "overdue");
+        // Expired.
+        let t = srv._env.login().await;
+        let c = authed(&srv, &t).await;
+        srv._env.clock.advance(SESSION_TTL_SECS + 1);
+        srv._env.service.revalidate_sockets();
+        let (_c, f) = recv(c, 5).await;
+        assert_eq!(f, Some(Frame::Close(Some(4401))), "expired");
+        srv.stop().await;
     }
 
     #[tokio::test]

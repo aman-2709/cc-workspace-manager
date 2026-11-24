@@ -17,7 +17,7 @@ struct Migration {
 }
 
 /// Ordered migrations; index + 1 is the `PRAGMA user_version` after applying it.
-const MIGRATIONS: [Migration; 2] = [
+const MIGRATIONS: [Migration; 3] = [
     Migration {
         sql: include_str!("migrations/001_init.sql"),
         backfill: None,
@@ -25,6 +25,10 @@ const MIGRATIONS: [Migration; 2] = [
     Migration {
         sql: include_str!("migrations/002_sort_key.sql"),
         backfill: Some(backfill_sort_keys),
+    },
+    Migration {
+        sql: include_str!("migrations/003_activity.sql"),
+        backfill: None,
     },
 ];
 
@@ -123,7 +127,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             tables,
-            ["auth_sessions", "meta", "project_sources", "projects"]
+            [
+                "auth_sessions",
+                "file_events",
+                "git_cache",
+                "ignored_paths",
+                "meta",
+                "project_sources",
+                "projects"
+            ]
         );
         migrate(&mut conn).unwrap();
     }

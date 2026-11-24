@@ -33,6 +33,9 @@ struct Daemon {
     child: Child,
     log: Arc<Mutex<String>>,
     port: u16,
+    /// The daemon's own pid (from `instance.json`): differs from `child` when it runs under a
+    /// wrapper (strace, unshare).
+    daemon_pid: i32,
 }
 
 impl Daemon {
@@ -41,7 +44,31 @@ impl Daemon {
     }
 
     fn start_with_env(env: &SynthEnv, extra: &[&str], vars: &[(&str, &str)]) -> Self {
-        let mut c = command(env);
+        Self::start_wrapped(env, extra, vars, &[])
+    }
+
+    /// Start `ccwm serve` as `wrapper… ccwm serve …` when `wrapper` is not empty.
+    fn start_wrapped(
+        env: &SynthEnv,
+        extra: &[&str],
+        vars: &[(&str, &str)],
+        wrapper: &[String],
+    ) -> Self {
+        let mut c = match wrapper.split_first() {
+            None => command(env),
+            Some((program, args)) => {
+                let mut c = Command::new(program);
+                c.env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("NO_COLOR", "1")
+                    .args(args)
+                    .arg(BIN);
+                for (k, v) in env.env_pairs() {
+                    c.env(k, v);
+                }
+                c
+            }
+        };
         for (k, v) in vars {
             c.env(k, v);
         }
@@ -64,11 +91,12 @@ impl Daemon {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(info) = cc_workspace_manager::instance::read_instance(&info_path) {
-                if info.pid == child.id() {
+                if info.pid == child.id() || (!wrapper.is_empty() && info.pid != 0) {
                     return Self {
                         child,
                         log,
                         port: info.port,
+                        daemon_pid: i32::try_from(info.pid).unwrap(),
                     };
                 }
             }
@@ -85,7 +113,7 @@ impl Daemon {
     }
 
     fn pid(&self) -> i32 {
-        i32::try_from(self.child.id()).unwrap()
+        self.daemon_pid
     }
 
     /// SIGTERM and wait for the exit status.
@@ -178,6 +206,14 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        // A wrapper's death would leave the daemon running: kill the daemon itself too, but only
+        // while the child (wrapper or daemon) still runs, so the pid cannot have been reused.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.daemon_pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -479,7 +515,10 @@ fn restart_serves_cached_projects_even_when_the_tree_is_gone() {
     std::fs::create_dir(&env.home).unwrap();
     let second = Daemon::start(&env, &[]);
     let s2 = second.login(&env);
-    let after = second.get_json(&s2, "/api/v1/projects?limit=200");
+    // Served from the cache: same projects, ids and order, whether or not the new scan (which
+    // finds nothing) has already marked them missing.
+    let all = "/api/v1/projects?limit=200&include_missing=1";
+    let after = second.get_json(&s2, all);
     assert_eq!(
         after["total"].as_u64(),
         Some(n),
@@ -491,6 +530,23 @@ fn restart_serves_cached_projects_even_when_the_tree_is_gone() {
         "ids survive a restart"
     );
     second.wait_scan_done(&s2);
+    // M2: projects that were not found are marked missing, never deleted (§4.5).
+    let visible = second.get_json(&s2, "/api/v1/projects?limit=200");
+    assert_eq!(
+        visible["total"], 0,
+        "missing projects are hidden by default"
+    );
+    let kept = second.get_json(&s2, all);
+    assert_eq!(kept["total"].as_u64(), Some(n));
+    assert!(kept["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["missing_since"].is_i64()));
+    assert_eq!(
+        second.get_json(&s2, "/api/v1/stats")["missing"].as_u64(),
+        Some(n)
+    );
     assert_eq!(second.stop().0, Some(0));
 }
 
@@ -825,6 +881,9 @@ fn the_unix_socket_stays_usable_while_tcp_connections_are_saturated() {
     let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 0).unwrap();
     let d = Daemon::start(&env, &[]);
+    // M2: let the first reconciliation (directory walks, Git pipes) settle before counting.
+    wait_scans_finished(&env, 1);
+    std::thread::sleep(Duration::from_millis(500));
     let fds_before = std::fs::read_dir(format!("/proc/{}/fd", d.pid()))
         .unwrap()
         .count();
@@ -843,7 +902,8 @@ fn the_unix_socket_stays_usable_while_tcp_connections_are_saturated() {
         .unwrap()
         .count();
     assert!(
-        fds_during <= fds_before + cc_workspace_manager::http::MAX_CONNECTIONS + 2,
+        // Slack 4 (< the 20 excess clients): background work may hold a few descriptors briefly.
+        fds_during <= fds_before + cc_workspace_manager::http::MAX_CONNECTIONS + 4,
         "TCP clients beyond the cap must not hold descriptors: {fds_before} -> {fds_during}"
     );
     drop(idle);
@@ -866,5 +926,416 @@ impl Mode700 for std::fs::DirBuilder {
     fn mode_700(&mut self) -> &mut Self {
         use std::os::unix::fs::DirBuilderExt;
         self.mode(0o700)
+    }
+}
+
+// ---- M2: live updates, Git status, read-only monitoring, security acceptance test 5 ---------------
+
+fn socket_call(env: &SynthEnv, op: &str) -> serde_json::Value {
+    cc_workspace_manager::client::call(
+        &env.runtime_dir.join("ccwm/ccwm.sock"),
+        nix::unistd::geteuid().as_raw(),
+        op,
+    )
+    .unwrap()
+}
+
+fn wait_until(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !ok() {
+        assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait until discovery has finished `n` reconciliations, over the socket.
+fn wait_scans_finished(env: &SynthEnv, n: u64) {
+    wait_until("a finished reconciliation", 30, || {
+        socket_call(env, "discovery.status")["scans_finished"].as_u64() >= Some(n)
+    });
+}
+
+/// Request a reconciliation over the socket and wait until exactly that one has finished.
+fn refresh_and_wait(env: &SynthEnv) {
+    let target = socket_call(env, "scan.refresh")["done_at_scans_finished"]
+        .as_u64()
+        .unwrap();
+    wait_scans_finished(env, target);
+}
+
+/// `true` if the real inotify watcher is active; otherwise a notice (or a failure with
+/// `CCWM_REQUIRE_INOTIFY=1`): this host has few inotify instances left.
+fn inotify_active(env: &SynthEnv) -> bool {
+    let st = socket_call(env, "service.status");
+    if st["monitoring"]["watcher"] == "inotify" {
+        return true;
+    }
+    assert!(
+        std::env::var("CCWM_REQUIRE_INOTIFY").as_deref() != Ok("1"),
+        "no inotify instance: {st}"
+    );
+    eprintln!("NOTICE: the daemon could not create an inotify instance; live checks skipped");
+    false
+}
+
+fn project_by_name<'a>(page: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("{name} not listed: {page}"))
+}
+
+/// M2 acceptance: editing a file moves its project to the top live; a new `CLAUDE.md` in a
+/// watched area registers a project without a reload; Git status is correct. Over the real
+/// daemon's WebSocket.
+#[test]
+fn m2_acceptance_live_updates_and_git_status() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 6).unwrap();
+    let real_git = synth::init_git(&env).unwrap();
+    let d = Daemon::start(&env, &[]);
+    let token = d.login(&env);
+    d.wait_scan_done(&token);
+
+    if real_git {
+        // Git status is correct (and credentials never leave the daemon).
+        wait_until("git status of the synthetic repositories", 30, || {
+            let page = d.get_json(&token, "/api/v1/projects?limit=200");
+            ["monorepo", "beta", "inner"]
+                .iter()
+                .all(|n| project_by_name(&page, n)["git"]["state"] == "ok")
+        });
+        let page = d.get_json(&token, "/api/v1/projects?limit=200");
+        let git = |n: &str| project_by_name(&page, n)["git"].clone();
+        assert_eq!(
+            (
+                git("monorepo")["untracked"].as_i64(),
+                git("monorepo")["dirty"].as_bool()
+            ),
+            (Some(1), Some(true)),
+            "NOTES.txt is untracked"
+        );
+        assert_eq!(git("monorepo")["branch"], "main");
+        assert_eq!(
+            git("beta")["untracked"],
+            1,
+            "the nested repository shows as untracked"
+        );
+        assert_eq!(
+            (
+                git("inner")["staged"].as_i64(),
+                git("inner")["modified"].as_i64(),
+                git("inner")["untracked"].as_i64()
+            ),
+            (Some(0), Some(0), Some(0))
+        );
+        assert_eq!(project_by_name(&page, "alpha")["git"]["state"], "not_git");
+        let mono_id = project_by_name(&page, "monorepo")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let detail = d.get_json(&token, &format!("/api/v1/projects/{mono_id}"));
+        assert_eq!(
+            detail["git_detail"]["remote_url"],
+            "https://example.invalid/monorepo.git"
+        );
+        let dirty = d.get_json(&token, "/api/v1/projects?dirty=1&limit=200");
+        let mut dirty_names: Vec<&str> = dirty["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        dirty_names.sort_unstable();
+        assert_eq!(dirty_names, ["beta", "monorepo"]);
+        assert!(!page.to_string().contains("synthetic-password"));
+        assert!(!detail.to_string().contains("synthetic-password"));
+    } else {
+        eprintln!("NOTICE: git is not installed; Git status checks skipped");
+    }
+
+    if !inotify_active(&env) {
+        return;
+    }
+    wait_until("every project watched", 30, || {
+        let m = &socket_call(&env, "service.status")["monitoring"];
+        m["polled_projects"] == 0 && m["watched_projects"].as_u64() >= Some(14)
+    });
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", d.port).parse().unwrap();
+    let mut ws = common::WsClient::connect(addr, d.port, Some(&d.origin())).unwrap();
+    ws.send_text(&format!(r#"{{"type":"auth","token":"{token}"}}"#));
+    assert_eq!(ws.recv_json(Duration::from_secs(5))["type"], "ready");
+    let wait_event =
+        |ws: &mut common::WsClient, what: &str, pred: &dyn Fn(&serde_json::Value) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                assert!(Instant::now() < deadline, "no live event: {what}");
+                if let Some(common::Frame::Text(t)) = ws.recv(Duration::from_secs(1)) {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                    if pred(&v) {
+                        return v;
+                    }
+                }
+            }
+        };
+
+    // Editing a file moves its project to the top, live. (Timestamps have one-second resolution
+    // and ties sort by name: edit in a later second than the synthetic files were written.)
+    std::thread::sleep(Duration::from_millis(1100));
+    let target = env.home.join("bulk/proj-0002");
+    std::fs::write(target.join("notes.md"), "edited\n").unwrap();
+    let ev = wait_event(&mut ws, "edit in proj-0002", &|v| {
+        v["type"] == "project"
+            && v["project"]["name"] == "proj-0002"
+            && v["project"]["activity"]["kind"] == "observed"
+    });
+    assert_eq!(ev["project"]["activity"]["path"], "notes.md");
+    assert_eq!(ev["project"]["activity"]["status"], "today");
+    let top = d.get_json(&token, "/api/v1/projects?limit=1");
+    assert_eq!(
+        top["items"][0]["name"], "proj-0002",
+        "the edited project is first"
+    );
+
+    // A new CLAUDE.md in a watched area registers a project without a reload.
+    let fresh = env.home.join("dev/fresh-project");
+    std::fs::create_dir(&fresh).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(fresh.join("CLAUDE.md"), "# fresh\n").unwrap();
+    let ev = wait_event(&mut ws, "new project", &|v| {
+        v["type"] == "project" && v["project"]["name"] == "fresh-project"
+    });
+    assert_eq!(ev["project"]["display_path"], "~/dev/fresh-project");
+    assert_eq!(ev["project"]["sources"], serde_json::json!(["marker"]));
+    let (code, log) = d.stop();
+    assert_eq!(code, Some(0), "{log}");
+    assert!(!log.contains(&token), "token leaked into the log");
+}
+
+/// Acceptance tests 1 and 3 at process level, for M2: discovery, watching, Git and a manual
+/// reconciliation (`ccwm scan`) leave the monitored tree (including every `.git`) and the
+/// Claude config directory byte-identical, with mtimes and modes.
+#[test]
+fn acceptance_1_and_3_monitoring_git_and_reconciliation_modify_nothing() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 4).unwrap();
+    let real_git = synth::init_git(&env).unwrap();
+    let home_before = snapshot(&env.home);
+    let claude_before = snapshot(&env.claude_dir);
+    let d = Daemon::start(&env, &[]);
+    let token = d.login(&env);
+    d.wait_scan_done(&token);
+    if real_git {
+        wait_until("git inspected", 30, || {
+            let page = d.get_json(&token, "/api/v1/projects?limit=200");
+            project_by_name(&page, "monorepo")["git"]["state"] == "ok"
+        });
+    }
+    let out = command(&env).arg("scan").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Scan finished"));
+    // A second scan right after the first (same second) must also be recognised as finished.
+    let again = command(&env).arg("scan").output().unwrap();
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("Scan finished"));
+    std::thread::sleep(Duration::from_millis(1500)); // Git refreshes after the reconciliation
+    let status = command(&env).arg("status").output().unwrap();
+    let text = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.status.success() && text.contains(&format!("port {}", d.port)),
+        "{text}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&status.stderr).contains("warning"),
+        "same build: no commit warning"
+    );
+    assert_eq!(d.stop().0, Some(0));
+    assert_eq!(
+        snapshot(&env.home),
+        home_before,
+        "the monitored tree changed"
+    );
+    assert_eq!(
+        snapshot(&env.claude_dir),
+        claude_before,
+        "the Claude directory changed"
+    );
+}
+
+/// Lines of an `strace -e trace=connect` log that connect anywhere but loopback or a Unix socket.
+fn non_loopback_connects(log: &str) -> Vec<String> {
+    log.lines()
+        .filter(|l| l.contains("connect("))
+        .filter(|l| !connect_is_local(l))
+        .map(str::to_string)
+        .collect()
+}
+
+fn connect_is_local(line: &str) -> bool {
+    let quoted = |prefix: &str| {
+        line.split_once(prefix)
+            .and_then(|(_, rest)| rest.split('"').next())
+            .map(str::to_string)
+    };
+    if line.contains("sa_family=AF_UNIX") || line.contains("sa_family=AF_UNSPEC") {
+        return true;
+    }
+    if line.contains("sa_family=AF_INET,") {
+        return quoted("inet_addr(\"").is_some_and(|a| a.starts_with("127."));
+    }
+    if line.contains("sa_family=AF_INET6") {
+        return quoted("inet_pton(AF_INET6, \"")
+            .is_some_and(|a| a == "::1" || a.starts_with("::ffff:127."));
+    }
+    false // anything else (other families, unparsable lines) counts as a violation
+}
+
+#[test]
+fn the_connect_log_classifier_flags_every_non_loopback_connect() {
+    let log = r#"
+100 connect(3, {sa_family=AF_UNIX, sun_path="/run/user/1000/ccwm/ccwm.sock"}, 110) = 0
+101 connect(4, {sa_family=AF_INET, sin_port=htons(8765), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+102 connect(5, {sa_family=AF_INET6, sin6_port=htons(1), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::1", &sin6_addr), sin6_scope_id=0}, 28) = 0
+103 connect(6, {sa_family=AF_INET6, sin6_port=htons(1), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:127.0.0.2", &sin6_addr), sin6_scope_id=0}, 28) = 0
+104 connect(7, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.1")}, 16) = -1 EACCES (Permission denied)
+105 connect(8, {sa_family=AF_INET6, sin6_port=htons(443), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:db8::1", &sin6_addr), sin6_scope_id=0}, 28 <unfinished ...>
+106 <... connect resumed>) = -1 ENETUNREACH
+107 connect(9, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0
+108 connect(10, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("1.1.1.1")}, 16) = 0
+109 execve("/usr/bin/git", ["git", "status"], 0x0 /* 6 vars */) = 0
+"#;
+    let bad = non_loopback_connects(log);
+    let pids: Vec<&str> = bad.iter().map(|l| l.split(' ').next().unwrap()).collect();
+    assert_eq!(pids, ["104", "105", "107", "108"], "{bad:#?}");
+}
+
+/// Which isolation security acceptance test 5 can use on this host: a network namespace
+/// (`unshare`, mapping the current user: ccwm refuses to run as root) and/or `strace`. Each is
+/// probed with the exact wrapper it would run.
+fn test5_wrapper(log: &Path) -> Option<(Vec<String>, &'static str)> {
+    let works = |argv: &[&str]| {
+        Command::new(argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let log = log.to_str().unwrap();
+    let strace = [
+        "strace",
+        "-f",
+        "-qq",
+        "-e",
+        "trace=connect,execve",
+        "-o",
+        log,
+    ];
+    let netns = [
+        "unshare",
+        "--user",
+        "--map-current-user",
+        "--keep-caps",
+        "--net",
+        "--",
+        "sh",
+        "-c",
+        "ip link set lo up && exec \"$@\"",
+        "sh",
+    ];
+    let has_strace = works(&[&strace[..], &["true"]].concat());
+    let has_netns = works(&[&netns[..], &["true"]].concat());
+    let own = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+    match (has_netns, has_strace) {
+        (true, true) => Some((
+            [own(&netns), own(&strace)].concat(),
+            "network namespace + strace",
+        )),
+        (false, true) => Some((own(&strace), "strace (no network namespace on this host)")),
+        (true, false) => Some((own(&netns), "network namespace (no strace)")),
+        (false, false) => None,
+    }
+}
+
+/// Security acceptance test 5: through a discovery, live-watch, Git and reconciliation cycle, the
+/// daemon and its Git subprocesses attempt no non-loopback connect (strace), and/or run in a
+/// network namespace with only loopback. Skipped with a notice when neither is available.
+/// (The session cycle joins in M3, when sessions are parsed.)
+#[test]
+fn acceptance_5_no_external_network_connections() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 3).unwrap();
+    let real_git = synth::init_git(&env).unwrap();
+    // Make Git's network paths tempting: remotes over https and ssh.
+    if real_git {
+        let beta = env.home.join("dev/beta");
+        let out = Command::new("git")
+            .current_dir(&beta)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &env.home)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@example.invalid/beta.git",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+    let log_path = t.path().join("connect.log");
+    let Some((wrapper, variant)) = test5_wrapper(&log_path) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "test 5 needs strace or unprivileged network namespaces in CI"
+        );
+        eprintln!("NOTICE: security acceptance test 5 skipped: neither unshare (network namespace) nor strace is usable here");
+        return;
+    };
+    eprintln!("NOTICE: security acceptance test 5 variant: {variant}");
+    let d = Daemon::start_wrapped(&env, &[], &[], &wrapper);
+    wait_scans_finished(&env, 1);
+    // Live: an edit in a Git project (activity + Git refresh) and a new project.
+    std::fs::write(env.home.join("dev/beta/CLAUDE.md"), "# beta, edited\n").unwrap();
+    let fresh = env.home.join("dev/t5-new");
+    std::fs::create_dir(&fresh).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(fresh.join("CLAUDE.md"), "# new\n").unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    // Reconciliation over the socket, then let the Git refreshes run.
+    refresh_and_wait(&env);
+    std::thread::sleep(Duration::from_secs(2));
+    let (code, daemon_log) = d.stop();
+    assert_eq!(code, Some(0), "{daemon_log}");
+    if variant.contains("strace") {
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        let bad = non_loopback_connects(&log);
+        assert!(
+            bad.is_empty(),
+            "non-loopback connect attempts:\n{}",
+            bad.join("\n")
+        );
+        if real_git {
+            let git_runs = log
+                .lines()
+                .filter(|l| l.contains("execve(") && l.contains("git\""))
+                .count();
+            assert!(
+                git_runs >= 3,
+                "Git subprocesses were not traced ({git_runs} execs)"
+            );
+        }
+        let connects = log.lines().filter(|l| l.contains("connect(")).count();
+        eprintln!(
+            "NOTICE: test 5: {connects} connect() calls traced, all loopback or Unix sockets"
+        );
     }
 }

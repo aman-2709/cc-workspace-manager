@@ -5,8 +5,9 @@ use super::AppState;
 use crate::api_error::ApiError;
 use crate::auth::sessions::IssuedSession;
 use crate::discovery::status::DiscoverySnapshot;
-use crate::service::{Health, ProjectsPage, ProjectsQuery, ServiceStatus, Stats};
-use axum::extract::State;
+use crate::service::{Accepted, Health, ProjectsPage, ProjectsQuery, ServiceStatus, Stats};
+use crate::view::{ProjectDetail, ProjectView};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -47,6 +48,46 @@ pub async fn projects(
     ApiQuery(q): ApiQuery<ProjectsQuery>,
 ) -> Result<Json<ProjectsPage>, ApiError> {
     Ok(Json(s.service.list_projects(q).await?))
+}
+
+/// Project ids come from the path; anything that is not a well-formed id is a 404 (the service
+/// validates), and the extractor's own rejection is mapped to the JSON envelope.
+type Id = Result<Path<String>, axum::extract::rejection::PathRejection>;
+
+fn id(p: Id) -> Result<String, ApiError> {
+    p.map(|Path(id)| id)
+        .map_err(|_| ApiError::new(crate::api_error::Code::NotFound, "no such project"))
+}
+
+pub async fn project(
+    State(s): St,
+    _auth: SessionAuth,
+    p: Id,
+) -> Result<Json<ProjectDetail>, ApiError> {
+    Ok(Json(s.service.project(&id(p)?).await?))
+}
+
+pub async fn ignore(
+    State(s): St,
+    _auth: SessionAuth,
+    p: Id,
+) -> Result<Json<ProjectView>, ApiError> {
+    Ok(Json(s.service.set_ignored(&id(p)?, true).await?))
+}
+
+pub async fn unignore(
+    State(s): St,
+    _auth: SessionAuth,
+    p: Id,
+) -> Result<Json<ProjectView>, ApiError> {
+    Ok(Json(s.service.set_ignored(&id(p)?, false).await?))
+}
+
+pub async fn refresh(
+    State(s): St,
+    _auth: SessionAuth,
+) -> Result<(StatusCode, Json<Accepted>), ApiError> {
+    Ok((StatusCode::ACCEPTED, Json(s.service.refresh()?)))
 }
 
 pub async fn stats(State(s): St, _auth: SessionAuth) -> Result<Json<Stats>, ApiError> {

@@ -213,6 +213,7 @@ fn child_main(mode: &str) {
         "grandchild_write_inside",
         in_grandchild("write", data.join("g").to_str().unwrap()),
     );
+    git_probes(&l, listener_port);
     // A system binary can still be executed (git and claude live under the system paths).
     probe(
         "exec_system_binary",
@@ -227,6 +228,52 @@ fn child_main(mode: &str) {
                 }),
         ),
     );
+}
+
+/// Test 11, Git-subprocess variant: Git started by the confined process cannot connect out or
+/// write outside ccwm's directories, while ccwm's hardened inspection still works.
+fn git_probes(l: &Layout, listener_port: u16) {
+    let Some(git) = cc_workspace_manager::git::find_on_path(std::env::var_os("PATH").as_deref())
+    else {
+        probe("git", "missing");
+        return;
+    };
+    let classify = |out: io::Result<std::process::Output>| match out {
+        Ok(o) if o.status.success() => "ok".to_string(),
+        Ok(o) if String::from_utf8_lossy(&o.stderr).contains("Permission denied") => {
+            "EACCES".to_string()
+        }
+        Ok(o) => format!(
+            "failed:{}",
+            String::from_utf8_lossy(&o.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        ),
+        Err(e) => outcome::<()>(Err(e)),
+    };
+    // Plain Git, protocols allowed: only the kernel can stop this connect.
+    probe(
+        "git_connect",
+        classify(
+            sandbox::child_command(&git)
+                .args(["-c", "protocol.allow=always", "ls-remote"])
+                .arg(format!("git://127.0.0.1:{listener_port}/x"))
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output(),
+        ),
+    );
+    probe(
+        "git_write_outside",
+        classify(
+            sandbox::child_command(&git)
+                .args(["init", "-q"])
+                .arg(l.outside.join("gitrepo"))
+                .output(),
+        ),
+    );
+    let g = cc_workspace_manager::git::Git::detect(Some(git), &l.ro, false);
+    probe("git_inspect", g.inspect(&l.ro.join("repo")).state.as_str());
 }
 
 /// The daemon's own policy builder, fed with this layout.
@@ -262,6 +309,31 @@ fn setup() -> Setup {
         fs::create_dir_all(d).unwrap();
     }
     fs::write(layout.ro.join("f"), b"data").unwrap();
+    // A real repository inside the readable root, for the confined Git inspection.
+    let repo = layout.ro.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("file"), b"x").unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "file"][..],
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "x",
+        ][..],
+    ] {
+        let _ = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &layout.ro)
+            .output();
+    }
     fs::write(layout.outside.join("f"), b"data").unwrap();
     let unix = UnixListener::bind(layout.outside.join("u.sock")).unwrap();
     let abstract_name = format!("ccwm-sandbox-test-{}", std::process::id());
@@ -367,6 +439,23 @@ fn landlock_confines_the_process_threads_and_children() {
             r["unconfined"].as_array().unwrap().iter().any(|v| v == u),
             "{u}: {r}"
         );
+    }
+
+    if p.get("git").map(String::as_str) == Some("missing") {
+        assert!(std::env::var_os("CI").is_none(), "git is required in CI");
+        eprintln!("NOTICE: git not installed; Git-subprocess variant of test 11 skipped");
+    } else {
+        want("git_write_outside", "EACCES");
+        assert!(!s.layout.outside.join("gitrepo").exists());
+        want("git_inspect", "ok");
+        if r["network"] == "tcp_only" {
+            want("git_connect", "EACCES");
+            s.listener.set_nonblocking(true).unwrap();
+            assert!(
+                matches!(s.listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+                "a confined Git process reached the listener"
+            );
+        }
     }
 
     if r["network"] == "tcp_only" {

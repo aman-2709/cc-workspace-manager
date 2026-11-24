@@ -16,3 +16,28 @@ exclude = []
 max_depth = 10
 # Stay on the root's file system (do not descend into other mounts).
 same_file_system = true
+# Seconds between background reconciliation scans (60-86400). `ccwm scan` triggers one now.
+scan_interval_secs = 600
+# Projects that are not found are marked missing and deleted from ccwm's index after this many
+# days (1-3650). Your files are never touched.
+missing_retention_days = 30
+
+[watch]
+# Maximum inotify watches ccwm uses. 0 = automatic: min(8192, 25 % of fs.inotify.max_user_watches).
+# Projects beyond the budget are "polled": checked at each scan instead of live.
+budget = 0
+# File events of one project are combined for this long before they are recorded (100-60000 ms).
+debounce_ms = 2000
+
+[activity]
+# Calendar days since the last change (system time zone): 0 = today, 1 to inactive-1 = recent,
+# inactive to dormant-1 = inactive, dormant or more = dormant.
+inactive_after_days = 7
+dormant_after_days = 30
+# Recent file events kept per project.
+events_per_project = 200
+
+[git]
+# Git older than 2.41.0 cannot be hardened against filter drivers (no --attr-source), so worktree
+# status is disabled there. true re-enables it WITHOUT that protection. Not recommended.
+allow_unhardened_status = false

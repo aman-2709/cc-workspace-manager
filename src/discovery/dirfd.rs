@@ -66,6 +66,9 @@ impl From<Errno> for OpenError {
     }
 }
 
+/// Bytes of a `CLAUDE.md` read for its content hash (§4.1: bounded marker reads).
+pub const MAX_MARKER_BYTES: u64 = 256 * 1024;
+
 fn is(st: &FileStat, kind: SFlag) -> bool {
     SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == kind
 }
@@ -111,6 +114,13 @@ impl DirHandle {
         let fd =
             openat(self.dir.as_fd(), name, DIR_FLAGS, Mode::empty()).map_err(OpenError::from)?;
         Self::from_fd(fd, expected)
+    }
+
+    /// Open the real sub-directory `name` (never a symlink), whatever its identity.
+    pub fn open_child_dir(&self, name: &OsStr) -> Option<Self> {
+        let fd = openat(self.dir.as_fd(), name, DIR_FLAGS, Mode::empty()).ok()?;
+        let st = fstat(&fd).ok()?;
+        Self::from_fd(fd, Identity::of(&st)).ok()
     }
 
     pub fn identity(&self) -> Identity {
@@ -180,6 +190,64 @@ impl DirHandle {
             Err(Errno::ENOSYS | Errno::EPERM) => self.symlink_beneath_fallback(name),
             Err(_) => false,
         }
+    }
+
+    /// Read at most `max` bytes of the regular file `name`; also returns its full size. With
+    /// `beneath`, a symlink is followed only if it resolves inside this directory
+    /// (`RESOLVE_BENEATH`; `None` without `openat2`); otherwise symlinks are never followed.
+    /// FIFOs, devices and directories are never read.
+    pub fn read_regular(&self, name: &OsStr, beneath: bool, max: u64) -> Option<(Vec<u8>, u64)> {
+        use std::io::Read;
+        let flags = OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
+        let fd = if beneath {
+            let how = OpenHow::new()
+                .flags(flags)
+                .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_MAGICLINKS);
+            openat2(self.dir.as_fd(), name, how).ok()?
+        } else {
+            openat(
+                self.dir.as_fd(),
+                name,
+                flags | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .ok()?
+        };
+        let st = fstat(&fd).ok()?;
+        if !is(&st, SFlag::S_IFREG) {
+            return None;
+        }
+        let mut buf = Vec::new();
+        std::fs::File::from(fd)
+            .take(max)
+            .read_to_end(&mut buf)
+            .ok()?;
+        Some((buf, u64::try_from(st.st_size).unwrap_or(0)))
+    }
+
+    /// SHA-256 of the marker file `name` (at most [`MAX_MARKER_BYTES`] are read; a larger file
+    /// hashes its first bytes and its size). A symlinked marker must resolve beneath this
+    /// directory (see [`Self::read_regular`]).
+    pub fn marker_hash(&self, name: &OsStr, symlink: bool) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let (buf, size) = self.read_regular(name, symlink, MAX_MARKER_BYTES)?;
+        let mut h = Sha256::new();
+        h.update(&buf);
+        if size > MAX_MARKER_BYTES {
+            h.update(size.to_le_bytes());
+        }
+        Some(h.finalize().into())
+    }
+
+    /// Modification time (Unix seconds) of `name`, without following symlinks.
+    pub fn mtime(&self, name: &OsStr) -> Option<i64> {
+        fstatat(
+            self.dir.as_fd(),
+            name,
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .ok()
+        .map(|st| st.st_mtime)
     }
 
     /// Without `openat2`: read the link and follow it component by component with `O_NOFOLLOW`.
@@ -348,6 +416,37 @@ mod tests {
         symlink("ok-sibling", d.join("chain")).unwrap();
         assert!(h.symlink_resolves_to_file_beneath(OsStr::new("chain")));
         assert!(!h.symlink_beneath_fallback(OsStr::new("chain")));
+    }
+
+    #[test]
+    fn marker_hashes_are_bounded_and_never_leave_the_directory() {
+        use sha2::{Digest, Sha256};
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("p");
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("CLAUDE.md"), "hello").unwrap();
+        fs::write(d.join("AGENTS.md"), "agents").unwrap();
+        fs::write(t.path().join("secret.md"), "secret").unwrap();
+        symlink("AGENTS.md", d.join("in")).unwrap();
+        symlink("../secret.md", d.join("out")).unwrap();
+        let big = vec![b'x'; usize::try_from(MAX_MARKER_BYTES).unwrap() + 10];
+        fs::write(d.join("big"), &big).unwrap();
+        let h = DirHandle::open_root(&d).unwrap();
+        let want: [u8; 32] = Sha256::digest(b"hello").into();
+        assert_eq!(h.marker_hash(OsStr::new("CLAUDE.md"), false), Some(want));
+        let agents: [u8; 32] = Sha256::digest(b"agents").into();
+        assert_eq!(h.marker_hash(OsStr::new("in"), true), Some(agents));
+        assert_eq!(h.marker_hash(OsStr::new("out"), true), None, "escapes");
+        assert_eq!(
+            h.marker_hash(OsStr::new("in"), false),
+            None,
+            "not followed as a file"
+        );
+        let bounded = h.marker_hash(OsStr::new("big"), false).unwrap();
+        let first: [u8; 32] = Sha256::digest(&big[..big.len() - 10]).into();
+        assert_ne!(bounded, first, "the size is part of a truncated hash");
+        nix::unistd::mkfifo(&d.join("fifo"), Mode::S_IRWXU).unwrap();
+        assert_eq!(h.marker_hash(OsStr::new("fifo"), false), None);
     }
 
     #[test]

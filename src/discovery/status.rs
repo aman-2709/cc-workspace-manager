@@ -39,6 +39,8 @@ pub struct DiscoverySnapshot {
     pub roots: Vec<RootStatus>,
     pub last_success_at: Option<i64>,
     pub next_scan_at: Option<i64>,
+    /// Reconciliations finished since the daemon started (monotonic; `ccwm scan` waits on it).
+    pub scans_finished: u64,
 }
 
 #[derive(Debug, Clone, Default)]

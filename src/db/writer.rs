@@ -40,12 +40,78 @@ pub struct ProjectUpsert {
     pub canonical_path: String,
     pub name: String,
     pub source: Source,
+    /// SHA-256 of the marker content, if it was read (kept otherwise).
+    pub marker_hash: Option<[u8; 32]>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What happened to one upserted project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upserted {
+    pub id: String,
+    pub canonical_path: String,
+    pub inserted: bool,
+    /// It was marked missing before and is present again.
+    pub revived: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpsertSummary {
     pub inserted: usize,
     pub updated: usize,
+    pub rows: Vec<Upserted>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// From a walk of the tree (file modification times).
+    Inferred,
+    /// From a live filesystem event.
+    Observed,
+}
+
+impl ActivityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inferred => "inferred",
+            Self::Observed => "observed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    Create,
+    Modify,
+    Delete,
+    Rename,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Modify => "modify",
+            Self::Delete => "delete",
+            Self::Rename => "rename",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEvent {
+    pub at: i64,
+    pub kind: EventKind,
+    /// Relative to the project root.
+    pub path: String,
+}
+
+/// The latest meaningful modification of a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    pub at: i64,
+    pub kind: ActivityKind,
+    /// The latest modified file; `None` keeps the stored one (only directories changed).
+    pub path: Option<String>,
 }
 
 /// A freshly stored browser session.
@@ -98,6 +164,49 @@ enum Cmd {
         key: String,
         value: String,
         reply: Reply<()>,
+    },
+    /// Raise the project's activity to `activity` (never lowers it) and append `events`, keeping
+    /// the newest `keep`. Replies whether the activity changed.
+    RecordActivity {
+        id: String,
+        activity: Activity,
+        events: Vec<FileEvent>,
+        keep: u32,
+        reply: Reply<bool>,
+    },
+    StoreGit {
+        id: String,
+        info: Box<crate::git::Info>,
+        now: i64,
+        reply: Reply<()>,
+    },
+    /// Mark present projects missing; replies with the ids that changed.
+    MarkMissing {
+        ids: Vec<String>,
+        now: i64,
+        reply: Reply<Vec<String>>,
+    },
+    /// Delete projects missing since `before` or earlier; replies with their ids.
+    PurgeMissing {
+        before: i64,
+        reply: Reply<Vec<String>>,
+    },
+    /// Give project `id` a new canonical path (a move), keeping its id. A different project
+    /// already registered at that path is deleted first (it was the same project, seen before the
+    /// move was recognised); replies with its id.
+    MoveProject {
+        id: String,
+        path: String,
+        name: String,
+        now: i64,
+        reply: Reply<Option<String>>,
+    },
+    /// Ignore (or un-ignore) a canonical path; replies whether anything changed.
+    SetIgnored {
+        path: String,
+        ignored: bool,
+        now: i64,
+        reply: Reply<bool>,
     },
     Flush {
         reply: Reply<()>,
@@ -243,6 +352,69 @@ impl Writer {
         })
     }
 
+    pub async fn record_activity(
+        &self,
+        id: &str,
+        activity: Activity,
+        events: Vec<FileEvent>,
+        keep: u32,
+    ) -> Result<bool> {
+        self.call(|reply| Cmd::RecordActivity {
+            id: id.to_string(),
+            activity,
+            events,
+            keep,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn store_git(&self, id: &str, info: crate::git::Info, now: i64) -> Result<()> {
+        self.call(|reply| Cmd::StoreGit {
+            id: id.to_string(),
+            info: Box::new(info),
+            now,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn mark_missing(&self, ids: Vec<String>, now: i64) -> Result<Vec<String>> {
+        self.call(|reply| Cmd::MarkMissing { ids, now, reply })
+            .await
+    }
+
+    pub async fn purge_missing(&self, before: i64) -> Result<Vec<String>> {
+        self.call(|reply| Cmd::PurgeMissing { before, reply }).await
+    }
+
+    pub async fn move_project(
+        &self,
+        id: &str,
+        path: &str,
+        name: &str,
+        now: i64,
+    ) -> Result<Option<String>> {
+        self.call(|reply| Cmd::MoveProject {
+            id: id.to_string(),
+            path: path.to_string(),
+            name: name.to_string(),
+            now,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_ignored(&self, path: &str, ignored: bool, now: i64) -> Result<bool> {
+        self.call(|reply| Cmd::SetIgnored {
+            path: path.to_string(),
+            ignored,
+            now,
+            reply,
+        })
+        .await
+    }
+
     /// Wait until everything queued before this call has been committed.
     pub async fn flush(&self) -> Result<()> {
         self.call(|reply| Cmd::Flush { reply }).await
@@ -310,9 +482,17 @@ fn fail(cmd: Cmd, err: &Error) {
         Cmd::RevokeAll { reply } | Cmd::PurgeExpiredSessions { reply, .. } => {
             drop(reply.send(Err(e())))
         }
-        Cmd::SetMeta { reply, .. } | Cmd::Flush { reply } | Cmd::Shutdown { reply } => {
+        Cmd::SetMeta { reply, .. }
+        | Cmd::StoreGit { reply, .. }
+        | Cmd::Flush { reply }
+        | Cmd::Shutdown { reply } => drop(reply.send(Err(e()))),
+        Cmd::RecordActivity { reply, .. } | Cmd::SetIgnored { reply, .. } => {
             drop(reply.send(Err(e())))
         }
+        Cmd::MarkMissing { reply, .. } | Cmd::PurgeMissing { reply, .. } => {
+            drop(reply.send(Err(e())))
+        }
+        Cmd::MoveProject { reply, .. } => drop(reply.send(Err(e()))),
         Cmd::TouchSession { .. } => {}
     }
 }
@@ -399,6 +579,34 @@ fn execute(tx: &rusqlite::Transaction<'_>, cmd: Cmd) -> Outcome {
             .map(|_| ())
             .map_err(|e| db_err("set meta", &e))
         }),
+        Cmd::RecordActivity {
+            id,
+            activity,
+            events,
+            keep,
+            reply,
+        } => run!(reply, |c| record_activity(c, &id, &activity, &events, keep)),
+        Cmd::StoreGit {
+            id,
+            info,
+            now,
+            reply,
+        } => run!(reply, |c| store_git(c, &id, &info, now)),
+        Cmd::MarkMissing { ids, now, reply } => run!(reply, |c| mark_missing(c, &ids, now)),
+        Cmd::PurgeMissing { before, reply } => run!(reply, |c| purge_missing(c, before)),
+        Cmd::MoveProject {
+            id,
+            path,
+            name,
+            now,
+            reply,
+        } => run!(reply, |c| move_project(c, &id, &path, &name, now)),
+        Cmd::SetIgnored {
+            path,
+            ignored,
+            now,
+            reply,
+        } => run!(reply, |c| set_ignored(c, &path, ignored, now)),
         Cmd::Flush { reply } | Cmd::Shutdown { reply } => run!(reply, |_c| Ok(())),
     }
 }
@@ -425,42 +633,240 @@ fn savepoint<T>(
 fn upsert_projects(c: &Connection, batch: &[ProjectUpsert], now: i64) -> Result<UpsertSummary> {
     let mut summary = UpsertSummary::default();
     for p in batch {
-        let existing: Option<String> = c
+        let existing: Option<(String, Option<i64>)> = c
             .query_row(
-                "SELECT id FROM projects WHERE canonical_path = ?1",
+                "SELECT id, missing_since FROM projects WHERE canonical_path = ?1",
                 params![p.canonical_path],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(|e| db_err("find project", &e))?;
-        let id = match existing {
-            Some(id) => {
+        let hash = p.marker_hash.as_ref().map(<[u8; 32]>::as_slice);
+        let row = match existing {
+            Some((id, missing_since)) => {
                 c.execute(
-                    "UPDATE projects SET name = ?2, sort_key = ?3, last_seen_at = ?4 WHERE id = ?1",
-                    params![id, p.name, sort_key(&p.name), now],
+                    "UPDATE projects SET name = ?2, sort_key = ?3, last_seen_at = ?4, missing_since = NULL,
+                            marker_hash = coalesce(?5, marker_hash) WHERE id = ?1",
+                    params![id, p.name, sort_key(&p.name), now, hash],
                 )
                 .map_err(|e| db_err("update project", &e))?;
                 summary.updated += 1;
-                id
+                Upserted {
+                    id,
+                    canonical_path: p.canonical_path.clone(),
+                    inserted: false,
+                    revived: missing_since.is_some(),
+                }
             }
             None => {
                 let id = random_id()?;
                 c.execute(
-                    "INSERT INTO projects (id, canonical_path, name, sort_key, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                    params![id, p.canonical_path, p.name, sort_key(&p.name), now],
+                    "INSERT INTO projects (id, canonical_path, name, sort_key, first_seen_at, last_seen_at, marker_hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                    params![id, p.canonical_path, p.name, sort_key(&p.name), now, hash],
                 )
                 .map_err(|e| db_err("insert project", &e))?;
                 summary.inserted += 1;
-                id
+                Upserted {
+                    id,
+                    canonical_path: p.canonical_path.clone(),
+                    inserted: true,
+                    revived: false,
+                }
             }
         };
         c.execute(
             "INSERT OR IGNORE INTO project_sources (project_id, source, first_seen_at) VALUES (?1, ?2, ?3)",
-            params![id, p.source.as_str(), now],
+            params![row.id, p.source.as_str(), now],
         )
         .map_err(|e| db_err("insert source", &e))?;
+        summary.rows.push(row);
     }
     Ok(summary)
+}
+
+fn record_activity(
+    c: &Connection,
+    id: &str,
+    a: &Activity,
+    events: &[FileEvent],
+    keep: u32,
+) -> Result<bool> {
+    let changed = c
+        .execute(
+            "UPDATE projects SET activity_at = ?2, activity_kind = ?3,
+                    activity_path = coalesce(?4, activity_path)
+             WHERE id = ?1 AND (activity_at IS NULL OR activity_at < ?2
+                                -- same second: a newer observation may upgrade an inference or
+                                -- name a newer file; an inference never replaces an observation
+                                OR (activity_at = ?2 AND ?3 = 'observed'
+                                    AND (activity_kind IS NOT 'observed'
+                                         OR activity_path IS NOT coalesce(?4, activity_path))))",
+            params![id, a.at, a.kind.as_str(), a.path],
+        )
+        .map_err(|e| db_err("record activity", &e))?
+        > 0;
+    if events.is_empty() {
+        return Ok(changed);
+    }
+    let mut insert = c
+        .prepare_cached("INSERT INTO file_events (project_id, at, kind, path) SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM projects WHERE id = ?1)")
+        .map_err(|e| db_err("prepare event", &e))?;
+    for e in events {
+        insert
+            .execute(params![id, e.at, e.kind.as_str(), e.path])
+            .map_err(|e| db_err("insert event", &e))?;
+    }
+    c.execute(
+        "DELETE FROM file_events WHERE project_id = ?1 AND id NOT IN (
+           SELECT id FROM file_events WHERE project_id = ?1 ORDER BY id DESC LIMIT ?2)",
+        params![id, i64::from(keep)],
+    )
+    .map_err(|e| db_err("trim events", &e))?;
+    Ok(changed)
+}
+
+fn store_git(c: &Connection, id: &str, g: &crate::git::Info, now: i64) -> Result<()> {
+    let wt = g.worktree.as_ref();
+    let files = wt
+        .map(|w| serde_json::to_string(&w.files))
+        .transpose()
+        .map_err(|e| Error::new(format!("encode git files: {e}")))?;
+    let head = g.head.as_ref();
+    c.execute(
+        "INSERT INTO git_cache (project_id, fetched_at, state, branch, detached, upstream, ahead, behind,
+                                staged, modified, untracked, files, head_commit, head_subject, head_author,
+                                head_time, remote_url)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+         WHERE EXISTS (SELECT 1 FROM projects WHERE id = ?1)
+         ON CONFLICT(project_id) DO UPDATE SET
+           fetched_at = excluded.fetched_at, state = excluded.state, branch = excluded.branch,
+           detached = excluded.detached, upstream = excluded.upstream, ahead = excluded.ahead,
+           behind = excluded.behind, staged = excluded.staged, modified = excluded.modified,
+           untracked = excluded.untracked, files = excluded.files, head_commit = excluded.head_commit,
+           head_subject = excluded.head_subject, head_author = excluded.head_author,
+           head_time = excluded.head_time, remote_url = excluded.remote_url",
+        params![
+            id,
+            now,
+            g.state.as_str(),
+            g.branch,
+            g.detached,
+            g.upstream,
+            g.ahead,
+            g.behind,
+            wt.map(|w| w.staged),
+            wt.map(|w| w.modified),
+            wt.map(|w| w.untracked),
+            files,
+            head.map(|h| h.hash.as_str()),
+            head.map(|h| h.subject.as_str()),
+            head.map(|h| h.author.as_str()),
+            head.map(|h| h.time),
+            g.remote_url,
+        ],
+    )
+    .map_err(|e| db_err("store git", &e))?;
+    Ok(())
+}
+
+fn mark_missing(c: &Connection, ids: &[String], now: i64) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
+    let mut st = c
+        .prepare_cached(
+            "UPDATE projects SET missing_since = ?2 WHERE id = ?1 AND missing_since IS NULL",
+        )
+        .map_err(|e| db_err("prepare missing", &e))?;
+    for id in ids {
+        if st
+            .execute(params![id, now])
+            .map_err(|e| db_err("mark missing", &e))?
+            > 0
+        {
+            changed.push(id.clone());
+        }
+    }
+    Ok(changed)
+}
+
+fn purge_missing(c: &Connection, before: i64) -> Result<Vec<String>> {
+    let ids: Vec<String> = c
+        .prepare("SELECT id FROM projects WHERE missing_since IS NOT NULL AND missing_since <= ?1")
+        .and_then(|mut st| {
+            st.query_map(params![before], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()
+        })
+        .map_err(|e| db_err("find purgeable", &e))?;
+    c.execute(
+        "DELETE FROM projects WHERE missing_since IS NOT NULL AND missing_since <= ?1",
+        params![before],
+    )
+    .map_err(|e| db_err("purge missing", &e))?;
+    Ok(ids)
+}
+
+fn move_project(
+    c: &Connection,
+    id: &str,
+    path: &str,
+    name: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let occupant: Option<String> = c
+        .query_row(
+            "SELECT id FROM projects WHERE canonical_path = ?1 AND id <> ?2",
+            params![path, id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| db_err("find occupant", &e))?;
+    if let Some(other) = &occupant {
+        // Keep the sources the newer row had (e.g. a session source seen at the new path).
+        c.execute(
+            "INSERT OR IGNORE INTO project_sources (project_id, source, first_seen_at)
+             SELECT ?1, source, first_seen_at FROM project_sources WHERE project_id = ?2",
+            params![id, other],
+        )
+        .map_err(|e| db_err("merge sources", &e))?;
+        c.execute("DELETE FROM projects WHERE id = ?1", params![other])
+            .map_err(|e| db_err("delete duplicate", &e))?;
+    }
+    // An ignored project stays ignored where it moved to (the ignore is keyed by path).
+    c.execute(
+        "UPDATE OR IGNORE ignored_paths SET canonical_path = ?2
+         WHERE canonical_path = (SELECT canonical_path FROM projects WHERE id = ?1)",
+        params![id, path],
+    )
+    .map_err(|e| db_err("move ignore", &e))?;
+    c.execute(
+        "DELETE FROM ignored_paths WHERE canonical_path = (SELECT canonical_path FROM projects WHERE id = ?1)
+           AND canonical_path <> ?2",
+        params![id, path],
+    )
+    .map_err(|e| db_err("drop old ignore", &e))?;
+    c.execute(
+        "UPDATE projects SET canonical_path = ?2, name = ?3, sort_key = ?4, missing_since = NULL, last_seen_at = ?5
+         WHERE id = ?1",
+        params![id, path, name, sort_key(name), now],
+    )
+    .map_err(|e| db_err("move project", &e))?;
+    Ok(occupant)
+}
+
+fn set_ignored(c: &Connection, path: &str, ignored: bool, now: i64) -> Result<bool> {
+    let n = if ignored {
+        c.execute(
+            "INSERT OR IGNORE INTO ignored_paths (canonical_path, ignored_at) VALUES (?1, ?2)",
+            params![path, now],
+        )
+    } else {
+        c.execute(
+            "DELETE FROM ignored_paths WHERE canonical_path = ?1",
+            params![path],
+        )
+    }
+    .map_err(|e| db_err("set ignored", &e))?;
+    Ok(n > 0)
 }
 
 /// Insert a session after dropping expired ones, then keep only the [`MAX_LIVE_SESSIONS`] most
