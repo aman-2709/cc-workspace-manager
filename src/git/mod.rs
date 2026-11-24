@@ -5,8 +5,11 @@
 //! flags, an empty environment plus the six §6 variables, no shell, a 5 s timeout that kills the
 //! process group, and bounded output. Every `status` passes `--attr-source=<empty tree>` and nulls
 //! every filter driver Git reports in any scope; a driver name that `-c` cannot express safely
-//! disables status for that repository (fail closed). These flags are mitigations, **not a sandbox**:
-//! the Landlock ruleset the daemon applied is inherited by every Git process.
+//! disables status for that repository (fail closed). Every transport is blocked in three ways a
+//! repository cannot override (`GIT_ALLOW_PROTOCOL=` empty, `-c protocol.<name>.allow=never`,
+//! `GIT_NO_LAZY_FETCH=1`), because a promisor partial clone makes `status` and `log` fetch missing
+//! objects on their own. These flags are mitigations, **not a sandbox**: the Landlock ruleset the
+//! daemon applied is inherited by every Git process.
 
 pub mod parse;
 pub mod run;
@@ -27,8 +30,10 @@ const MAX_STDOUT: usize = 8 * 1024 * 1024;
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Global options on every invocation (§6). `--no-pager` is extra belt and braces: Git has no
-/// terminal here, so it would not page anyway.
-pub const BASE_ARGS: [&str; 10] = [
+/// terminal here, so it would not page anyway. `protocol.allow=never` alone is not enough: a
+/// per-protocol `protocol.<name>.allow` in the repository's config outranks the generic setting,
+/// while the per-protocol settings given here with `-c` outrank the repository's.
+pub const BASE_ARGS: [&str; 22] = [
     "--no-pager",
     "--no-optional-locks",
     "-c",
@@ -39,6 +44,32 @@ pub const BASE_ARGS: [&str; 10] = [
     "core.hooksPath=/dev/null",
     "-c",
     "protocol.allow=never",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "protocol.ssh.allow=never",
+    "-c",
+    "protocol.file.allow=never",
+    "-c",
+    "protocol.git.allow=never",
+    "-c",
+    "protocol.http.allow=never",
+    "-c",
+    "protocol.https.allow=never",
+];
+
+/// The child environment besides `PATH` and `HOME` (§6). `GIT_ALLOW_PROTOCOL` set to the empty
+/// list allows no transport at all (remote helpers included) and overrides any configuration;
+/// `GIT_NO_LAZY_FETCH=1` stops a promisor partial clone from fetching missing objects (honored
+/// by Git 2.45.0 and by distribution builds carrying the CVE-2024-32465 fix, e.g. Ubuntu's
+/// 2.43.0-1ubuntu7.1+; older Git ignores it and the transport block above still applies).
+pub const ENV: [(&str, &str); 6] = [
+    ("LC_ALL", "C"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_ALLOW_PROTOCOL", ""),
+    ("GIT_NO_LAZY_FETCH", "1"),
 ];
 
 /// What we know about Git for one project.
@@ -56,6 +87,9 @@ pub enum State {
     StatusDisabledOldGit,
     /// Worktree status not run: a filter driver name cannot be neutralized safely.
     StatusDisabledUnsafeConfig,
+    /// Worktree status failed in a promisor partial clone: objects it needs are not local, and
+    /// ccwm never fetches them.
+    PartialClone,
     Timeout,
     Error,
 }
@@ -69,6 +103,7 @@ impl State {
             Self::UnsafeRepository => "unsafe_repository",
             Self::StatusDisabledOldGit => "status_disabled_old_git",
             Self::StatusDisabledUnsafeConfig => "status_disabled_unsafe_config",
+            Self::PartialClone => "partial_clone",
             Self::Timeout => "timeout",
             Self::Error => "error",
         }
@@ -82,6 +117,7 @@ impl State {
             Self::UnsafeRepository,
             Self::StatusDisabledOldGit,
             Self::StatusDisabledUnsafeConfig,
+            Self::PartialClone,
             Self::Timeout,
             Self::Error,
         ]
@@ -215,10 +251,7 @@ impl Git {
         cmd.env_clear()
             .env("PATH", &self.path_env)
             .env("HOME", &self.home)
-            .env("LC_ALL", "C")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_OPTIONAL_LOCKS", "0")
+            .envs(ENV)
             .current_dir(dir)
             .args(BASE_ARGS)
             .args(args);
@@ -258,8 +291,8 @@ impl Git {
             info.state = State::StatusDisabledOldGit;
             info.branch = self.branch_without_status(dir);
         } else {
-            match self.status(dir)? {
-                Some(st) => {
+            match self.status(dir) {
+                Ok(Some(st)) => {
                     info.branch = st.branch;
                     info.detached = st.detached;
                     info.upstream = st.upstream;
@@ -272,10 +305,17 @@ impl Git {
                         files: st.files,
                     });
                 }
-                None => {
+                Ok(None) => {
                     info.state = State::StatusDisabledUnsafeConfig;
                     info.branch = self.branch_without_status(dir);
                 }
+                // Objects status needs are missing and ccwm never fetches them: degrade, keep
+                // what can still be read (branch, latest commit if present, remote).
+                Err(State::Error) if self.is_partial_clone(dir) => {
+                    info.state = State::PartialClone;
+                    info.branch = self.branch_without_status(dir);
+                }
+                Err(state) => return Err(state),
             }
         }
 
@@ -318,6 +358,23 @@ impl Git {
             Err(RunError::Timeout) => Err(State::Timeout),
             Err(_) => Err(State::Error),
         }
+    }
+
+    /// A promisor partial clone: `extensions.partialClone` or any `remote.<name>.promisor`
+    /// (reading config never executes anything).
+    fn is_partial_clone(&self, dir: &Path) -> bool {
+        self.run(
+            dir,
+            &[
+                "config",
+                "-z",
+                "--get-regexp",
+                r"^(extensions\.partialclone|remote\..*\.promisor)$",
+            ],
+        )
+        .ok()
+        .filter(Output::success)
+        .is_some_and(|o| parse::any_promisor(&o.stdout))
     }
 
     /// `None` means a filter driver cannot be neutralized (status disabled, fail closed).
@@ -423,6 +480,7 @@ mod tests {
             State::UnsafeRepository,
             State::StatusDisabledOldGit,
             State::StatusDisabledUnsafeConfig,
+            State::PartialClone,
             State::Timeout,
             State::Error,
         ] {
@@ -492,7 +550,9 @@ mod tests {
         assert_eq!(
             names,
             [
+                "GIT_ALLOW_PROTOCOL",
                 "GIT_CONFIG_NOSYSTEM",
+                "GIT_NO_LAZY_FETCH",
                 "GIT_OPTIONAL_LOCKS",
                 "GIT_TERMINAL_PROMPT",
                 "HOME",
@@ -500,12 +560,30 @@ mod tests {
                 "PATH"
             ]
         );
+        let value = |name: &str| {
+            envs.iter()
+                .find(|(k, _)| k == name)
+                .and_then(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            value("GIT_ALLOW_PROTOCOL").as_deref(),
+            Some(""),
+            "no transport allowed"
+        );
+        assert_eq!(value("GIT_NO_LAZY_FETCH").as_deref(), Some("1"));
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(&args[..BASE_ARGS.len()], BASE_ARGS);
         assert_eq!(args.last().map(String::as_str), Some("status"));
+        for proto in ["ext", "ssh", "file", "git", "http", "https"] {
+            let want = format!("protocol.{proto}.allow=never");
+            assert!(
+                args.windows(2).any(|w| w[0] == "-c" && w[1] == want),
+                "{want} missing"
+            );
+        }
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/p")));
     }
 

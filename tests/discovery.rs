@@ -268,6 +268,36 @@ fn unreadable_directories_are_counted_and_do_not_abort() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(found, ["good"]);
     assert_eq!(s.skipped.permission, 1);
+    assert_eq!(s.unreadable.len(), 1);
+    assert_eq!(s.unreadable[0].path, "~/locked", "listed home-relative");
+    assert_eq!(s.unreadable[0].reason, "permission");
+}
+
+#[test]
+fn the_list_of_unreadable_directories_is_bounded_but_the_count_is_exact() {
+    use cc_workspace_manager::discovery::status::MAX_UNREADABLE_LISTED;
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let f = fixture();
+    let n = MAX_UNREADABLE_LISTED + 7;
+    let locked: Vec<_> = (0..n).map(|i| f.mkdir(&format!("locked{i:03}"))).collect();
+    for d in &locked {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let status = SharedStatus::default();
+    let s = scan(&f.opts(), &AtomicBool::new(false), &status, &mut |_| true);
+    for d in &locked {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(s.skipped.permission, n as u64);
+    assert_eq!(s.unreadable.len(), MAX_UNREADABLE_LISTED);
+    assert_eq!(
+        status.snapshot().unreadable,
+        s.unreadable,
+        "published in the status"
+    );
+    assert_eq!(s.unreadable[0].path, "~/locked000");
 }
 
 #[test]

@@ -187,6 +187,28 @@ mod tests {
         assert_eq!(c.status(None, now), Status::Unknown);
     }
 
+    /// The real-home report: "6 days ago" shown next to "Inactive". At a non-midnight time a
+    /// change 6.5 × 24 h ago is 7 calendar days ago: Inactive, and outside "this week".
+    #[test]
+    fn the_6_and_7_day_boundary_at_a_non_midnight_time() {
+        let c = eastern();
+        let now = ts("2026-06-30T10:00:00", &c);
+        let seven = ts("2026-06-23T23:00:00", &c); // 155 h = 6.46 × 24 h ago
+        assert_eq!((now - seven) / 86_400, 6, "elapsed whole 24-hour periods");
+        assert_eq!(c.days_ago(seven, now), Some(7));
+        assert_eq!(c.status(Some(seven), now), Status::Inactive);
+        let week = c.range(Filter::Week, now).unwrap();
+        assert!(seven < week.from.unwrap(), "not in this week");
+        let six = ts("2026-06-24T00:30:00", &c); // 6 calendar days, 153.5 h ago
+        assert_eq!(c.days_ago(six, now), Some(6));
+        assert_eq!(c.status(Some(six), now), Status::Recent);
+        assert!(six >= week.from.unwrap(), "in this week");
+        // The same at a late-evening "now".
+        let now = ts("2026-06-30T23:30:00", &c);
+        assert_eq!(c.days_ago(ts("2026-06-24T00:10:00", &c), now), Some(6));
+        assert_eq!(c.days_ago(ts("2026-06-23T23:50:00", &c), now), Some(7));
+    }
+
     #[test]
     fn calendar_days_not_24_hour_periods_across_midnight() {
         let c = eastern();

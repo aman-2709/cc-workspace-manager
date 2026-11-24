@@ -23,6 +23,18 @@ pub struct Skipped {
     pub other: u64,
 }
 
+/// At most this many unreadable folders are listed (the counters in [`Skipped`] stay exact).
+pub const MAX_UNREADABLE_LISTED: usize = 50;
+
+/// A folder the last scan could not read.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Unreadable {
+    /// Home-relative (`~/…`) when inside the home directory, else absolute.
+    pub path: String,
+    /// `permission`, `vanished`, `changed` (swapped while being opened) or `other`.
+    pub reason: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RootStatus {
     pub path: String,
@@ -36,6 +48,9 @@ pub struct DiscoverySnapshot {
     pub dirs_visited: u64,
     pub projects_found: u64,
     pub skipped: Skipped,
+    /// The first [`MAX_UNREADABLE_LISTED`] folders counted in `skipped.permission`, `vanished`,
+    /// `changed` and `other`.
+    pub unreadable: Vec<Unreadable>,
     pub roots: Vec<RootStatus>,
     pub last_success_at: Option<i64>,
     pub next_scan_at: Option<i64>,

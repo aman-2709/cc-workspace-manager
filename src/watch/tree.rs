@@ -21,22 +21,32 @@ use std::sync::Arc;
 pub const MAX_ENTRIES: usize = 100_000;
 const MAX_GITIGNORE_BYTES: u64 = 1024 * 1024;
 
-/// Gitignore rules of one project: `.git/info/exclude` (lowest priority), then `.gitignore`
-/// files, deeper ones overriding shallower ones. Approximates Git (documented differences: no
-/// `core.excludesFile`, no rules from above the project root).
-#[derive(Debug, Default)]
+/// Gitignore rules of one project: `.git/info/exclude` of its repository (lowest priority), then
+/// `.gitignore` files from the repository's root down, deeper ones overriding shallower ones.
+/// Approximates Git (documented differences: no `core.excludesFile`; rules above the
+/// repository root never apply).
+#[derive(Debug, Default, Clone)]
 pub struct GitIgnore {
-    /// In priority order, lowest first.
-    layers: Vec<(PathBuf, Gitignore)>,
+    /// Sorted by rank, lowest priority first. Only layers whose directory is an ancestor of a
+    /// path apply to it, and those are ordered by depth, so one sorted list serves every path.
+    layers: Vec<Layer>,
+}
+
+#[derive(Debug, Clone)]
+struct Layer {
+    dir: PathBuf,
+    /// (depth of `dir`, 0 for `info/exclude` / 1 for `.gitignore`).
+    rank: (usize, u8),
+    rules: Gitignore,
 }
 
 impl GitIgnore {
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        for (dir, gi) in self.layers.iter().rev() {
-            if !path.starts_with(dir) || path == dir {
+        for l in self.layers.iter().rev() {
+            if !path.starts_with(&l.dir) || path == l.dir {
                 continue;
             }
-            match gi.matched(path, is_dir) {
+            match l.rules.matched(path, is_dir) {
                 Match::Ignore(_) => return true,
                 Match::Whitelist(_) => return false,
                 Match::None => {}
@@ -45,14 +55,26 @@ impl GitIgnore {
         false
     }
 
-    fn add(&mut self, dir: &Path, text: &[u8]) {
+    /// Add (or replace) the rules of `dir`'s `.gitignore` (or `info/exclude` when
+    /// `exclude_file`).
+    fn add(&mut self, dir: &Path, exclude_file: bool, text: &[u8]) {
+        let rank = (dir.components().count(), u8::from(!exclude_file));
+        self.layers.retain(|l| !(l.dir == dir && l.rank == rank));
         let mut b = GitignoreBuilder::new(dir);
         for line in String::from_utf8_lossy(text).lines() {
             let _ = b.add_line(None, line); // an invalid pattern is skipped, like Git does
         }
-        if let Ok(gi) = b.build() {
-            if gi.num_ignores() + gi.num_whitelists() > 0 {
-                self.layers.push((dir.to_path_buf(), gi));
+        if let Ok(rules) = b.build() {
+            if rules.num_ignores() + rules.num_whitelists() > 0 {
+                let at = self.layers.partition_point(|l| l.rank <= rank);
+                self.layers.insert(
+                    at,
+                    Layer {
+                        dir: dir.to_path_buf(),
+                        rank,
+                        rules,
+                    },
+                );
             }
         }
     }
@@ -62,12 +84,19 @@ impl GitIgnore {
     }
 }
 
-/// Whether `root` lies in a Git work tree: `root` or an ancestor below `home` has `.git`
-/// (a repository at `home` itself, e.g. dotfiles, does not count; same rule as the Git module).
-pub fn in_git_worktree(root: &Path, home: &Path) -> bool {
+/// The root of the Git work tree containing `root`: `root` or the nearest ancestor below `home`
+/// with a `.git` (a repository at `home` itself, e.g. dotfiles, does not count; same rule as the
+/// Git module).
+pub fn git_worktree_root(root: &Path, home: &Path) -> Option<PathBuf> {
     root.ancestors()
         .take_while(|a| *a != home && a.parent().is_some())
-        .any(|a| std::fs::symlink_metadata(a.join(".git")).is_ok())
+        .find(|a| std::fs::symlink_metadata(a.join(".git")).is_ok())
+        .map(Path::to_path_buf)
+}
+
+/// Whether `root` lies in a Git work tree ([`git_worktree_root`]).
+pub fn in_git_worktree(root: &Path, home: &Path) -> bool {
+    git_worktree_root(root, home).is_some()
 }
 
 pub struct TreeOptions<'a> {
@@ -78,6 +107,9 @@ pub struct TreeOptions<'a> {
     pub same_file_system: bool,
     /// Apply `.gitignore` rules (the project is in a Git work tree).
     pub git_aware: bool,
+    /// The work tree's root when it lies above the project root: its `info/exclude` and the
+    /// `.gitignore` files from it down to the project root apply too. `None`: the project root.
+    pub repo_root: Option<&'a Path>,
     /// File times after this are clamped to it (a future mtime must not pin a project on top).
     pub now: i64,
     pub max_entries: usize,
@@ -86,7 +118,7 @@ pub struct TreeOptions<'a> {
 #[derive(Debug)]
 pub struct Tree {
     pub root: PathBuf,
-    /// Eligible directories in preorder, the root first.
+    /// Eligible directories in preorder, the walk's start first (the root for a full walk).
     pub dirs: Vec<PathBuf>,
     /// `<root>/.git` when it is a directory (watched for HEAD/index/ref changes, never for activity).
     pub git_dir: Option<PathBuf>,
@@ -107,13 +139,29 @@ struct Frame {
 
 /// Walk `root` (canonical). Fails only if `root` itself cannot be opened.
 pub fn walk(root: &Path, o: &TreeOptions) -> std::io::Result<Tree> {
-    let first = DirHandle::open_root(root).map_err(|e| match e {
+    walk_from(root, root, &GitIgnore::default(), o)
+}
+
+/// Walk the part of `root`'s tree at and below `start` with the same rules as a full walk;
+/// `base` holds the rules already known for the project (a `.gitignore` read again replaces its
+/// layer). Used to poll the subtrees that have no watches and to watch directories created at
+/// runtime. Fails only if `start` cannot be opened.
+pub fn walk_from(
+    root: &Path,
+    start: &Path,
+    base: &GitIgnore,
+    o: &TreeOptions,
+) -> std::io::Result<Tree> {
+    let first = DirHandle::open_root(start).map_err(|e| match e {
         crate::discovery::dirfd::OpenError::Io(e) => e,
         crate::discovery::dirfd::OpenError::Replaced => {
             std::io::Error::other("the directory was replaced")
         }
     })?;
     let root_dev = first.identity().dev;
+    let start_depth = start
+        .strip_prefix(root)
+        .map_or(0, |r| r.components().count());
     let mut tree = Tree {
         root: root.to_path_buf(),
         dirs: Vec::new(),
@@ -123,13 +171,18 @@ pub fn walk(root: &Path, o: &TreeOptions) -> std::io::Result<Tree> {
         truncated: false,
         unreadable: 0,
     };
-    let mut ignore = GitIgnore::default();
+    let mut ignore = base.clone();
+    if o.git_aware && start_depth == 0 {
+        if let Some(repo) = o.repo_root.filter(|r| *r != root && root.starts_with(r)) {
+            add_repository_layers(&mut ignore, repo, root);
+        }
+    }
     let mut entries_seen = 0usize;
     let mut first = Some(first);
     let mut stack = vec![Frame {
         parent: None,
-        path: root.to_path_buf(),
-        depth: 0,
+        path: start.to_path_buf(),
+        depth: start_depth,
     }];
     while let Some(frame) = stack.pop() {
         let opened = match (&frame.parent, first.take()) {
@@ -149,16 +202,16 @@ pub fn walk(root: &Path, o: &TreeOptions) -> std::io::Result<Tree> {
             break;
         }
         if o.git_aware {
-            if frame.depth == 0 {
+            if frame.depth == 0 && o.repo_root.is_none_or(|r| r == root) {
                 if let Some((text, _)) = read_info_exclude(&dir) {
-                    ignore.add(&frame.path, &text);
+                    ignore.add(&frame.path, true, &text);
                 }
             }
             if entries.iter().any(|e| e.name == ".gitignore") {
                 if let Some((text, _)) =
                     dir.read_regular(OsStr::new(".gitignore"), false, MAX_GITIGNORE_BYTES)
                 {
-                    ignore.add(&frame.path, &text);
+                    ignore.add(&frame.path, false, &text);
                 }
             }
         }
@@ -215,6 +268,38 @@ pub fn walk(root: &Path, o: &TreeOptions) -> std::io::Result<Tree> {
     Ok(tree)
 }
 
+/// Rules from a work tree's root above the project root: its `.git/info/exclude` and every
+/// `.gitignore` from `repo` down to (not including) `root`. Each directory is opened by path and
+/// read through its descriptor; one that cannot be read (e.g. outside the sandbox) is skipped.
+fn add_repository_layers(ignore: &mut GitIgnore, repo: &Path, root: &Path) {
+    let Ok(rel) = root.strip_prefix(repo) else {
+        return;
+    };
+    let mut dir = repo.to_path_buf();
+    let mut dirs = vec![dir.clone()];
+    for c in rel.components() {
+        dir.push(c);
+        if dir != root {
+            dirs.push(dir.clone());
+        }
+    }
+    for (i, d) in dirs.iter().enumerate() {
+        let Ok(h) = DirHandle::open_root(d) else {
+            continue;
+        };
+        if i == 0 {
+            if let Some((text, _)) = read_info_exclude(&h) {
+                ignore.add(d, true, &text);
+            }
+        }
+        if let Some((text, _)) =
+            h.read_regular(OsStr::new(".gitignore"), false, MAX_GITIGNORE_BYTES)
+        {
+            ignore.add(d, false, &text);
+        }
+    }
+}
+
 /// `.git/info/exclude` of a repository rooted here (only when `.git` is a real directory).
 fn read_info_exclude(dir: &DirHandle) -> Option<(Vec<u8>, u64)> {
     let entries_git = dir.open_child_dir(OsStr::new(".git"))?;
@@ -234,6 +319,7 @@ mod tests {
             max_depth: 10,
             same_file_system: true,
             git_aware: git,
+            repo_root: None,
             now: i64::MAX,
             max_entries: MAX_ENTRIES,
         }
@@ -376,5 +462,105 @@ mod tests {
             in_git_worktree(&home.join("a/b/c"), &home),
             "a .git file counts"
         );
+    }
+
+    #[test]
+    fn rules_from_a_repository_root_above_the_project_apply() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = fs::canonicalize(t.path()).unwrap().join("repo");
+        let root = repo.join("pkgs/app");
+        for d in ["src", "data/raw", "gen/x", "scratch", "keep"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        fs::create_dir_all(repo.join(".git/info")).unwrap();
+        fs::write(repo.join(".git/info/exclude"), "scratch/\n").unwrap();
+        fs::write(repo.join(".gitignore"), "data/\n*.bin\n").unwrap();
+        fs::write(repo.join("pkgs/.gitignore"), "gen/\n").unwrap();
+        file(&root, "src/a.rs", 10);
+        file(&root, "w.bin", 99);
+        let ex = Exclusions::new(&root, Path::new("/nonexistent-home"), &[], &[], &[]).unwrap();
+        let none = HashSet::new();
+        let mut o = opts(&ex, &none, true);
+        o.repo_root = Some(&repo);
+        let t = walk(&root, &o).unwrap();
+        let rel: Vec<String> = t
+            .dirs
+            .iter()
+            .map(|d| {
+                d.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            rel,
+            ["", "keep", "src"],
+            "data/, gen/ and scratch/ are ignored above"
+        );
+        assert_eq!(
+            t.newest,
+            Some((10, "src/a.rs".to_string())),
+            "*.bin ignored"
+        );
+        assert!(t.ignore.is_ignored(&root.join("x.bin"), false));
+
+        // Without the repository root, only the project's own rules apply (old behaviour).
+        o.repo_root = None;
+        assert_eq!(
+            walk(&root, &o).unwrap().dirs.len(),
+            8,
+            "all eight directories"
+        );
+        assert_eq!(
+            git_worktree_root(&root, Path::new("/nonexistent-home")),
+            Some(repo.clone())
+        );
+    }
+
+    #[test]
+    fn a_subtree_walk_keeps_the_project_rules_and_its_depth() {
+        let f = fx();
+        let r = &f.root;
+        fs::write(r.join(".gitignore"), "cache/\n").unwrap();
+        for d in ["a/b/cache", "a/b/c"] {
+            fs::create_dir_all(r.join(d)).unwrap();
+        }
+        file(r, "a/b/c/new.txt", 500);
+        let none = HashSet::new();
+        let mut o = opts(&f.ex, &none, true);
+        let full = walk(r, &o).unwrap();
+        let sub = walk_from(r, &r.join("a/b"), &full.ignore, &o).unwrap();
+        assert_eq!(sub.root, *r);
+        assert_eq!(
+            sub.dirs,
+            [r.join("a/b"), r.join("a/b/c")],
+            "cache/ from the root's rules"
+        );
+        assert_eq!(sub.newest, Some((500, "a/b/c/new.txt".to_string())));
+        assert!(sub.git_dir.is_none());
+        // Depth counts from the project root.
+        o.max_depth = 2;
+        let sub = walk_from(r, &r.join("a/b"), &full.ignore, &o).unwrap();
+        assert_eq!(sub.dirs, [r.join("a/b")]);
+    }
+
+    #[test]
+    fn layers_are_ranked_by_depth_and_replaced_not_duplicated() {
+        let mut gi = GitIgnore::default();
+        let deep = Path::new("/p/a/b");
+        let shallow = Path::new("/p/a");
+        gi.add(deep, false, b"!keep.tmp\n");
+        gi.add(shallow, false, b"*.tmp\n"); // added later, but shallower: lower priority
+        assert!(!gi.is_ignored(Path::new("/p/a/b/keep.tmp"), false));
+        assert!(gi.is_ignored(Path::new("/p/a/b/other.tmp"), false));
+        gi.add(shallow, false, b"*.log\n"); // replaces the old rules of /p/a
+        assert!(!gi.is_ignored(Path::new("/p/a/x.tmp"), false));
+        assert!(gi.is_ignored(Path::new("/p/a/x.log"), false));
+        assert_eq!(gi.layers.len(), 2);
+        gi.add(shallow, true, b"x.log\n!*.log\n"); // info/exclude ranks below .gitignore
+        assert!(gi.is_ignored(Path::new("/p/a/x.log"), false));
+        gi.add(deep, false, b"");
+        assert_eq!(gi.layers.len(), 2, "an empty file removes its layer");
     }
 }

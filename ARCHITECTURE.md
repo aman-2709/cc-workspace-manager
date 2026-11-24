@@ -13,13 +13,13 @@ has run it (see `ROADMAP.md`).
 |---|---|
 | OS / kernel | Ubuntu 24.04.4 LTS, Linux 7.0.0-34-generic, x86_64 |
 | Rust | rustc / cargo 1.94.0, clippy 0.1.94, rustfmt 1.8.0; targets include `x86_64-unknown-linux-musl` (installed by the maintainer) |
-| git | 2.43.0. `--attr-source` appears in the 2.41.0 release notes (and is in 2.43's man page) ⇒ **minimum 2.41.0**; hardened status verified only on 2.43.0 |
+| git | 2.43.0 (Ubuntu `1:2.43.0-1ubuntu7.4`, which carries the CVE-2024-32465 backport and honors `GIT_NO_LAZY_FETCH`: verified by its "lazy fetching disabled" warning and no fetch child; upstream lists `--no-lazy-fetch` in the 2.45.0 release notes). `--attr-source` appears in the 2.41.0 release notes (and is in 2.43's man page) ⇒ **minimum 2.41.0**; hardened status verified only on 2.43.0 |
 | claude | 2.1.331; `claude --help` lists `--resume <session-id>` |
 | systemd | 255 (`systemctl --user` works); `Linger=no` |
 | Landlock | `landlock` in `/sys/kernel/security/lsm`; ABI **8** (queried via `landlock_create_ruleset`) ⇒ filesystem + TCP rules available |
 | `unshare -rn` | **fails** (`apparmor_restrict_unprivileged_userns=1`), as does `unshare --user --map-current-user --net` ⇒ test 5 runs its **strace** variant here |
 | strace / node | strace 6.8 (traces children; `kernel.yama.ptrace_scope=1` allows tracing our own children); node v22.22.0 (UI helper tests) |
-| inotify | `max_user_watches=65536` ⇒ default budget `min(8192, 25 %)` = 8192; `max_user_instances=128` with ≥109 already used by other processes ⇒ ccwm uses exactly one instance |
+| inotify | `max_user_watches=65536` ⇒ default budget 25 % = 16 384 (M2.1; was `min(8192, 25 %)`); `max_user_instances=128` with ≥109 already used by other processes ⇒ ccwm uses exactly one instance |
 | Env | uid 1000; `XDG_RUNTIME_DIR=/run/user/1000`; other XDG vars unset; `CLAUDE_CONFIG_DIR` unset |
 | Not installed | `musl-tools`; `cargo-deny` is not installed system-wide (M1.1 installs 0.21.0 into the ignored `target/tools/` to run it — 0.22 needs rustc 1.95) |
 
@@ -233,7 +233,7 @@ same_file_system = true
 ```
 `deny_unknown_fields`. Symlink-following is not configurable in v0.1 (never followed). M2 keys (all in
 `config.example.toml`, which a unit test parses and compares with the defaults):
-`discovery.scan_interval_secs` (600, 60–86400), `discovery.missing_retention_days` (30), `watch.budget` (0 = auto),
+`discovery.scan_interval_secs` (600, 60–86400), `discovery.missing_retention_days` (30), `watch.budget` (0 = auto: 25 % of `max_user_watches`, 8192 if unreadable),
 `watch.debounce_ms` (2000), `activity.inactive_after_days` (7), `activity.dormant_after_days` (30),
 `activity.events_per_project` (200), `git.allow_unhardened_status` (false).
 
@@ -265,23 +265,35 @@ one per project, a request during a refresh schedules exactly one more). `Servic
 to 1 h): full discovery scan (batches upserted and published progressively) → projects not found are marked
 missing, except under a root whose scan state is not `ok` → new/revived projects are enrolled → (startup) every
 present project is walked and handed to the monitor as one **Plan**; (later) polled projects are walked for newer
-mtimes and re-added → purge of projects missing longer than the retention → `scans_finished += 1`.
+mtimes and re-added, and *partly watched* projects are walked **only in their unwatched subtrees** (`walk_from` with
+the project's ignore rules; `.git` is retried, never walked), their newest file recorded as inferred, then
+`Cmd::Retry` tries those subtrees' watches again → purge of projects missing longer than the retention → `scans_finished += 1`.
 `POST /refresh` returns `done_at_scans_finished` (current + 1, or + 2 while a scan runs).
 
 **Enrollment** (new project, revived, un-ignored, `.gitignore` changed, renamed): fd-based tree walk
 (`watch/tree.rs`: same exclusions as discovery, other projects' subtrees pruned, `.gitignore` +
-`.git/info/exclude` layers when the project is in a Git work tree below home, ≤100 000 entries, future mtimes
+`.git/info/exclude` layers when the project is in a Git work tree below home — since M2.1 also the
+`info/exclude` and `.gitignore` files from a work-tree root *above* the project root, layers ranked by
+depth — ≤100 000 entries, future mtimes
 clamped to now) → newest file = *inferred* activity → Git inspection → for a newly inserted project while
 missing projects exist: **move matching** (exactly one missing project with the same HEAD commit and the same
 sanitized remote, or — without a commit — the same marker hash and no Git head; ambiguity ⇒ no match) ⇒ the old id
 moves to the new path and the new row is deleted → Git cache stored → `Cmd::Add` to the monitor.
 
-**Watch plan / budget.** Budget = `min(8192, max_user_watches/4)` or `watch.budget`. Allocation for a plan (projects
-most-recent first): every project root, then the parents of project roots (sibling detection, inside the
-configured roots only), then for each project its `.git` directory and the rest of its eligible directories. A
-project that does not fit completely, hits `ENOSPC` (kernel limit), has a truncated tree, or exists while the
-inotify instance is unavailable is **polled** (reason reported). Watches are non-recursive, `IN_DONT_FOLLOW`,
-`IN_ONLYDIR`.
+**Watch plan / budget (M2.1).** Budget = `max_user_watches/4` (no fixed ceiling; 8192 if the limit cannot be read)
+or `watch.budget`. Allocation is **breadth first** over a plan (projects most-recent first): every project root,
+then the parents of project roots (sibling detection, inside the configured roots only), then every project's
+`.git` and depth-1 directories, then the deeper directories project by project (shallow first within a project).
+The first limit hit (budget, kernel `ENOSPC`, no inotify instance) is remembered for the rest of the command, so
+the kernel is not asked again; every directory refused is recorded as a **subtree root** (nothing below a
+refused directory is tried). Monitoring per project: `watched` (nothing refused, tree complete), `partial` (root
+watched, some subtrees refused, or the tree truncated: reason reported; reconciliation polls only the refused
+subtrees, or the whole project when truncated), `polled` (root refused or no inotify instance: whole project).
+`Cmd::Retry` re-watches refused subtrees when budget frees up; removing a refused subtree settles the project.
+Directories created at runtime are walked with `walk_from` (project root, the project's ignore layers, depth
+from the project root), so gitignored subdirectories of a new directory are never watched. Watches are
+non-recursive and `IN_DONT_FOLLOW`; notify requests `IN_ONLYDIR` but retries without it on `ENOTDIR`, so the
+backend checks that the path is still a directory after adding a watch and drops it otherwise (M2 review L2).
 
 **Events → signals.** Paths are attributed to the innermost registered project (longest prefix). In a project:
 `.git/…` (not `*.lock`) ⇒ Git refresh only; gitignored files and excluded directories ⇒ nothing; other changes ⇒
@@ -343,10 +355,13 @@ Errors: `{"error":{"code":"…","message":"…"}}` — codes `invalid_argument 4
 **Project** (list items, events): `{"id","name","path","display_path" ("~/…" inside home),"sources",
 "first_seen_at","activity":{"status","at","kind","path"},"git":null|{"state","branch","detached","upstream",
 "ahead","behind","staged","modified","untracked","dirty","commit":{"subject","time"}|null,"checked_at"},
-"missing_since","ignored","monitoring":"watched"|"polled"|null,"monitoring_reason"}`. Git states: `ok`,
-`not_git`, `git_missing`, `unsafe_repository`, `status_disabled_old_git`, `status_disabled_unsafe_config`,
-`timeout`, `error`. `/discovery/status` adds `scans_finished`; `/service/status` adds `commit`, `discovery.next_scan_at`,
-`monitoring{watcher,watches,budget,max_user_watches,watched_projects,polled_projects,overflows,
+"missing_since","ignored","monitoring":"watched"|"partial"|"polled"|null,"monitoring_reason"}`; `activity` also
+carries `days_ago` (M2.1: local calendar days from the same classifier as `status`, ≥ 0, `null` when unknown; the
+UI's "N days ago" uses it). Git states: `ok`, `not_git`, `git_missing`, `unsafe_repository`,
+`status_disabled_old_git`, `status_disabled_unsafe_config`, `partial_clone` (M2.1), `timeout`, `error`.
+`/discovery/status` adds `scans_finished` and (M2.1) `unreadable[{path ("~/…"),reason}]` (first 50 folders counted
+in `skipped.permission|vanished|changed|other`); `/service/status` adds `commit`, `discovery.next_scan_at`,
+`monitoring{watcher,watches,budget,max_user_watches,watched_projects,partial_projects,polled_projects,overflows,
 recovering_overflow,pending_projects,degraded,advice[]}`, `git{program,version,hardened_status,
 unhardened_status_allowed}`, `queues{git_in_flight,websocket_clients}`.
 
@@ -472,7 +487,9 @@ detect execution.
 | `core.fsmonitor=<cmd>` | not executed | executed |
 | `filter.<n>.clean` via `.gitattributes` | **executed** | executed |
 | same via `.git/info/attributes` | **executed** | executed |
-| `core.pager`, `diff.external`, `core.sshCommand` | not reached by `status`/`rev-parse`/`log -1` | — |
+| `core.pager`, `diff.external` | not reached by `status`/`rev-parse`/`log -1` | — |
+| promisor partial clone (`HEAD` object missing) + `ext::` / `file://`+`uploadpack` / `ssh://`+`core.sshCommand`, per-protocol `allow=always` in repo config (M2 review H1) | **executed** by `status` and `log -1` (lazy `git fetch` → transport) | executed |
+| same, with `GIT_ALLOW_PROTOCOL=` only / `-c protocol.<name>.allow=never` only / `GIT_NO_LAZY_FETCH=1` only (M2.1) | not executed (each alone, all three vectors) | — |
 | hooks | `status` runs none (maintainer decision: no hook test) | — |
 
 Verified mitigation (now §6 of the spec): `--attr-source=<empty tree>` stops worktree `.gitattributes` filters;
@@ -526,6 +543,22 @@ codes go in `RestartPreventExitStatus=`.
   updates could downgrade an observation; `log.showSignature` + `gpg.program` executed during `log -1` (control
   run) ⇒ `--no-show-signature`; filter names with `=` could not be nulled ⇒ fail closed.
 
+## 13d. M2.1 verification notes (what was actually run, 2026-11-24)
+
+- H1 reproduced in a scratch directory with ccwm's exact flags and environment: all three promisor vectors
+  executed their helper; each of the three transport blocks alone stopped all three (`tests/git.rs`
+  `each_transport_block_alone_stops_the_promisor_vectors`). Mutation checks: removing the blocks makes acceptance
+  test 4 fail; removing only `GIT_NO_LAZY_FETCH` makes test 5 fail (two `fetch` execs outside the allowlist).
+- Test 5 (strace variant): 52 execs traced, all allowlisted; 3 promisor projects, zero fetch children, state
+  `partial_clone` over the API. `strace -s 256` so long Git argument lists are not abbreviated.
+- L2: with the directory check removed, `notify` watched a regular file (`watch(file) == Ok`); test in
+  `tests/tracker.rs` (real inotify).
+- Real daemon in a synthetic environment with `watch.budget = 40`: `ccwm status` printed "34 watched, 4 partly
+  watched, 0 polled" and the unreadable folder; a `ccwm status` started before the daemon waited and succeeded.
+  Real browser (Chrome extension, synthetic daemon): one-line degraded banner with a details toggle, "1 folder
+  could not be read" with the path in the tooltip, one-line non-Git cards, "partly watched" badges, a long path
+  shown as `…/internal-services/backend-api-gateway`; no console errors.
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -547,6 +580,11 @@ sending). **L6:** a nested object with more than 12 distinct keys over the whole
 Decided 2026-11-24: M1.1 spec additions L1, L3, L4, L5 (§11) approved; pre-M2 requests (test 5 strace fallback,
 home-relative left-ellipsized paths, licensing, forwarder residual risk + test, build commit in `/health` and
 `ccwm status`).
+
+Decided 2026-11-24 (M2.1): the M2 security review's H1 fix (per-protocol denies, `GIT_ALLOW_PROTOCOL=`,
+`GIT_NO_LAZY_FETCH=1`, partial clones degraded not refused), test 4/5 additions, L1/L2/L4 as SECURITY.md notes (L2
+plus the directory check), and the real-home defect fixes (breadth-first watches, 25 % budget, calendar-day
+relative time, `/`-boundary paths, unreadable list, one-line banner, CLI start-up wait).
 
 Open:
 - **O5 (M2, needs approval):** the REQUIREMENTS.md changes listed in the M2 report (Appendix A rows marked "M2"/"pre-M2").

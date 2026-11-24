@@ -62,7 +62,7 @@ impl Default for DiscoveryConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct WatchConfig {
-    /// Maximum inotify watches; 0 = automatic: `min(8192, 25 % of max_user_watches)` (§5.1).
+    /// Maximum inotify watches; 0 = automatic: 25 % of `max_user_watches` (§5.1).
     pub budget: u32,
     /// File events of one project are coalesced for this long (§5.1).
     pub debounce_ms: u64,

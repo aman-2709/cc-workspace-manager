@@ -284,7 +284,7 @@ impl Tracker {
         let trees = self.walk_many(jobs, &tracked).await;
         let mut plan = Vec::new();
         for (id, tree) in trees {
-            self.record_inferred(&id, &tree).await;
+            self.record_inferred(&id, tree.newest.as_ref()).await;
             plan.push(WatchProject { id, tree });
         }
         plan.sort_by_key(|p| std::cmp::Reverse(p.tree.newest.as_ref().map(|n| n.0)));
@@ -307,38 +307,93 @@ impl Tracker {
     }
 
     /// Polled projects (and, after an overflow, every project) are walked for newer file times,
-    /// their Git state refreshed, and their watches retried.
+    /// their Git state refreshed, and their watches retried. A partly watched project is walked
+    /// only in its unwatched subtrees (its watched part is live), then those are retried.
     async fn refresh_polled(self: &Arc<Self>, all: bool) -> Result<()> {
+        use crate::watch::{Monitoring, PollReason};
         let tracked = self.tracked().await?;
-        let ids: Vec<(String, PathBuf)> = tracked
-            .iter()
-            .filter(|t| !t.missing && !t.ignored)
-            .filter(|t| {
-                all || self
-                    .monitor_state
-                    .of(&t.id)
-                    .is_none_or(|(m, _)| m == crate::watch::Monitoring::Polled)
-            })
-            .map(|t| (t.id.clone(), PathBuf::from(&t.path)))
-            .collect();
-        if ids.is_empty() {
-            return Ok(());
+        let mut whole: Vec<(String, PathBuf)> = Vec::new();
+        let mut partial: Vec<(String, PathBuf, crate::watch::PollTarget)> = Vec::new();
+        for t in tracked.iter().filter(|t| !t.missing && !t.ignored) {
+            let job = (t.id.clone(), PathBuf::from(&t.path));
+            match (all, self.monitor_state.of(&t.id)) {
+                (false, Some((Monitoring::Watched, _))) => {}
+                (false, Some((Monitoring::Partial, reason)))
+                    if reason != Some(PollReason::Truncated) =>
+                {
+                    if let Some(target) = self.monitor_state.poll_target(&t.id) {
+                        partial.push((job.0, job.1, target));
+                    } else {
+                        whole.push(job);
+                    }
+                }
+                _ => whole.push(job),
+            }
         }
-        let trees = self.walk_many(ids, &tracked).await;
-        let mut plan = Vec::new();
-        for (id, tree) in trees {
-            self.record_inferred(&id, &tree).await;
-            self.git.request(&id);
-            plan.push(WatchProject { id, tree });
+        if !whole.is_empty() {
+            let trees = self.walk_many(whole, &tracked).await;
+            let mut plan = Vec::new();
+            for (id, tree) in trees {
+                self.record_inferred(&id, tree.newest.as_ref()).await;
+                self.git.request(&id);
+                plan.push(WatchProject { id, tree });
+            }
+            if all {
+                let _ = self.monitor.send(Cmd::Plan(plan)).await;
+            } else {
+                for p in plan {
+                    let _ = self.monitor.send(Cmd::Add(p)).await;
+                }
+            }
         }
-        if all {
-            let _ = self.monitor.send(Cmd::Plan(plan)).await;
-        } else {
-            for p in plan {
-                let _ = self.monitor.send(Cmd::Add(p)).await;
+        if !partial.is_empty() {
+            for (id, newest, roots, dirs) in self.walk_subtrees(partial, &tracked).await {
+                self.record_inferred(&id, newest.as_ref()).await;
+                self.git.request(&id);
+                let _ = self.monitor.send(Cmd::Retry { id, roots, dirs }).await;
             }
         }
         Ok(())
+    }
+
+    /// Walk the unwatched subtrees of partly watched projects (blocking thread): per project
+    /// the newest file found, the subtree roots, and their directories shallow first (`.git` is
+    /// retried as a watch, never walked).
+    async fn walk_subtrees(
+        &self,
+        jobs: Vec<(String, PathBuf, crate::watch::PollTarget)>,
+        tracked: &[Tracked],
+    ) -> Vec<(String, Option<(i64, String)>, Vec<PathBuf>, Vec<PathBuf>)> {
+        let ctx = self.walk_context(tracked);
+        let now = self.clock.now();
+        tokio::task::spawn_blocking(move || {
+            jobs.into_iter()
+                .map(|(id, root, target)| {
+                    let mut newest: Option<(i64, String)> = None;
+                    let mut dirs = Vec::new();
+                    for sub in &target.subtrees {
+                        if *sub == root.join(".git") {
+                            dirs.push(sub.clone());
+                            continue;
+                        }
+                        let Some(t) = ctx.walk_from(&root, sub, &target.ignore, now) else {
+                            continue; // vanished: forgotten by the retry
+                        };
+                        if t.newest
+                            .as_ref()
+                            .is_some_and(|n| newest.as_ref().is_none_or(|m| n.0 > m.0))
+                        {
+                            newest = t.newest;
+                        }
+                        dirs.extend(t.dirs);
+                    }
+                    dirs.sort_by_key(|d| d.components().count());
+                    (id, newest, target.subtrees, dirs)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Walk several project trees, one after another, on a blocking thread.
@@ -383,8 +438,8 @@ impl Tracker {
         }
     }
 
-    async fn record_inferred(&self, id: &str, tree: &Tree) {
-        let Some((at, path)) = &tree.newest else {
+    async fn record_inferred(&self, id: &str, newest: Option<&(i64, String)>) {
+        let Some((at, path)) = newest else {
             return;
         };
         let activity = Activity {
@@ -442,7 +497,7 @@ impl Tracker {
             }
         }
         self.writer.store_git(&id, info, self.clock.now()).await?;
-        self.record_inferred(&id, &tree).await;
+        self.record_inferred(&id, tree.newest.as_ref()).await;
         self.notifier.project(&id);
         let ignored = self
             .reader
@@ -678,6 +733,18 @@ struct WalkContext {
 
 impl WalkContext {
     fn walk(&self, root: &Path, now: i64) -> Option<Tree> {
+        self.walk_from(root, root, &tree::GitIgnore::default(), now)
+    }
+
+    /// The part of project `root` at and below `start`, with the project's known rules `base`
+    /// (see [`tree::walk_from`]).
+    fn walk_from(
+        &self,
+        root: &Path,
+        start: &Path,
+        base: &tree::GitIgnore,
+        now: i64,
+    ) -> Option<Tree> {
         let (_, ex) = self
             .roots
             .iter()
@@ -685,16 +752,18 @@ impl WalkContext {
             .max_by_key(|(r, _)| r.as_os_str().len())?;
         let mut others = self.others.clone();
         others.remove(root);
+        let repo = tree::git_worktree_root(root, &self.home);
         let opts = TreeOptions {
             exclusions: ex,
             other_projects: &others,
             max_depth: self.max_depth,
             same_file_system: self.same_file_system,
-            git_aware: tree::in_git_worktree(root, &self.home),
+            git_aware: repo.is_some(),
+            repo_root: repo.as_deref(),
             now,
             max_entries: tree::MAX_ENTRIES,
         };
-        tree::walk(root, &opts).ok()
+        tree::walk_from(root, start, base, &opts).ok()
     }
 }
 

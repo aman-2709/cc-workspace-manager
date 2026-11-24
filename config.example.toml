@@ -23,8 +23,10 @@ scan_interval_secs = 600
 missing_retention_days = 30
 
 [watch]
-# Maximum inotify watches ccwm uses. 0 = automatic: min(8192, 25 % of fs.inotify.max_user_watches).
-# Projects beyond the budget are "polled": checked at each scan instead of live.
+# Maximum inotify watches ccwm uses. 0 = automatic: 25 % of fs.inotify.max_user_watches
+# (8192 if the limit cannot be read). Every project root is watched first, then top-level
+# folders, then deeper folders of the most recently active projects; folders without a watch
+# are checked at each scan instead of live ("partly watched" / "polled").
 budget = 0
 # File events of one project are combined for this long before they are recorded (100-60000 ms).
 debounce_ms = 2000

@@ -9,7 +9,7 @@
 
 use super::dirfd::{DirHandle, Identity, Kind, OpenError};
 use super::exclusions::Exclusions;
-use super::status::{Phase, RootStatus, SharedStatus, Skipped};
+use super::status::{Phase, RootStatus, SharedStatus, Skipped, Unreadable, MAX_UNREADABLE_LISTED};
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
@@ -77,14 +77,26 @@ pub struct ScanSummary {
     pub dirs_visited: u64,
     pub projects_found: u64,
     pub skipped: Skipped,
+    /// Folders that could not be read (bounded, see [`MAX_UNREADABLE_LISTED`]).
+    pub unreadable: Vec<Unreadable>,
     pub cancelled: bool,
 }
 
-fn record_io_error(skipped: &mut Skipped, e: &io::Error) {
+/// Count an I/O error; returns the reason it is listed under.
+fn record_io_error(skipped: &mut Skipped, e: &io::Error) -> &'static str {
     match e.kind() {
-        io::ErrorKind::PermissionDenied => skipped.permission += 1,
-        io::ErrorKind::NotFound => skipped.vanished += 1,
-        _ => skipped.other += 1,
+        io::ErrorKind::PermissionDenied => {
+            skipped.permission += 1;
+            "permission"
+        }
+        io::ErrorKind::NotFound => {
+            skipped.vanished += 1;
+            "vanished"
+        }
+        _ => {
+            skipped.other += 1;
+            "other"
+        }
     }
 }
 
@@ -135,6 +147,7 @@ pub fn scan(
         s.dirs_visited = 0;
         s.projects_found = 0;
         s.skipped = Skipped::default();
+        s.unreadable.clear();
     });
     let mut w = Walker {
         opts,
@@ -160,6 +173,7 @@ pub fn scan(
         s.dirs_visited = summary.dirs_visited;
         s.projects_found = summary.projects_found;
         s.skipped = summary.skipped.clone();
+        s.unreadable = summary.unreadable.clone();
         s.roots = roots;
     });
     summary
@@ -215,10 +229,26 @@ impl Walker<'_> {
         }
     }
 
-    fn count_open_error(&mut self, e: OpenError) {
-        match e {
-            OpenError::Replaced => self.summary.skipped.changed += 1,
+    fn count_open_error(&mut self, e: OpenError, path: &Path) {
+        let reason = match e {
+            OpenError::Replaced => {
+                self.summary.skipped.changed += 1;
+                "changed"
+            }
             OpenError::Io(e) => record_io_error(&mut self.summary.skipped, &e),
+        };
+        self.list_unreadable(path, reason);
+    }
+
+    /// Remember an unreadable folder for the status (once, bounded).
+    fn list_unreadable(&mut self, path: &Path, reason: &'static str) {
+        let list = &mut self.summary.unreadable;
+        if list.len() >= MAX_UNREADABLE_LISTED {
+            return;
+        }
+        let path = crate::view::display_path(&path.to_string_lossy(), &self.opts.home);
+        if !list.iter().any(|u| u.path == path) {
+            list.push(Unreadable { path, reason });
         }
     }
 
@@ -255,7 +285,7 @@ impl Walker<'_> {
         let handle = match DirHandle::open_root(&canonical) {
             Ok(h) => h,
             Err(e) => {
-                self.count_open_error(e);
+                self.count_open_error(e, &canonical);
                 self.roots.push(RootStatus {
                     path: display,
                     state: "unreadable",
@@ -361,14 +391,15 @@ impl Walker<'_> {
             } => match parent.open_child(&name, expected) {
                 Ok(h) => h,
                 Err(e) => {
-                    self.count_open_error(e);
+                    self.count_open_error(e, &frame.path);
                     return;
                 }
             },
         };
         let (entries, errors) = dir.entries();
         for e in &errors {
-            record_io_error(&mut self.summary.skipped, e);
+            let reason = record_io_error(&mut self.summary.skipped, e);
+            self.list_unreadable(&frame.path, reason);
         }
 
         let mut marker: Option<bool> = None; // Some(is_symlink) for a valid marker
@@ -465,15 +496,17 @@ impl Walker<'_> {
     }
 
     fn publish_progress(&self) {
-        let (dirs, found, skipped) = (
+        let (dirs, found, skipped, unreadable) = (
             self.summary.dirs_visited,
             self.summary.projects_found,
             self.summary.skipped.clone(),
+            self.summary.unreadable.clone(),
         );
         self.status.update(|s| {
             s.dirs_visited = dirs;
             s.projects_found = found;
             s.skipped = skipped;
+            s.unreadable = unreadable;
         });
     }
 }

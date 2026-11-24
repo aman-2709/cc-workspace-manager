@@ -28,7 +28,8 @@ use tree::{GitIgnore, Tree, TreeOptions};
 /// Raw events buffered between notify's thread and the monitor; when full, events are dropped
 /// and handled like a kernel queue overflow (§5.1).
 pub const EVENT_QUEUE: usize = 8192;
-pub const MAX_DEFAULT_BUDGET: usize = 8192;
+/// The budget when `max_user_watches` cannot be read.
+pub const FALLBACK_BUDGET: usize = 8192;
 /// An unpaired half of a rename is acted on after this long (notify pairs halves by cookie).
 const RENAME_PAIRING: Duration = Duration::from_millis(200);
 /// Directories created in a sibling-detection area are watched this many levels deep.
@@ -42,11 +43,12 @@ pub fn read_max_user_watches() -> Option<u64> {
         .ok()
 }
 
-/// `min(8192, 25 % of max_user_watches)` (§5.1); 8192 if the limit cannot be read.
+/// 25 % of `max_user_watches` (§5.1; the pool is shared with IDEs and other tools, so ccwm never
+/// takes more by default); [`FALLBACK_BUDGET`] if the limit cannot be read.
 pub fn default_budget(max_user_watches: Option<u64>) -> usize {
-    max_user_watches
-        .map(|m| usize::try_from(m / 4).unwrap_or(usize::MAX))
-        .map_or(MAX_DEFAULT_BUDGET, |q| q.min(MAX_DEFAULT_BUDGET))
+    max_user_watches.map_or(FALLBACK_BUDGET, |m| {
+        usize::try_from(m / 4).unwrap_or(usize::MAX)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -54,7 +56,11 @@ pub fn default_budget(max_user_watches: Option<u64>) -> usize {
 pub enum Monitoring {
     /// Every eligible directory has a watch: changes are observed live.
     Watched,
-    /// Some or all directories are not watched: changes are found by reconciliation (mtimes).
+    /// The root and part of the tree are watched; the subtrees without a watch are checked at
+    /// each reconciliation (mtimes), the rest is live.
+    Partial,
+    /// The root has no watch (or there is no inotify instance): the whole project is checked at
+    /// each reconciliation.
     Polled,
 }
 
@@ -79,12 +85,21 @@ pub struct WatchProject {
 }
 
 pub enum Cmd {
-    /// Replace every project watch: allocate the budget to the projects' roots first, then their
-    /// parent directories, then the rest of each tree in the given order (most recent first).
+    /// Replace every project watch. Breadth first: every project's root, then the roots'
+    /// parents (sibling detection), then every project's `.git` and top-level directories, then
+    /// the deeper directories project by project in the given order (most recent first).
     Plan(Vec<WatchProject>),
     /// Add or replace one project.
     Add(WatchProject),
     Remove(String),
+    /// Try again to watch a partly watched project's unwatched subtrees: `roots` are the subtree
+    /// roots being retried (forgotten first, e.g. if they vanished), `dirs` their directories
+    /// as walked now, shallow first.
+    Retry {
+        id: String,
+        roots: Vec<PathBuf>,
+        dirs: Vec<PathBuf>,
+    },
     /// The reconciliation triggered by an overflow has finished.
     OverflowRecovered,
     /// Internal: a walk of a directory created at runtime finished.
@@ -134,7 +149,11 @@ pub struct MonitorStatus {
     pub watches: usize,
     pub budget: usize,
     pub max_user_watches: Option<u64>,
+    /// Every eligible directory watched.
     pub watched_projects: usize,
+    /// Root watched, some subtrees checked at each reconciliation.
+    pub partial_projects: usize,
+    /// No root watch: the whole project is checked at each reconciliation.
     pub polled_projects: usize,
     pub overflows: u64,
     pub recovering_overflow: bool,
@@ -145,6 +164,18 @@ pub struct MonitorStatus {
     pub advice: Vec<String>,
     #[serde(skip)]
     pub projects: HashMap<String, (Monitoring, Option<PollReason>)>,
+    /// What reconciliation polls for partly watched projects (absent: the whole project).
+    #[serde(skip)]
+    pub poll_targets: HashMap<String, PollTarget>,
+}
+
+/// The unwatched part of a partly watched project.
+#[derive(Debug, Clone)]
+pub struct PollTarget {
+    /// Roots of the subtrees without a watch, shallowest first.
+    pub subtrees: Vec<PathBuf>,
+    /// The project's ignore rules, for walking the subtrees with the project's rules.
+    pub ignore: Arc<GitIgnore>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,6 +189,11 @@ impl SharedMonitor {
     /// `(monitoring, reason)` of a project; `None` if it is not monitored (ignored, missing, new).
     pub fn of(&self, id: &str) -> Option<(Monitoring, Option<PollReason>)> {
         self.0.lock().ok()?.projects.get(id).copied()
+    }
+
+    /// The subtrees to poll for a partly watched project; `None`: poll the whole project.
+    pub fn poll_target(&self, id: &str) -> Option<PollTarget> {
+        self.0.lock().ok()?.poll_targets.get(id).cloned()
     }
 
     fn set(&self, s: MonitorStatus) {
@@ -201,6 +237,11 @@ pub enum WatchError {
 }
 
 impl WatchBackend for notify::INotifyWatcher {
+    /// `IN_DONT_FOLLOW` (no dereference). notify first asks for `IN_ONLYDIR` but, on `ENOTDIR`,
+    /// silently retries without it (notify 9 `add_single_watch`), so a directory swapped for a
+    /// regular file would be watched as that file: the path must still be a directory after the
+    /// watch was added, else the watch is dropped. This narrows the swap window; it does not
+    /// close it (watches are added by path, SECURITY.md).
     fn watch(&mut self, dir: &Path) -> Result<(), WatchError> {
         let cfg =
             WatchPathConfig::new(RecursiveMode::NonRecursive).with_dereference_symlinks(false);
@@ -208,7 +249,12 @@ impl WatchBackend for notify::INotifyWatcher {
             notify::ErrorKind::MaxFilesWatch => WatchError::KernelLimit,
             notify::ErrorKind::PathNotFound => WatchError::Gone,
             _ => WatchError::Other,
-        })
+        })?;
+        if !is_dir(dir) {
+            let _ = Watcher::unwatch(self, dir);
+            return Err(WatchError::Gone);
+        }
+        Ok(())
     }
     fn unwatch(&mut self, dir: &Path) {
         let _ = Watcher::unwatch(self, dir);
@@ -240,7 +286,29 @@ struct ProjectState {
     git_dir: Option<PathBuf>,
     ignore: Arc<GitIgnore>,
     git_aware: bool,
+    /// Why part (or all) of the project is not watched; the first reason wins.
     polled: Option<PollReason>,
+    /// The walk stopped at the entry limit: unknown parts, so the whole project is polled.
+    truncated: bool,
+    /// Roots of the subtrees that got no watch because of a limit (the root itself when it has
+    /// none). Only subtree roots: nothing below a refused directory is listed or watched.
+    refused: HashSet<PathBuf>,
+}
+
+impl ProjectState {
+    fn mode(&self, has_backend: bool) -> (Monitoring, Option<PollReason>) {
+        if !has_backend || self.refused.contains(&self.root) {
+            (Monitoring::Polled, self.polled)
+        } else if self.polled.is_some() {
+            (Monitoring::Partial, self.polled)
+        } else {
+            (Monitoring::Watched, None)
+        }
+    }
+
+    fn inside_refused(&self, dir: &Path) -> bool {
+        dir.ancestors().skip(1).any(|a| self.refused.contains(a))
+    }
 }
 
 #[derive(Default)]
@@ -270,6 +338,17 @@ enum Change {
     Removed(PathBuf),
 }
 
+/// What clients are told about (a `monitoring` event) when it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Summary {
+    watches: usize,
+    partial: usize,
+    polled: usize,
+    recovering: bool,
+    overflows: u64,
+    projects: usize,
+}
+
 pub struct Monitor {
     backend: Option<Box<dyn WatchBackend>>,
     settings: Settings,
@@ -287,7 +366,7 @@ pub struct Monitor {
     shared: SharedMonitor,
     notifier: Option<crate::events::Notifier>,
     /// Last published summary, to notify clients only on change.
-    last_summary: Option<(usize, usize, bool, u64, usize)>,
+    last_summary: Option<Summary>,
     /// Projects, watches or degraded state changed since the last full publication.
     dirty: bool,
 }
@@ -401,6 +480,7 @@ impl Monitor {
                 self.plan_more(vec![p]);
             }
             Cmd::Remove(id) => self.remove_project(&id),
+            Cmd::Retry { id, roots, dirs } => self.retry(&id, &roots, &dirs),
             Cmd::OverflowRecovered => self.recovering = false,
             Cmd::Walked { owner, tree } => self.watch_new_tree(&owner, &tree),
         }
@@ -414,8 +494,10 @@ impl Monitor {
         self.plan_more(projects);
     }
 
-    /// Budget allocation: roots of all `projects`, then their parents, then the rest of each tree
-    /// in order. A project whose tree does not fit entirely is polled.
+    /// Budget allocation, breadth first (see [`Cmd::Plan`]): every project gets its root (and its
+    /// `.git` and top-level directories) before any project gets deeper directories. Once a limit
+    /// is hit, the remaining directories are refused without asking the kernel again; a project
+    /// whose root is watched but not all of its tree is *partly* watched.
     fn plan_more(&mut self, projects: Vec<WatchProject>) {
         for p in &projects {
             self.by_root.insert(p.tree.root.clone(), p.id.clone());
@@ -428,43 +510,97 @@ impl Monitor {
                     ignore: Arc::clone(&p.tree.ignore),
                     git_aware,
                     polled: p.tree.truncated.then_some(PollReason::Truncated),
+                    truncated: p.tree.truncated,
+                    refused: HashSet::new(),
                 },
             );
         }
-        if self.backend.is_none() {
-            for p in &projects {
-                self.set_polled(&p.id, PollReason::WatcherUnavailable);
-            }
-            return;
-        }
+        let mut limit = self
+            .backend
+            .is_none()
+            .then_some(PollReason::WatcherUnavailable);
         for p in &projects {
-            if let Err(reason) = self.add_watch(&p.tree.root, Owner::Project(p.id.clone())) {
-                self.set_polled(&p.id, reason);
-            }
+            self.watch_dir(&p.id, &p.tree.root, &mut limit);
         }
         for p in &projects {
             if let Some(parent) = p.tree.root.parent() {
-                if self.within_roots(parent) {
-                    let _ = self.add_watch(parent, Owner::Parent(0));
+                if limit.is_none() && self.within_roots(parent) {
+                    if let Err(reason) = self.add_watch(parent, Owner::Parent(0)) {
+                        limit = Some(reason);
+                    }
                 }
             }
         }
+        let depth = |p: &WatchProject, d: &Path| {
+            d.strip_prefix(&p.tree.root)
+                .map_or(usize::MAX, |r| r.components().count())
+        };
         for p in &projects {
-            let owner = Owner::Project(p.id.clone());
-            let dirs = p.tree.git_dir.iter().chain(p.tree.dirs.iter().skip(1));
-            for d in dirs {
-                if let Err(reason) = self.add_watch(d, owner.clone()) {
-                    self.set_polled(&p.id, reason);
-                    break;
-                }
+            let top = p
+                .tree
+                .git_dir
+                .iter()
+                .chain(p.tree.dirs.iter().skip(1).filter(|d| depth(p, d) == 1));
+            for d in top {
+                self.watch_dir(&p.id, d, &mut limit);
+            }
+        }
+        for p in &projects {
+            let mut deeper: Vec<&PathBuf> =
+                p.tree.dirs.iter().filter(|d| depth(p, d) > 1).collect();
+            deeper.sort_by_key(|d| depth(p, d)); // stable: preorder within a level
+            for d in deeper {
+                self.watch_dir(&p.id, d, &mut limit);
             }
         }
     }
 
-    fn set_polled(&mut self, id: &str, reason: PollReason) {
-        if let Some(p) = self.projects.get_mut(id) {
-            if p.polled.is_none() {
-                p.polled = Some(reason);
+    /// Watch `dir` for project `id`, or refuse it when a limit is (or gets) reached: `limit`
+    /// carries the first limit hit during this command, so later directories do not ask the
+    /// kernel again. Directories inside a refused subtree are skipped.
+    fn watch_dir(&mut self, id: &str, dir: &Path, limit: &mut Option<PollReason>) {
+        let Some(state) = self.projects.get(id) else {
+            return;
+        };
+        if state.inside_refused(dir) {
+            return;
+        }
+        let result = match *limit {
+            Some(reason) => Err(reason),
+            None => self.add_watch(dir, Owner::Project(id.to_string())),
+        };
+        if let Err(reason) = result {
+            *limit = Some(reason);
+            if let Some(state) = self.projects.get_mut(id) {
+                state.refused.insert(dir.to_path_buf());
+                state.polled.get_or_insert(reason);
+            }
+        }
+    }
+
+    /// Reconciliation polled a partly watched project's subtrees: try to watch them again.
+    fn retry(&mut self, id: &str, roots: &[PathBuf], dirs: &[PathBuf]) {
+        let Some(state) = self.projects.get_mut(id) else {
+            return;
+        };
+        for r in roots {
+            state.refused.remove(r);
+        }
+        let mut limit = None;
+        for d in dirs {
+            self.watch_dir(id, d, &mut limit);
+        }
+        self.settle(id);
+    }
+
+    /// A project with nothing refused (and a complete tree) is fully watched again.
+    fn settle(&mut self, id: &str) {
+        if self.backend.is_none() {
+            return;
+        }
+        if let Some(state) = self.projects.get_mut(id) {
+            if state.refused.is_empty() && !state.truncated {
+                state.polled = None;
             }
         }
     }
@@ -532,22 +668,17 @@ impl Monitor {
         }
     }
 
+    /// A directory created at runtime was walked: watch it and its eligible subdirectories,
+    /// shallow first (refusals make the project partly watched).
     fn watch_new_tree(&mut self, owner: &Owner, tree: &Tree) {
-        let owner_ok = match owner {
-            Owner::Project(id) => self.projects.contains_key(id),
-            Owner::Parent(_) => true,
-        };
-        if !owner_ok {
+        let Owner::Project(id) = owner else {
             return;
-        }
-        for d in &tree.dirs {
-            if let Err(reason) = self.add_watch(d, owner.clone()) {
-                if let Owner::Project(id) = owner {
-                    let id = id.clone();
-                    self.set_polled(&id, reason);
-                }
-                break;
-            }
+        };
+        let mut dirs: Vec<&PathBuf> = tree.dirs.iter().collect();
+        dirs.sort_by_key(|d| d.components().count());
+        let mut limit = None;
+        for d in dirs {
+            self.watch_dir(id, d, &mut limit);
         }
     }
 
@@ -786,12 +917,21 @@ impl Monitor {
         };
         if matches!(change, Change::Removed(_)) {
             self.forget_below(path);
+            let had = self.projects.get_mut(id).is_some_and(|s| {
+                let before = s.refused.len();
+                s.refused.retain(|r| !r.starts_with(path));
+                s.refused.len() != before
+            });
+            if had {
+                self.dirty = true;
+                self.settle(id);
+            }
         }
         if is_dir {
             if !self.eligible_dir(path) || (git_aware && ignore.is_ignored(path, true)) {
                 return; // e.g. a new node_modules or a gitignored build directory
             }
-            self.walk_new_dir(Owner::Project(id.to_string()), path, git_aware);
+            self.walk_new_dir(id, path, git_aware);
             self.signal(Signal::Discover(path.to_path_buf()));
         } else if git_aware && ignore.is_ignored(path, false) {
             return;
@@ -846,12 +986,20 @@ impl Monitor {
         }
     }
 
-    fn walk_new_dir(&self, owner: Owner, dir: &Path, git_aware: bool) {
-        let Some(ex) = self.exclusions_for(dir) else {
+    /// Walk a directory created inside project `id` with the project's rules (exclusions, its
+    /// ignore layers, depth counted from the project root), then watch the result.
+    fn walk_new_dir(&self, id: &str, dir: &Path, git_aware: bool) {
+        let (Some(ex), Some(state)) = (self.exclusions_for(dir), self.projects.get(id)) else {
             return;
         };
         let ex = Exclusions::clone(ex);
-        let others: HashSet<PathBuf> = self.by_root.keys().cloned().collect();
+        let mut others: HashSet<PathBuf> = self.by_root.keys().cloned().collect();
+        others.remove(&state.root);
+        let (root, ignore, owner) = (
+            state.root.clone(),
+            Arc::clone(&state.ignore),
+            Owner::Project(id.to_string()),
+        );
         let (dir, tx, max_depth, same_fs, now) = (
             dir.to_path_buf(),
             self.self_tx.clone(),
@@ -866,10 +1014,11 @@ impl Monitor {
                 max_depth,
                 same_file_system: same_fs,
                 git_aware,
+                repo_root: None,
                 now,
                 max_entries: tree::MAX_ENTRIES,
             };
-            if let Ok(tree) = tree::walk(&dir, &opts) {
+            if let Ok(tree) = tree::walk_from(&root, &dir, &ignore, &opts) {
                 let _ = tx.blocking_send(Cmd::Walked { owner, tree });
             }
         });
@@ -928,16 +1077,31 @@ impl Monitor {
             return;
         }
         self.dirty = false;
+        let has_backend = self.backend.is_some();
         let mut projects = HashMap::with_capacity(self.projects.len());
-        let mut polled = 0;
+        let mut poll_targets = HashMap::new();
+        let (mut partial, mut polled) = (0, 0);
         for (id, p) in &self.projects {
-            let m = if p.polled.is_some() {
-                polled += 1;
-                Monitoring::Polled
-            } else {
-                Monitoring::Watched
-            };
-            projects.insert(id.clone(), (m, p.polled));
+            let mode = p.mode(has_backend);
+            match mode.0 {
+                Monitoring::Watched => {}
+                Monitoring::Partial => {
+                    partial += 1;
+                    if !p.truncated {
+                        let mut subtrees: Vec<PathBuf> = p.refused.iter().cloned().collect();
+                        subtrees.sort_by_key(|d| (d.components().count(), d.clone()));
+                        poll_targets.insert(
+                            id.clone(),
+                            PollTarget {
+                                subtrees,
+                                ignore: Arc::clone(&p.ignore),
+                            },
+                        );
+                    }
+                }
+                Monitoring::Polled => polled += 1,
+            }
+            projects.insert(id.clone(), mode);
         }
         let mut advice = Vec::new();
         if self.backend.is_none() {
@@ -946,10 +1110,10 @@ impl Monitor {
         let reasons: HashSet<PollReason> =
             self.projects.values().filter_map(|p| p.polled).collect();
         if reasons.contains(&PollReason::Budget) {
-            advice.push(format!("The watch budget ({}) is used up: the least recently active projects are polled. Raise [watch] budget in config.toml.", self.settings.budget));
+            advice.push(format!("The watch budget ({} watches, 25 % of fs.inotify.max_user_watches by default) is used up: every project root is watched first, then top-level folders, then deeper folders of the most recently active projects; folders without a watch are checked at each scan. Raise [watch] budget in config.toml, or exclude large generated folders.", self.settings.budget));
         }
         if reasons.contains(&PollReason::KernelLimit) {
-            advice.push("The kernel's inotify watch limit (fs.inotify.max_user_watches) is reached: some projects are polled. Raise it with sudo sysctl fs.inotify.max_user_watches=… (ccwm never changes kernel limits).".to_string());
+            advice.push("The kernel's inotify watch limit (fs.inotify.max_user_watches) is reached: folders without a watch are checked at each scan. Raise it with sudo sysctl fs.inotify.max_user_watches=… (ccwm never changes kernel limits).".to_string());
         }
         if reasons.contains(&PollReason::Truncated) {
             advice.push(
@@ -962,14 +1126,14 @@ impl Monitor {
                     .to_string(),
             );
         }
-        let polled_total = polled;
-        let summary = (
-            self.watches.len() / 64, // coarse: watch counts move constantly
-            polled_total,
-            self.recovering,
-            self.overflows,
-            projects.len(),
-        );
+        let summary = Summary {
+            watches: self.watches.len() / 64, // coarse: watch counts move constantly
+            partial,
+            polled,
+            recovering: self.recovering,
+            overflows: self.overflows,
+            projects: projects.len(),
+        };
         if self.last_summary != Some(summary) {
             self.last_summary = Some(summary);
             if let Some(n) = &self.notifier {
@@ -985,14 +1149,16 @@ impl Monitor {
             watches: self.watches.len(),
             budget: self.settings.budget,
             max_user_watches: self.settings.max_user_watches,
-            watched_projects: projects.len() - polled,
+            watched_projects: projects.len() - partial - polled,
+            partial_projects: partial,
             polled_projects: polled,
             overflows: self.overflows,
             recovering_overflow: self.recovering,
             pending_projects: self.pending.len(),
-            degraded: self.backend.is_none() || polled > 0 || self.recovering,
+            degraded: !has_backend || partial > 0 || polled > 0 || self.recovering,
             advice,
             projects,
+            poll_targets,
         });
     }
 
@@ -1024,11 +1190,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_budget_is_a_quarter_capped_at_8192() {
-        assert_eq!(default_budget(Some(65_536)), 8192);
+    fn default_budget_is_a_quarter_of_the_kernel_limit_without_a_fixed_ceiling() {
+        assert_eq!(default_budget(Some(65_536)), 16_384);
         assert_eq!(default_budget(Some(8192)), 2048);
-        assert_eq!(default_budget(Some(1_000_000)), 8192);
-        assert_eq!(default_budget(None), 8192);
+        assert_eq!(default_budget(Some(1_048_576)), 262_144, "no 8192 ceiling");
+        assert_eq!(default_budget(None), FALLBACK_BUDGET);
         assert_eq!(default_budget(Some(3)), 0);
     }
 }

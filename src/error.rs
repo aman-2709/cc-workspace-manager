@@ -10,6 +10,7 @@ pub const EXIT_ERROR: i32 = 1;
 pub struct Error {
     message: String,
     exit_code: i32,
+    not_running: bool,
 }
 
 impl Error {
@@ -17,7 +18,21 @@ impl Error {
         Self {
             message: message.into(),
             exit_code: EXIT_ERROR,
+            not_running: false,
         }
+    }
+
+    /// No daemon answers (yet): its runtime directory or socket is absent, or nothing listens.
+    /// The CLI waits a little for a daemon that is still starting.
+    pub fn not_running(message: impl Into<String>) -> Self {
+        Self {
+            not_running: true,
+            ..Self::new(message)
+        }
+    }
+
+    pub fn is_not_running(&self) -> bool {
+        self.not_running
     }
 
     /// An error that maps to a specific process exit code (M4: port in use, already running).

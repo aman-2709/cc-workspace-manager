@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **M2 (activity tracking) complete, including the pre-M2 items — waiting for the maintainer's go-ahead for M3.**
+Current position: **M2.1 (M2 security fixes + real-home defects) complete — waiting for the maintainer's go-ahead for M3.**
 
 ---
 
@@ -72,6 +72,20 @@ unprivileged user namespaces — skipped with notice on the development host).
 - [x] UI: card + table (sortable columns, 100-row pages), search/sort/filters, stats, ignore/un-ignore, missing and ignored filters, degraded and reconnecting banners, theme (system/light/dark), view and theme persisted
 - [x] `/projects/{id}`, ignore endpoints; acceptance (synthetic env, real browser): an edit moves its project to the top live, a new `CLAUDE.md` registers a project without reload, Git status correct; tests 3, 4, 5 pass
 - [x] fmt / clippy / test / cargo deny green; docs; local commit
+
+## M2.1 — Git transport hardening and real-home defects (review `docs/reviews/m2-security-review.md` + maintainer's real-home test)
+No new features. Spec changes approved by the maintainer and applied to REQUIREMENTS.md §0/§5.1/§5.3/§6/§9/§16 and SECURITY.md.
+
+- [x] H1: `GIT_ALLOW_PROTOCOL=` (empty) and `GIT_NO_LAZY_FETCH=1` in the Git environment; `-c protocol.{ext,ssh,file,git,http,https}.allow=never`; `GIT_NO_LAZY_FETCH` verified on the host's Ubuntu 2.43.0 build (CVE-2024-32465 backport), upstream 2.45.0; partial clones degrade to `partial_clone` ("Git status unavailable (partial clone)") instead of being refused
+- [x] Test 4: promisor vectors (`ext::`, `file://` + `uploadpack`, `ssh://` + `core.sshCommand`), `HEAD` object removed, control = plain `git status`/`log`; each transport block alone tested; the `ls-remote` `sshCommand` control removed
+- [x] Test 5: `execve` allowlist (daemon + `git --version|rev-parse|status|log|config`), zero fetch children for three promisor projects (L3), `strace -s 256`
+- [x] L1, L4: SECURITY.md notes. L2: notify drops `IN_ONLYDIR` on `ENOTDIR` ⇒ directory check after every watch + real-inotify test; SECURITY.md note
+- [x] Watches breadth first (roots → parents → `.git` + top level → deeper by recency); *partly watched* projects poll only their unwatched subtrees (`Cmd::Retry`); ancestor `.gitignore`/`info/exclude` of the work tree applied; new directories walked with the project's rules; `ccwm status` shows watched / partly watched / polled; test: one huge project + 20 small ones
+- [x] Default budget 25 % of `max_user_watches` (no 8192 ceiling)
+- [x] Activity: `activity.days_ago` from the classifier; the UI's relative time uses it (6/7-day boundary tested at a non-midnight time, Rust and JS)
+- [x] UI: paths shortened at a `/` boundary; non-Git cards one Git line; "1 folder" plural + unreadable paths (discovery status `unreadable[]`, `ccwm status`, tooltip); degraded banner one line + `<details>`
+- [x] `ccwm open` / `status` / `scan` wait up to ~5 s for a starting daemon (only "not running" errors are retried)
+- [x] fmt / clippy / test (`CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_INOTIFY=1`) / cargo deny green; synthetic daemon + real browser check; docs; local commit
 
 ## M3 — Development continuity
 Accept: a project with sessions but no `CLAUDE.md` appears; detail panel shows last prompt (read on demand), Git

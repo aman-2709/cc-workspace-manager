@@ -72,9 +72,72 @@ fn marker(dir: &Path, text: &str) {
     fs::write(dir.join("CLAUDE.md"), text).unwrap();
 }
 
+/// M2 review L2: notify requests `IN_ONLYDIR` but falls back to a plain watch on `ENOTDIR`; the
+/// backend must still refuse anything that is not a directory, and never follow a symlink.
+#[tokio::test]
+async fn the_inotify_backend_watches_only_real_directories() {
+    let _g = inotify_lock().lock().await;
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let (raw_tx, mut raw_rx) = mpsc::channel(64);
+    let mut backend = match watch::inotify_backend(raw_tx, Arc::new(AtomicBool::new(false))) {
+        Ok(w) => w,
+        Err(e) => {
+            assert!(
+                std::env::var("CCWM_REQUIRE_INOTIFY").as_deref() != Ok("1"),
+                "no inotify instance: {e}"
+            );
+            eprintln!("NOTICE: no inotify instance available ({e}); skipping");
+            return;
+        }
+    };
+    let dir = root.join("d");
+    fs::create_dir(&dir).unwrap();
+    let file = root.join("f");
+    fs::write(&file, "x").unwrap();
+    let link = root.join("l");
+    std::os::unix::fs::symlink(&dir, &link).unwrap();
+    assert_eq!(backend.watch(&dir), Ok(()));
+    assert_eq!(
+        backend.watch(&file),
+        Err(watch::WatchError::Gone),
+        "a regular file is never watched"
+    );
+    assert_eq!(
+        backend.watch(&link),
+        Err(watch::WatchError::Gone),
+        "a symlink to a directory is never watched"
+    );
+    assert_eq!(
+        backend.watch(&root.join("missing")),
+        Err(watch::WatchError::Gone)
+    );
+    // The refused file really has no watch: writing to it produces no event.
+    fs::write(&file, "changed").unwrap();
+    fs::write(dir.join("inside"), "y").unwrap();
+    let mut paths = Vec::new();
+    while let Ok(Some(Ok(ev))) =
+        tokio::time::timeout(Duration::from_millis(300), raw_rx.recv()).await
+    {
+        paths.extend(ev.paths);
+    }
+    assert!(paths.iter().any(|p| p.starts_with(&dir)), "{paths:?}");
+    assert!(!paths.iter().any(|p| p == &file), "{paths:?}");
+}
+
 impl Stack {
     /// `None` if no inotify instance could be created (notice printed).
     async fn start(home: &Path, data: &Path, clock: Arc<FakeClock>) -> Option<Self> {
+        Self::start_with_budget(home, data, clock, 1000).await
+    }
+
+    /// `None` if no inotify instance could be created (notice printed).
+    async fn start_with_budget(
+        home: &Path,
+        data: &Path,
+        clock: Arc<FakeClock>,
+        budget: usize,
+    ) -> Option<Self> {
         let db = data.join("t.db");
         let writer = Arc::new(Writer::spawn(&db).unwrap());
         let reader = Reader::open(&db, 2).unwrap();
@@ -136,7 +199,7 @@ impl Stack {
                 fuse_mounts: vec![],
                 max_depth: 10,
                 same_file_system: true,
-                budget: 1000,
+                budget,
                 max_user_watches: None,
                 debounce: Duration::from_millis(100),
                 events_per_project: 50,
@@ -334,6 +397,73 @@ async fn live_activity_new_projects_missing_revived_and_renames() {
         s.row(&a.id).await.activity_path,
         alpha_before,
         "never attributed to the parent"
+    );
+    s.stop().await;
+}
+
+/// A partly watched project: reconciliation walks only its unwatched subtrees, finds a change
+/// there by mtime (inferred), and keeps the watched part live.
+#[tokio::test]
+async fn reconciliation_polls_the_unwatched_subtrees_of_a_partly_watched_project() {
+    let _g = inotify_lock().lock().await;
+    let e = env();
+    let p = e.home.join("dev/p");
+    marker(&p, "# p");
+    fs::create_dir_all(p.join("top")).unwrap();
+    fs::create_dir_all(p.join("deep/x/y")).unwrap();
+    // Budget: the root, its parent `dev`, and the top level (`top`, `deep`); `deep/x` is not.
+    let Some(s) = Stack::start_with_budget(&e.home, &e.data, now_clock(), 4).await else {
+        return;
+    };
+    let t = s.wait_registered(&p).await;
+    s.wait("partly watched", 15, || async {
+        s.monitor
+            .of(&t.id)
+            .is_some_and(|m| m.0 == Monitoring::Partial)
+    })
+    .await;
+    let target = s.monitor.poll_target(&t.id).unwrap();
+    assert_eq!(target.subtrees, [p.join("deep/x")]);
+
+    // The watched part is live.
+    s.clock.advance(100);
+    fs::write(p.join("top/live.txt"), "l").unwrap();
+    s.wait("observed activity in the watched part", 10, || async {
+        let r = s.row(&t.id).await;
+        r.activity_kind.as_deref() == Some("observed")
+            && r.activity_path.as_deref() == Some("top/live.txt")
+    })
+    .await;
+
+    // A change in the unwatched subtree is found by the next reconciliation (mtime, inferred).
+    s.clock.advance(1000);
+    let hidden = p.join("deep/x/y/new.txt");
+    fs::write(&hidden, "n").unwrap();
+    let at = s.clock.now() - 5;
+    fs::File::options()
+        .write(true)
+        .open(&hidden)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(at.try_into().unwrap()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_ne!(
+        s.row(&t.id).await.activity_path.as_deref(),
+        Some("deep/x/y/new.txt"),
+        "not seen live: no watch there"
+    );
+    s.tracker.request_refresh();
+    s.wait("the polled subtree's change", 15, || async {
+        let r = s.row(&t.id).await;
+        r.activity_path.as_deref() == Some("deep/x/y/new.txt")
+            && r.activity_kind.as_deref() == Some("inferred")
+            && r.activity_at == Some(at)
+    })
+    .await;
+    assert_eq!(
+        s.monitor.of(&t.id).unwrap().0,
+        Monitoring::Partial,
+        "still no room for the subtree"
     );
     s.stop().await;
 }

@@ -7,13 +7,15 @@ Independent, unofficial tool to discover, track and resume Claude Code projects.
 2. `ARCHITECTURE.md` (modules, data flow, schema, contracts, verified findings), `ROADMAP.md` (checklists + §18 backlog). Keep all three current. §18 items are **not** v0.1.
 
 ## Current status
-**M1, M1.1: complete. Pre-M2 items and M2 — Activity tracking: complete (one local commit, not pushed).** Waiting for the maintainer's go-ahead before M3. Implement only the approved milestone; after it, stop, report, and wait.
+**M1, M1.1, M2, M2.1 (M2 security review fixes + real-home defects): complete (local commits, not pushed).** Waiting for the maintainer's go-ahead before M3. Implement only the approved milestone; after it, stop, report, and wait.
 
-## Session handoff (2026-11-24, after M2)
-- **State:** pre-M2 requests (test 5 strace fallback, `~/…` left-ellipsized paths + uniform cards, licensing/README/CONTRIBUTING, forwarder residual risk + test, build commit in `/health` and `ccwm status`) and all of M2 (watch engine, tracker/reconciliation, Git module, activity buckets, WebSocket, card/table UI, ignore, missing, moves) in one local commit. Spec changes are applied to REQUIREMENTS.md (Appendix A rows marked "pre-M2"/"M2") and **await approval**.
-- **Next:** M3, only after the maintainer approves M2 and the spec changes. M3 needs the maintainer's pasted output of `scripts/inspect-session-schema.py` (§19).
+## Session handoff (2026-11-24, after M2.1)
+- **State:** M2.1 in one local commit: Git transport hardening (H1: `GIT_ALLOW_PROTOCOL=`, `GIT_NO_LAZY_FETCH=1`, per-protocol `-c …allow=never`, `partial_clone` state), test 4 promisor vectors, test 5 exec allowlist, L2 directory check, breadth-first watches with *partly watched* projects, 25 % budget, calendar-day relative time, UI/CLI fixes. Spec changes approved and applied (Appendix A rows "M2.1").
+- **Next:** M3, only after the maintainer's go-ahead. M3 needs the maintainer's pasted output of `scripts/inspect-session-schema.py` (§19). The M2 spec changes (Appendix A "M2"/"pre-M2", ARCHITECTURE O5) were never explicitly approved.
 - **Open items:**
   - Test 5 ran as the **strace** variant only; the network-namespace variant (`unshare --user --map-current-user --net`) has never run (AppArmor blocks it here) — needs a CI runner.
+  - `GIT_NO_LAZY_FETCH` is honored by this host's Ubuntu git (CVE-2024-32465 backport); upstream releases before 2.45.0 without that backport ignore it (the other two blocks still apply; test 5's zero-fetch assertion would then fail by design).
+  - Watches are still added by path (L2 residual); only a swap to a non-directory is caught.
   - New licenses ISC, CC0-1.0, BSL-1.0 (through `notify`) allowed in `deny.toml`, pending maintainer review.
   - axum's `ws` enables `tokio-tungstenite`'s `connect` feature (unused WebSocket client code); documented in SECURITY.md.
   - M4 additions: `sock_diag` peer lookup, daemon-level write/connect probes, manual two-user check, `cargo-about`.
@@ -79,9 +81,13 @@ Ubuntu 24.04, rustc/cargo 1.94.0, git 2.43.0 (needs ≥2.41.0 for `--attr-source
 - Nothing in ccwm logged below `info` before M1.1, so a trace-level log test proved nothing; the TCP peer check (debug) and socket requests (trace, op name only) now log there.
 - `axum::serve` exposes no header-read timeout; the server loop uses hyper's http1 builder directly (`http/mod.rs`).
 - A gitignore pattern with an inner slash is anchored to the `.gitignore` directory: use `**/ccwm/config.toml`.
+- A repository's per-protocol `protocol.<name>.allow` beats a command-line `protocol.allow=never`; a promisor partial clone makes `status`/`log` lazily fetch (and run the transport). Block with `GIT_ALLOW_PROTOCOL=` + per-protocol `-c` + `GIT_NO_LAZY_FETCH=1`.
+- notify 9 requests `IN_ONLYDIR` but retries **without** it on `ENOTDIR`: check `is_dir` after adding a watch.
+- strace abbreviates arrays/strings at 32 by default (`...`): use `-s 256` when parsing `execve` argv.
+- Changing a CSS grid template does not resize its container: a `ResizeObserver` on the container does not fire (test path fitting with a real width change).
 
 ## Module status
-M1: `paths config clock error api_error sandbox instance db/{mod,writer,reader,queries} discovery/{walk,dirfd,exclusions,mounts,status} auth/{tokens,bootstrap,sessions} service ipc/{protocol,server} client http/{mod,peer,middleware,extract,routes,assets,error} daemon cli synth bin/ccwm-synth` + `web/*` + `scripts/inspect-session-schema.py` + `deny.toml` + `SECURITY.md`. M2: `activity git/{mod,run,parse} watch/{mod,tree} tracker events view http/ws build.rs` + migration 3 + README/CONTRIBUTING. Not built yet: `claude privacy` (M3).
+M1: `paths config clock error api_error sandbox instance db/{mod,writer,reader,queries} discovery/{walk,dirfd,exclusions,mounts,status} auth/{tokens,bootstrap,sessions} service ipc/{protocol,server} client http/{mod,peer,middleware,extract,routes,assets,error} daemon cli synth bin/ccwm-synth` + `web/*` + `scripts/inspect-session-schema.py` + `deny.toml` + `SECURITY.md`. M2: `activity git/{mod,run,parse} watch/{mod,tree} tracker events view http/ws build.rs` + migration 3 + README/CONTRIBUTING. M2.1: no new modules. Not built yet: `claude privacy` (M3).
 
 ## Open items
 See ARCHITECTURE.md §14 (O1–O4).

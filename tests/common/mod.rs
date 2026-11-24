@@ -30,6 +30,77 @@ pub fn tempdir() -> tempfile::TempDir {
     t
 }
 
+/// An executable `<dir>/<name>.sh` that creates `<dir>/<name>.ran`, then runs `body`.
+/// Returns `(script, sentinel)`.
+pub fn sentinel_script(
+    dir: &Path,
+    name: &str,
+    body: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let sentinel = dir.join(format!("{name}.ran"));
+    let script = dir.join(format!("{name}.sh"));
+    fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\n{body}\n", sentinel.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    (script, sentinel)
+}
+
+/// How a promisor partial clone reaches a program when `status`/`log` lazily fetch a missing
+/// object (M2 security review, H1). Each re-enables its transport in the repository's config.
+#[derive(Clone, Copy, Debug)]
+pub enum Promisor {
+    /// `ext::` runs a command as the transport.
+    Ext,
+    /// `file://` runs `remote.<name>.uploadpack`.
+    FileUploadPack,
+    /// `ssh://` runs `core.sshCommand`.
+    SshCommand,
+}
+
+pub const PROMISORS: [Promisor; 3] = [
+    Promisor::Ext,
+    Promisor::FileUploadPack,
+    Promisor::SshCommand,
+];
+
+/// Make `r` (a repository with at least one commit) a promisor partial clone whose `HEAD` commit
+/// object is missing and whose transport runs `helper` (which must not read stdin: Git would wait
+/// for it). `git(args)` runs plain Git in `r` and panics on failure.
+pub fn make_promisor(r: &Path, vector: Promisor, helper: &Path, git: &dyn Fn(&[&str]) -> String) {
+    let h = helper.to_str().unwrap();
+    let head = git(&["rev-parse", "HEAD"]);
+    let head = head.trim();
+    fs::remove_file(r.join(".git/objects").join(&head[..2]).join(&head[2..])).unwrap();
+    git(&["config", "extensions.partialClone", "origin"]);
+    git(&["config", "remote.origin.promisor", "true"]);
+    let missing = r.join("no-such-remote");
+    let (url, extra) = match vector {
+        Promisor::Ext => (
+            format!("ext::sh {h}"),
+            [("protocol.ext.allow", "always"); 2],
+        ),
+        Promisor::FileUploadPack => (
+            format!("file://{}", missing.display()),
+            [
+                ("remote.origin.uploadpack", h),
+                ("protocol.file.allow", "always"),
+            ],
+        ),
+        Promisor::SshCommand => (
+            "ssh://git@example.invalid/x.git".to_string(),
+            [("core.sshCommand", h), ("protocol.ssh.allow", "always")],
+        ),
+    };
+    git(&["config", "remote.origin.url", &url]);
+    for (k, v) in extra {
+        git(&["config", k, v]);
+    }
+}
+
 /// The home directory the test service assumes (seeded projects live below it).
 pub const HOME: &str = "/home/u";
 

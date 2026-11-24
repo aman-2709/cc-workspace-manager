@@ -162,7 +162,7 @@ impl Dirs {
         let uid = owner.uid;
         match fs::symlink_metadata(&self.runtime) {
             Ok(md) => verify_private(&self.runtime, &md, uid),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::new(format!(
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::not_running(format!(
                 "no ccwm runtime directory at {} (is the daemon running?)",
                 self.runtime.display()
             ))),

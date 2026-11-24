@@ -23,15 +23,59 @@ function shouldRotate(session, nowSeconds) {
   return Boolean(session) && typeof session.rotate_after === "number" && nowSeconds >= session.rotate_after;
 }
 
+function plural(n, word) {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+// Folders the last scan counted as unreadable (permission, vanished, changed, other).
+function unreadableCount(status) {
+  const skipped = (status && status.skipped) || {};
+  return (skipped.permission || 0) + (skipped.vanished || 0) + (skipped.changed || 0) + (skipped.other || 0);
+}
+
 function describeDiscovery(status) {
   if (!status) return "";
   if (status.phase === "scanning") {
-    return `Scanning… ${status.dirs_visited} folders checked, ${status.projects_found} projects found`;
+    return `Scanning… ${plural(status.dirs_visited, "folder")} checked, ${plural(status.projects_found, "project")} found`;
   }
-  const skipped = status.skipped || {};
-  const problems = (skipped.permission || 0) + (skipped.vanished || 0) + (skipped.changed || 0) + (skipped.other || 0);
+  const problems = unreadableCount(status);
   const last = status.last_success_at ? `Last scan ${new Date(status.last_success_at * 1000).toLocaleString()}` : "No completed scan yet";
-  return problems > 0 ? `${last}, ${problems} folders could not be read` : last;
+  return problems > 0 ? `${last}, ${plural(problems, "folder")} could not be read` : last;
+}
+
+// The tooltip listing the unreadable folders ("" when there are none).
+function describeUnreadable(status) {
+  const total = unreadableCount(status);
+  if (!total) return "";
+  const listed = (status.unreadable || []).map((u) => `${u.path} (${u.reason})`);
+  const more = total > listed.length ? [`… and ${total - listed.length} more`] : [];
+  return [`Could not be read in the last scan:`, ...listed, ...more].join("\n");
+}
+
+// The one-line summary of the degraded-monitoring banner (details are behind a toggle).
+function degradedSummary(m) {
+  if (!m || !m.degraded) return "";
+  const parts = [];
+  if (m.watcher === "unavailable") parts.push("no inotify instance");
+  if (m.partial_projects) parts.push(`${plural(m.partial_projects, "project")} partly watched`);
+  if (m.polled_projects) parts.push(`${plural(m.polled_projects, "project")} checked only at each scan`);
+  if (m.recovering_overflow) parts.push("catching up after lost file events");
+  return `Monitoring is degraded${parts.length ? `: ${parts.join(", ")}` : ""}.`;
+}
+
+// The tail of `path` that fits in `max` characters, cut at a "/" boundary ("…/dev/project").
+// The last component is always kept whole (CSS clips it if even that does not fit).
+function truncatePath(path, max) {
+  if (typeof path !== "string" || path.length <= max) return path;
+  const parts = path.split("/");
+  let tail = parts.pop();
+  while (parts.length > 0) {
+    const next = `${parts[parts.length - 1]}/${tail}`;
+    if (`…/${next}`.length > max) break;
+    tail = next;
+    parts.pop();
+  }
+  return parts.length > 0 ? `…/${tail}` : tail;
 }
 
 function readSession(storage) {
@@ -100,13 +144,26 @@ function withSort(state, sort) {
   return { ...state, sort, order: sort === "name" ? "asc" : "desc", page: 0 };
 }
 
-function relativeTime(at, now) {
+// Local calendar days from `at` to `now` (browser time zone), never negative.
+function calendarDaysAgo(at, now) {
+  const day = (t) => {
+    const d = new Date(t * 1000);
+    return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 86400000;
+  };
+  return Math.max(0, Math.round(day(now) - day(at)));
+}
+
+// "N days ago" counts calendar days, exactly like the activity status: `daysAgo` comes from the
+// server's classifier (the same calculation as the bucket); without it, local calendar days.
+function relativeTime(at, now, daysAgo) {
   if (typeof at !== "number") return "unknown";
   const s = Math.max(0, now - at);
-  if (s < 60) return "just now";
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
-  const d = Math.floor(s / 86400);
+  const d = typeof daysAgo === "number" ? Math.max(0, daysAgo) : calendarDaysAgo(at, now);
+  if (d === 0) {
+    if (s < 60) return "just now";
+    if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+    return `${Math.floor(s / 3600)} h ago`;
+  }
   if (d === 1) return "yesterday";
   if (d < 14) return `${d} days ago`;
   if (d < 60) return `${Math.floor(d / 7)} weeks ago`;
@@ -123,6 +180,7 @@ function gitSummary(git) {
     case "unsafe_repository": return "Git refused this repository (safe.directory)";
     case "status_disabled_old_git": return `${git.branch || "?"}: status disabled, Git too old to harden`;
     case "status_disabled_unsafe_config": return `${git.branch || "?"}: status disabled, unsafe filter configuration`;
+    case "partial_clone": return git.branch ? `${git.branch}: Git status unavailable (partial clone)` : "Git status unavailable (partial clone)";
     case "timeout": return "Git timed out";
     case "error": return "Git could not read this repository";
     default: break;
@@ -156,6 +214,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     parseFragmentToken, shouldRotate, describeDiscovery, readSession, shouldClearOnUnauthorized, preferStored,
     readPrefs, buildQuery, withView, withSort, relativeTime, gitSummary, paginate, reconnectDelay, wsUrl,
+    plural, describeUnreadable, degradedSummary, truncatePath, calendarDaysAgo,
     STORAGE_KEY, PREFS_KEY, DEFAULT_QUERY,
   };
 }
@@ -230,6 +289,7 @@ function startApp() {
     signoutBtn.hidden = true;
     themeWrap.hidden = true;
     discoveryEl.textContent = "";
+    for (const a of ["title", "tabindex", "aria-description"]) discoveryEl.removeAttribute(a);
     bannersEl.replaceChildren();
   }
 
@@ -292,18 +352,36 @@ function startApp() {
 
   // ---- rendering ----------------------------------------------------------------------------
 
-  function timeEl(at, kind) {
+  function timeEl(activity) {
+    const { at, kind } = activity;
     if (typeof at !== "number") return h("span", { text: "Last change unknown" });
     const exact = new Date(at * 1000).toLocaleString();
     const how = kind === "observed" ? "observed" : "inferred from file times";
     return h("time", {
       datetime: new Date(at * 1000).toISOString(), title: `${exact} (${how})`, tabindex: "0",
-      "aria-label": `Last change ${exact}, ${how}`, text: `${relativeTime(at, now())}${kind === "inferred" ? " (inferred)" : ""}`,
+      "aria-label": `Last change ${exact}, ${how}`, text: `${relativeTime(at, now(), activity.days_ago)}${kind === "inferred" ? " (inferred)" : ""}`,
     });
   }
 
+  // The visible text is fitted to the element's width by `fitPaths` (cut at a "/").
   function pathEl(p, tag = "p") {
-    return h(tag, { class: "line path", title: p.path }, h("bdi", { text: p.display_path || p.path }));
+    const shown = p.display_path || p.path;
+    return h(tag, { class: "line path", title: p.path, "data-path": shown }, h("bdi", { text: shown }));
+  }
+
+  // Shorten every path in `root` to what fits, at a "/" boundary. The paths are monospace, so
+  // one character width (measured once) gives the number of characters that fit.
+  function fitPaths(root) {
+    const els = root.querySelectorAll("[data-path]");
+    if (els.length === 0) return;
+    const probe = h("span", { class: "path probe", text: "0".repeat(32) });
+    root.append(probe);
+    const charWidth = probe.getBoundingClientRect().width / 32;
+    probe.remove();
+    for (const el of els) {
+      const max = charWidth > 0 ? Math.max(1, Math.floor(el.clientWidth / charWidth)) : Infinity;
+      el.firstChild.textContent = truncatePath(el.dataset.path, max);
+    }
   }
 
   function ignoreButton(p) {
@@ -320,6 +398,7 @@ function startApp() {
     if (p.missing_since) list.push(h("li", { class: "badge warn", text: "missing" }));
     if (p.ignored) list.push(h("li", { class: "badge warn", text: "ignored" }));
     if (p.monitoring === "polled") list.push(h("li", { class: "badge warn", text: "polled", title: "Changes are found at the next scan, not live" }));
+    if (p.monitoring === "partial") list.push(h("li", { class: "badge warn", text: "partly watched", title: "Some folders have no watch: changes there are found at the next scan" }));
     return h("ul", { class: "badges", "aria-label": "Details" }, ...list);
   }
 
@@ -332,11 +411,15 @@ function startApp() {
         h("h3", { class: "line", title: p.name, text: p.name }),
         h("span", { class: "small muted", text: STATUS_LABEL[status] || status })),
       pathEl(p),
-      h("p", { class: "line small" }, timeEl(p.activity.at, p.activity.kind),
+      h("p", { class: "line small" }, timeEl(p.activity),
         p.activity.path ? h("span", { class: "muted", text: `, ${p.activity.path}` }) : null),
-      h("p", { class: `line small${git && git.dirty ? " dirty" : ""}`, text: gitSummary(git) }),
-      h("p", { class: "line small muted", title: commit && commit.subject ? commit.subject : "",
-        text: commit && commit.subject ? `Latest commit: ${commit.subject}` : "No commit recorded" }),
+      ...(git && git.state === "not_git"
+        ? [h("p", { class: "line small muted", text: gitSummary(git) })] // one line: nothing else to say
+        : [
+          h("p", { class: `line small${git && git.dirty ? " dirty" : ""}`, text: gitSummary(git) }),
+          h("p", { class: "line small muted", title: commit && commit.subject ? commit.subject : "",
+            text: commit && commit.subject ? `Latest commit: ${commit.subject}` : "No commit recorded" }),
+        ]),
       h("div", { class: "foot" }, badges(p), ignoreButton(p)));
   }
 
@@ -362,7 +445,7 @@ function startApp() {
         h("tbody", {}, ...rows.map((p) => h("tr", {},
           h("td", {}, h("span", { class: "line", title: p.name, text: p.name })),
           h("td", {}, pathEl(p, "span")),
-          h("td", {}, h("span", { class: "line" }, timeEl(p.activity.at, p.activity.kind))),
+          h("td", {}, h("span", { class: "line" }, timeEl(p.activity))),
           h("td", {}, h("span", { class: "line" }, h("span", { class: "dot", "data-status": p.activity.status }),
             STATUS_LABEL[p.activity.status] || p.activity.status)),
           h("td", {}, h("span", { class: `line${p.git && p.git.dirty ? " dirty" : ""}`, title: gitSummary(p.git), text: gitSummary(p.git) })),
@@ -449,7 +532,28 @@ function startApp() {
     const content = h("div", { id: "content" });
     main.replaceChildren(summary, toolbar, content);
     ui = { toolbar, summary, content };
+    if (typeof ResizeObserver === "function") {
+      let frame = 0;
+      new ResizeObserver(() => {
+        cancelAnimationFrame(frame);
+        frame = requestAnimationFrame(() => fitPaths(content));
+      }).observe(content);
+    }
     syncToolbar();
+  }
+
+  function showDiscovery() {
+    discoveryEl.textContent = describeDiscovery(status);
+    const tip = describeUnreadable(status);
+    if (tip) {
+      discoveryEl.title = tip;
+      discoveryEl.tabIndex = 0; // focusable, so the list is reachable without a mouse
+      discoveryEl.setAttribute("aria-description", tip);
+    } else {
+      discoveryEl.removeAttribute("title");
+      discoveryEl.removeAttribute("tabindex");
+      discoveryEl.removeAttribute("aria-description");
+    }
   }
 
   function renderStats() {
@@ -489,6 +593,7 @@ function startApp() {
     } else {
       ui.content.replaceChildren(count, h("ul", { class: "cards" }, ...items.map(card)));
     }
+    fitPaths(ui.content);
   }
 
   function renderBanners() {
@@ -498,8 +603,9 @@ function startApp() {
         h("p", { text: "Live updates are disconnected. Reconnecting…" })));
     }
     if (monitoring && monitoring.degraded) {
-      list.push(h("div", { class: "banner", role: "status" },
-        h("p", { text: `Monitoring is degraded: ${monitoring.polled_projects} project${monitoring.polled_projects === 1 ? " is" : "s are"} checked at each scan instead of live.` }),
+      // One line; the advice is behind a native disclosure toggle (keyboard accessible).
+      list.push(h("details", { class: "banner" }, // #banners is aria-live already
+        h("summary", {}, degradedSummary(monitoring), h("span", { class: "small muted", text: " Details" })),
         ...(monitoring.advice || []).map((a) => h("p", { class: "small", text: a }))));
     }
     bannersEl.replaceChildren(...list);
@@ -536,7 +642,7 @@ function startApp() {
   async function loadStatus() {
     try {
       status = await api("/discovery/status");
-      discoveryEl.textContent = describeDiscovery(status);
+      showDiscovery();
       const svc = await api("/service/status");
       monitoring = svc.monitoring;
       renderBanners();
@@ -585,7 +691,7 @@ function startApp() {
           break;
         case "discovery":
           status = msg.status;
-          discoveryEl.textContent = describeDiscovery(status);
+          showDiscovery();
           break;
         case "monitoring":
           monitoring = msg.monitoring;

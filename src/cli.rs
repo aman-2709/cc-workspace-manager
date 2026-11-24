@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::paths::{current_home, Dirs, EnvVars, Owner};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::time::Duration;
 
 const NOTICE: &str = "CC Workspace Manager is an independent, unofficial open-source project. \
 It is not affiliated with or endorsed by Anthropic.";
@@ -67,10 +68,54 @@ fn daemon_socket() -> Result<(std::path::PathBuf, u32)> {
     Ok((dirs.socket_path(), uid))
 }
 
+/// How long the CLI waits for a daemon that is still starting (runtime directory or socket not
+/// there yet, or not accepting yet).
+pub const STARTUP_WAIT: Duration = Duration::from_secs(5);
+
+/// The first request of a command: retried while the daemon is not running yet, up to `wait`.
+/// Every other error (wrong owner, impostor, protocol) fails at once.
+fn first_call(op: &str) -> Result<(std::path::PathBuf, u32, serde_json::Value)> {
+    let mut told = false;
+    retry_while_starting(STARTUP_WAIT, Duration::from_millis(100), || {
+        let r = daemon_socket()
+            .and_then(|(socket, uid)| client::call(&socket, uid, op).map(|v| (socket, uid, v)));
+        if r.as_ref().is_err_and(Error::is_not_running) && !told {
+            eprintln!(
+                "Waiting up to {} s for the ccwm daemon to start…",
+                STARTUP_WAIT.as_secs()
+            );
+            told = true;
+        }
+        r
+    })
+}
+
+/// Run `attempt` until it succeeds, fails with anything but "not running", or `wait` is over
+/// (then its last error is returned). Sleeps `step`, doubling up to 500 ms, between attempts.
+pub fn retry_while_starting<T>(
+    wait: Duration,
+    step: Duration,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = std::time::Instant::now() + wait;
+    let mut delay = step;
+    loop {
+        match attempt() {
+            Err(e) if e.is_not_running() && std::time::Instant::now() + delay <= deadline => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(500));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn status() -> Result<()> {
-    let (socket, uid) = daemon_socket()?;
-    let st = client::call(&socket, uid, "service.status")?;
+    let (socket, uid, st) = first_call("service.status")?;
     print!("{}", format_status(&st));
+    if let Ok(d) = client::call(&socket, uid, "discovery.status") {
+        print!("{}", format_unreadable(&d));
+    }
     if let Some(warning) = commit_mismatch(st.get("commit").and_then(|v| v.as_str())) {
         eprintln!("warning: {warning}");
     }
@@ -133,11 +178,12 @@ pub fn format_status(v: &serde_json::Value) -> String {
         when(v, "/discovery/next_scan_at")
     ));
     out.push_str(&format!(
-        "  monitoring: {}, {} watches (budget {}), {} watched / {} polled projects{}\n",
+        "  monitoring: {}, {} watches (budget {}), projects: {} watched, {} partly watched, {} polled{}\n",
         s(v, "/monitoring/watcher"),
         s(v, "/monitoring/watches"),
         s(v, "/monitoring/budget"),
         s(v, "/monitoring/watched_projects"),
+        s(v, "/monitoring/partial_projects"),
         s(v, "/monitoring/polled_projects"),
         if v.pointer("/monitoring/degraded") == Some(&serde_json::Value::Bool(true)) {
             " (DEGRADED)"
@@ -167,11 +213,43 @@ pub fn format_status(v: &serde_json::Value) -> String {
 }
 
 /// How long `ccwm scan` waits for the scan to finish.
+/// `n folder` / `n folders`.
+pub fn folders(n: u64) -> String {
+    format!("{n} folder{}", if n == 1 { "" } else { "s" })
+}
+
+/// The folders the last scan could not read (from `discovery.status`), or nothing.
+pub fn format_unreadable(d: &serde_json::Value) -> String {
+    let count: u64 = ["permission", "vanished", "changed", "other"]
+        .iter()
+        .filter_map(|k| {
+            d.pointer(&format!("/skipped/{k}"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .sum();
+    if count == 0 {
+        return String::new();
+    }
+    let mut out = format!("  {} could not be read in the last scan:\n", folders(count));
+    let listed = d
+        .get("unreadable")
+        .and_then(|u| u.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for u in &listed {
+        out.push_str(&format!("    {} ({})\n", s(u, "/path"), s(u, "/reason")));
+    }
+    let shown = u64::try_from(listed.len()).unwrap_or(u64::MAX);
+    if count > shown {
+        out.push_str(&format!("    … and {} more\n", count - shown));
+    }
+    out
+}
+
 const SCAN_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 fn scan() -> Result<()> {
-    let (socket, uid) = daemon_socket()?;
-    let accepted = client::call(&socket, uid, "scan.refresh")?;
+    let (socket, uid, accepted) = first_call("scan.refresh")?;
     let target = accepted
         .get("done_at_scans_finished")
         .and_then(serde_json::Value::as_u64)
@@ -206,8 +284,7 @@ fn scan() -> Result<()> {
 }
 
 fn open(print_only: bool) -> Result<()> {
-    let (socket, uid) = daemon_socket()?;
-    let issued = client::call(&socket, uid, "auth.bootstrap")?;
+    let (_, _, issued) = first_call("auth.bootstrap")?;
     let token = issued.get("bootstrap_token").and_then(|v| v.as_str());
     let port = issued
         .get("port")
@@ -312,7 +389,7 @@ mod status_tests {
             "version": "0.1.0", "commit": "abc", "port": 8765, "uptime_s": 5,
             "discovery": {"phase": "idle", "last_success_at": null, "next_scan_at": 10},
             "monitoring": {"watcher": "inotify", "watches": 3, "budget": 8192, "watched_projects": 2,
-                           "polled_projects": 1, "degraded": true, "advice": ["raise it"]},
+                           "partial_projects": 4, "polled_projects": 1, "degraded": true, "advice": ["raise it"]},
             "git": {"program": "/usr/bin/git", "version": "2.43.0", "hardened_status": true},
             "sandbox": {"status": "fully_enforced", "abi": 8, "filesystem": true, "network": "tcp_only"}
         });
@@ -322,11 +399,74 @@ mod status_tests {
             "port 8765",
             "last scan unknown",
             "(DEGRADED)",
+            "2 watched, 4 partly watched, 1 polled",
             "! raise it",
             "2.43.0",
             "tcp_only",
         ] {
             assert!(t.contains(want), "{want} in {t}");
         }
+    }
+
+    #[test]
+    fn unreadable_folders_are_listed_with_correct_plurals() {
+        assert_eq!(folders(1), "1 folder");
+        assert_eq!(folders(0), "0 folders");
+        assert_eq!(folders(2), "2 folders");
+        let none = serde_json::json!({"skipped": {"permission": 0}, "unreadable": []});
+        assert_eq!(format_unreadable(&none), "");
+        let one = serde_json::json!({"skipped": {"permission": 1, "excluded": 9},
+            "unreadable": [{"path": "~/locked", "reason": "permission"}]});
+        assert_eq!(
+            format_unreadable(&one),
+            "  1 folder could not be read in the last scan:\n    ~/locked (permission)\n"
+        );
+        let many = serde_json::json!({"skipped": {"permission": 2, "vanished": 1, "changed": 1, "other": 1},
+            "unreadable": [{"path": "~/a", "reason": "permission"}, {"path": "/srv/b", "reason": "vanished"}]});
+        let t = format_unreadable(&many);
+        assert!(t.starts_with("  5 folders could not be read"), "{t}");
+        assert!(
+            t.contains("    /srv/b (vanished)\n") && t.ends_with("    … and 3 more\n"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn the_first_call_waits_only_for_a_daemon_that_is_not_running_yet() {
+        let step = Duration::from_millis(1);
+        let mut n = 0;
+        let r = retry_while_starting(Duration::from_secs(5), step, || {
+            n += 1;
+            if n < 4 {
+                Err(Error::not_running("starting"))
+            } else {
+                Ok(n)
+            }
+        });
+        assert_eq!(r.unwrap(), 4, "succeeds once the daemon answers");
+
+        let started = std::time::Instant::now();
+        let mut n = 0;
+        let r: Result<()> = retry_while_starting(Duration::from_millis(50), step, || {
+            n += 1;
+            Err(Error::not_running("never"))
+        });
+        assert!(r.unwrap_err().is_not_running());
+        assert!(
+            n > 1 && started.elapsed() < Duration::from_secs(2),
+            "gives up after the wait"
+        );
+
+        let mut n = 0;
+        let r: Result<()> = retry_while_starting(Duration::from_secs(5), step, || {
+            n += 1;
+            Err(Error::new(
+                "refusing to talk to the process on the ccwm socket",
+            ))
+        });
+        assert!(
+            r.is_err() && n == 1,
+            "other errors (e.g. an impostor) fail at once"
+        );
     }
 }

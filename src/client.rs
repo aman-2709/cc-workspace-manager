@@ -27,7 +27,7 @@ pub fn verify_peer(peer_uid: u32, expected_uid: u32) -> Result<()> {
 pub fn call(socket: &Path, expected_uid: u32, op: &str) -> Result<Value> {
     let mut stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-            Error::new(format!(
+            Error::not_running(format!(
                 "ccwm is not running (cannot reach {}). Start it with `ccwm serve`",
                 socket.display()
             ))
@@ -76,5 +76,8 @@ mod tests {
             err.contains("not running") && err.contains("ccwm serve"),
             "{err}"
         );
+        assert!(call(&t.path().join("none.sock"), 1000, "ping")
+            .unwrap_err()
+            .is_not_running());
     }
 }

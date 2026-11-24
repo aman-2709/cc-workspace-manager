@@ -66,17 +66,23 @@ environment without `DBUS_*`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK` and similar IPC
 (`{"type":"auth","token":…}`) within 5 s, otherwise the socket is closed with code 4401 and nothing
 is sent. The token is checked again whenever sessions are revoked (sign-out, `ccwm auth revoke-all`,
 the hourly purge) and every 10 s, so a socket whose token expired, was rotated out (after its 60 s
-grace) or is overdue for rotation is closed with 4401.
+grace) or is overdue for rotation is closed with 4401. Revalidation is a normal authenticated use of
+the session, so an open tab slides the session's 30-day expiry forward (intended); it cannot keep a
+token alive past the 24 h rotation rule, because an overdue token fails revalidation.
 
 **Git (REQUIREMENTS.md §6).** Only allowlisted read commands run: `--version`, `rev-parse`,
-`config --get-regexp` (filter drivers) / `config --get`, `status --porcelain=v2`, `log -1`. Each runs
-without a shell, with an empty environment plus `PATH`, `HOME`, `LC_ALL=C`, `GIT_TERMINAL_PROMPT=0`,
-`GIT_CONFIG_NOSYSTEM=1`, `GIT_OPTIONAL_LOCKS=0`, a 5 s timeout that kills the whole process group,
-at most 4 at a time, and the flags `--no-pager --no-optional-locks -c core.fsmonitor=false
--c core.untrackedCache=false -c core.hooksPath=/dev/null -c protocol.allow=never`. These flags are
-mitigations, **not a sandbox**; the Landlock ruleset (no writes, no TCP connect) also applies to
-every Git process. What was investigated, with a sentinel test for each vector Git can reach
-(`tests/git.rs`, each with a control run proving the vector executes without the mitigation):
+`config --get-regexp` (filter drivers; promisor remotes after a failed `status`) / `config --get`,
+`status --porcelain=v2`, `log -1`. Each runs without a shell, with an empty environment plus `PATH`,
+`HOME`, `LC_ALL=C`, `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_OPTIONAL_LOCKS=0`,
+`GIT_ALLOW_PROTOCOL=` (empty) and `GIT_NO_LAZY_FETCH=1`, a 5 s timeout that kills the whole process
+group, at most 4 at a time, and the flags `--no-pager --no-optional-locks -c core.fsmonitor=false
+-c core.untrackedCache=false -c core.hooksPath=/dev/null -c protocol.allow=never` plus
+`-c protocol.<name>.allow=never` for `ext`, `ssh`, `file`, `git`, `http` and `https`. These flags
+are mitigations, **not a sandbox**, and not the only line of defense: the Landlock ruleset (no
+writes, no TCP connect) also applies to every Git process, but the Git hardening must hold on its
+own where Landlock is absent or partial. What was investigated, with a sentinel test for each vector
+Git can reach (`tests/git.rs`, each with a control run, using a command ccwm runs, proving the
+vector executes without the mitigation):
 
 | Repository-controlled configuration | Reached by our commands? | Mitigation |
 |---|---|---|
@@ -87,7 +93,8 @@ every Git process. What was investigated, with a sentinel test for each vector G
 | `log.showSignature` + `gpg.program` (signature verification runs a program) | yes (`log -1`) | `--no-show-signature` |
 | `core.pager`, `pager.<cmd>` | no (no terminal) | `--no-pager` anyway |
 | `diff.external`, textconv drivers | no (no diff is produced) | — (asserted not executed) |
-| `core.sshCommand`, credential helpers, `core.askPass` | no (no network command) | `protocol.allow=never`; Landlock denies TCP connect |
+| **Promisor partial clone, lazy fetch** (M2 review H1): with an object missing, `status` and `log -1` start `git fetch` on their own, which runs the repository's transport: an `ext::` command, `remote.<name>.uploadpack` (`file://`) or `core.sshCommand` (`ssh://`). A per-protocol `protocol.<name>.allow=always` in the repository's config overrides a generic `protocol.allow=never` | yes (`status`, `log -1`) | three blocks, each sufficient alone (tested): `GIT_ALLOW_PROTOCOL=` (empty: no transport, remote helpers included; overrides all config), `-c protocol.<name>.allow=never` (outranks the repository's per-protocol value), and `GIT_NO_LAZY_FETCH=1` (no fetch child at all; Git 2.45.0+ and builds with the CVE-2024-32465 fix such as Ubuntu `1:2.43.0-1ubuntu7.1`+, ignored by older Git). The repository shows "Git status unavailable (partial clone)" |
+| `core.sshCommand`, credential helpers, `core.askPass` | only through a transport, i.e. the lazy fetch above (blocked there) | transport blocks above; Landlock denies TCP connect |
 | hooks | no (`status` runs none) | `core.hooksPath=/dev/null` |
 | `trace2.*Target` | not from repository config (Git reads trace2 settings only from system/global config and the environment) | the environment is empty; system config is not read |
 | `core.worktree` pointing elsewhere | reads only; Landlock limits what can be read | — |
@@ -100,7 +107,9 @@ filters or attributes (git-lfs, `text`/`eol` normalisation) can show a different
 own `git status`.
 
 **Monitoring.** One inotify instance with non-recursive watches on eligible directories only;
-symlinks are never followed (`IN_DONT_FOLLOW`, `IN_ONLYDIR`). File contents read by monitoring:
+symlinks are never followed (`IN_DONT_FOLLOW`). The `notify` crate asks for `IN_ONLYDIR` but, on
+`ENOTDIR`, silently retries without it; ccwm therefore checks after every watch that the path is
+still a real directory and drops the watch otherwise (tested with a regular file and a symlink). File contents read by monitoring:
 `.gitignore` files and `.git/info/exclude` (bounded, through the parent directory's descriptor), to
 evaluate ignore rules in-process; ccwm never runs `git check-ignore`. ccwm's own directories are
 never watched, so its writes never count as activity.
@@ -126,10 +135,15 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
   ever reaches HTML-parsing DOM APIs.
 - **Same-user processes** can read everything ccwm can.
 - The single-use **bootstrap fragment** briefly exists in browser history (it expires in 30 s).
-- **Watch registration by path.** Directories are listed through descriptors, but inotify watches
-  are added by path (the `notify` crate has no descriptor interface). A directory swapped for
-  another between the walk and the watch can make ccwm watch the wrong directory: events only,
-  nothing is read or written, and symlinks are never followed.
+- **Watch registration by path** (M2 review L2). Directories are listed through descriptors, but
+  inotify watches are added by path (the `notify` crate has no descriptor interface). A directory
+  swapped for another real directory between the walk and the watch can make ccwm watch the wrong
+  directory and attribute its events to the project: events only, nothing is read or written,
+  symlinks are never followed, and a swap to a regular file is caught by the directory check.
+- **Move matching is not identity** (M2 review L1). A new project is taken as a moved missing
+  project when its Git HEAD and remote (or its `CLAUDE.md` hash) match; all of these are content
+  anyone who can write in a discovery root controls, so in a shared or group-writable root another
+  user could make a directory inherit a missing project's id, history and ignore state.
 - Tests catch regressions; they cannot prove the absence of network activity. Security acceptance
   test 5 traces every `connect()` of the daemon and its Git processes with `strace` (and runs them
   in a network namespace where unprivileged user namespaces are allowed).

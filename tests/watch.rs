@@ -19,15 +19,19 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-/// Records watches; fails with `KernelLimit` once `kernel_max` watches exist.
+/// Records watches; fails with `KernelLimit` once `kernel_max` watches exist. `attempts` counts
+/// every call, refused or not.
 #[derive(Clone, Default)]
 struct Fake {
     watched: Arc<Mutex<HashSet<PathBuf>>>,
     kernel_max: Option<usize>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl WatchBackend for Fake {
     fn watch(&mut self, dir: &Path) -> Result<(), WatchError> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut w = self.watched.lock().unwrap();
         if self.kernel_max.is_some_and(|m| w.len() >= m) {
             return Err(WatchError::KernelLimit);
@@ -125,6 +129,7 @@ impl Fx {
                 max_depth: 10,
                 same_file_system: true,
                 git_aware: true,
+                repo_root: None,
                 now: i64::MAX,
                 max_entries: tree::MAX_ENTRIES,
             },
@@ -277,61 +282,214 @@ async fn non_recursive_watches_only_on_eligible_directories() {
     assert_eq!(f.shared.of("p"), Some((Monitoring::Watched, None)));
 }
 
+impl Fx {
+    fn mode(&self, id: &str) -> (Monitoring, Option<PollReason>) {
+        self.shared.of(id).unwrap()
+    }
+
+    /// Unwatched subtree roots of a partly watched project, relative to the home directory.
+    fn subtrees(&self, id: &str) -> Vec<String> {
+        self.shared
+            .poll_target(id)
+            .map(|t| {
+                t.subtrees
+                    .iter()
+                    .map(|d| {
+                        d.strip_prefix(&self.home)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[tokio::test]
-async fn the_budget_goes_to_roots_first_and_the_rest_is_polled() {
+async fn the_budget_goes_breadth_first_and_only_unwatched_subtrees_are_polled() {
+    // Budget 3: both roots and their parent. Both projects are *partly* watched (live at the
+    // root), not polled as a whole; the unwatched subtrees are what reconciliation checks.
     let mut f = fx_with(3, Some(Fake::default()));
-    let a = f.project("a", &["s1/x", "s2/x"]);
+    let a = f.project("a", &["s1/x", "s2/deep/y"]);
     let b = f.project("b", &["s1/x"]);
-    // `a` is the most recently active (first in the plan).
-    f.plan(&[("a", &a), ("b", &b)]);
-    let w = f.watched();
-    assert!(
-        w.contains(&"a".to_string()) && w.contains(&"b".to_string()),
-        "{w:?}"
-    );
-    assert_eq!(w.len(), 3);
+    f.plan(&[("a", &a), ("b", &b)]); // `a` is the most recently active (first)
+    assert_eq!(f.watched(), ["", "a", "b"]);
+    assert_eq!(f.mode("a"), (Monitoring::Partial, Some(PollReason::Budget)));
+    assert_eq!(f.mode("b"), (Monitoring::Partial, Some(PollReason::Budget)));
     assert_eq!(
-        f.shared.of("a").unwrap(),
-        (Monitoring::Polled, Some(PollReason::Budget))
+        f.subtrees("a"),
+        ["a/.git", "a/s1", "a/s2"],
+        "a/s2/deep is inside a/s2"
     );
-    assert_eq!(
-        f.shared.of("b").unwrap(),
-        (Monitoring::Polled, Some(PollReason::Budget))
-    );
+    assert_eq!(f.subtrees("b"), ["b/.git", "b/s1"]);
     let st = f.shared.snapshot();
-    assert!(st.degraded && st.polled_projects == 2);
+    assert!(st.degraded);
+    assert_eq!(
+        (st.watched_projects, st.partial_projects, st.polled_projects),
+        (0, 2, 0)
+    );
     assert!(
         st.advice.iter().any(|a| a.contains("budget")),
         "{:?}",
         st.advice
     );
 
-    // With room for one project completely, the first one is watched and the second polled.
-    let mut f = fx_with(6, Some(Fake::default()));
-    let a = f.project("a", &["s1/x"]);
+    // Room for every root, the parent and every top-level directory, not for `a/s2/deep`.
+    let mut f = fx_with(8, Some(Fake::default()));
+    let a = f.project("a", &["s1/x", "s2/deep/y"]);
     let b = f.project("b", &["s1/x"]);
     f.plan(&[("a", &a), ("b", &b)]);
-    assert_eq!(f.shared.of("a").unwrap().0, Monitoring::Watched);
     assert_eq!(
-        f.shared.of("b").unwrap(),
-        (Monitoring::Polled, Some(PollReason::Budget))
+        f.mode("b"),
+        (Monitoring::Watched, None),
+        "b's top level fits before a's depth"
+    );
+    assert_eq!(f.mode("a"), (Monitoring::Partial, Some(PollReason::Budget)));
+    assert_eq!(f.subtrees("a"), ["a/s2/deep"]);
+    assert!(f.shared.poll_target("b").is_none());
+}
+
+#[tokio::test]
+async fn deeper_directories_go_to_the_most_recent_project_first() {
+    // Roots 2 + parent 1 + top level (.git, d) 2 each = 7; one more for the deeper level.
+    let mut f = fx_with(8, Some(Fake::default()));
+    let old = f.project("old", &["d/e/x"]);
+    let new = f.project("new", &["d/e/x"]);
+    f.plan(&[("new", &new), ("old", &old)]);
+    assert_eq!(f.mode("new"), (Monitoring::Watched, None));
+    assert_eq!(
+        f.mode("old"),
+        (Monitoring::Partial, Some(PollReason::Budget))
+    );
+    assert_eq!(f.subtrees("old"), ["old/d/e"]);
+}
+
+/// The real-home failure: one huge project used to take the whole budget and every other
+/// project was polled. Now every small project gets its root and top-level directories first.
+#[tokio::test]
+async fn one_huge_project_cannot_starve_the_small_ones() {
+    let mut f = fx_with(150, Some(Fake::default()));
+    let mut files: Vec<String> = (0..50).map(|i| format!("d{i:02}/a/b/c/f")).collect();
+    files.push("top.txt".into());
+    let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+    let huge = f.project("dev/huge", &refs); // 1 + .git + 50 + 150 directories
+    let small: Vec<PathBuf> = (0..20)
+        .map(|i| f.project(&format!("dev/small{i:02}"), &["src/x"]))
+        .collect();
+    let ids: Vec<String> = (0..20).map(|i| format!("s{i}")).collect();
+    let mut plan: Vec<(&str, &Path)> = vec![("huge", &huge)]; // the most recent
+    plan.extend(
+        ids.iter()
+            .map(String::as_str)
+            .zip(small.iter().map(PathBuf::as_path)),
+    );
+    f.plan(&plan);
+
+    for id in &ids {
+        assert_eq!(f.mode(id), (Monitoring::Watched, None), "{id}");
+    }
+    assert_eq!(
+        f.mode("huge"),
+        (Monitoring::Partial, Some(PollReason::Budget))
+    );
+    let w = f.watched();
+    assert_eq!(w.len(), 150);
+    for i in 0..50 {
+        assert!(
+            w.contains(&format!("dev/huge/d{i:02}")),
+            "top level d{i:02} of the huge project"
+        );
+    }
+    let subtrees = f.subtrees("huge");
+    assert!(!subtrees.is_empty());
+    for s in &subtrees {
+        assert!(!w.contains(s), "{s} is watched but listed as unwatched");
+        assert!(
+            Path::new(s).components().count() >= 4,
+            "only deeper levels: {s}"
+        );
+        assert!(
+            !subtrees
+                .iter()
+                .any(|o| o != s && Path::new(s).starts_with(o)),
+            "{s} is inside another listed subtree"
+        );
+    }
+    let st = f.shared.snapshot();
+    assert_eq!(
+        (st.watched_projects, st.partial_projects, st.polled_projects),
+        (20, 1, 0)
     );
 }
 
 #[tokio::test]
+async fn retrying_unwatched_subtrees_settles_the_project_once_they_fit() {
+    let mut f = fx_with(5, Some(Fake::default()));
+    let a = f.project("a", &["s1/x"]);
+    let b = f.project("b", &[]);
+    f.plan(&[("b", &b), ("a", &a)]); // roots a, b, parent, b/.git, a/.git = 5
+    assert_eq!(f.subtrees("a"), ["a/s1"]);
+    // Nothing freed yet: the retry is refused again and the subtree stays listed.
+    let retry = |f: &mut Fx| {
+        let dirs = vec![a.join("s1")];
+        f.monitor.on_cmd(Cmd::Retry {
+            id: "a".into(),
+            roots: dirs.clone(),
+            dirs,
+        });
+    };
+    retry(&mut f);
+    assert_eq!(f.mode("a"), (Monitoring::Partial, Some(PollReason::Budget)));
+    assert_eq!(f.subtrees("a"), ["a/s1"]);
+    // `b` goes away (its watches are freed): the retry succeeds and `a` is fully watched.
+    f.monitor.on_cmd(Cmd::Remove("b".into()));
+    retry(&mut f);
+    assert_eq!(f.mode("a"), (Monitoring::Watched, None));
+    assert!(f.shared.poll_target("a").is_none());
+    // A retried subtree that vanished is forgotten.
+    let mut f = fx_with(4, Some(Fake::default()));
+    let a = f.project("a", &["s1/x", "s2/x"]);
+    f.plan(&[("a", &a)]); // a, parent, .git, s1
+    assert_eq!(f.subtrees("a"), ["a/s2"]);
+    f.monitor.on_cmd(Cmd::Retry {
+        id: "a".into(),
+        roots: vec![a.join("s2")],
+        dirs: vec![],
+    });
+    assert_eq!(f.mode("a"), (Monitoring::Watched, None));
+}
+
+#[tokio::test]
+async fn removing_an_unwatched_subtree_settles_the_project() {
+    let mut f = fx_with(4, Some(Fake::default()));
+    let a = f.project("a", &["s1/x", "s2/x"]);
+    f.plan(&[("a", &a)]);
+    assert_eq!(f.subtrees("a"), ["a/s2"]);
+    fs::remove_dir_all(a.join("s2")).unwrap();
+    f.event(EventKind::Remove(RemoveKind::Folder), &[&a.join("s2")]);
+    assert_eq!(f.mode("a"), (Monitoring::Watched, None));
+}
+
+#[tokio::test]
 async fn kernel_limits_and_a_missing_inotify_instance_mean_polled_mode() {
-    let mut f = fx_with(
-        1000,
-        Some(Fake {
-            kernel_max: Some(2),
-            ..Fake::default()
-        }),
-    );
-    let a = f.project("a", &["s/x"]);
+    // The kernel refuses after two watches: the root is live, the rest is polled, and the
+    // kernel is not asked again for every remaining directory.
+    let fake = Fake {
+        kernel_max: Some(2),
+        ..Fake::default()
+    };
+    let mut f = fx_with(1000, Some(fake.clone()));
+    let a = f.project("a", &["s/x", "t/x", "u/x/y"]);
     f.plan(&[("a", &a)]);
     assert_eq!(
-        f.shared.of("a").unwrap(),
-        (Monitoring::Polled, Some(PollReason::KernelLimit))
+        f.mode("a"),
+        (Monitoring::Partial, Some(PollReason::KernelLimit))
+    );
+    assert_eq!(
+        fake.attempts.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "root, parent, then one refused attempt"
     );
     assert!(f
         .shared
@@ -340,16 +498,58 @@ async fn kernel_limits_and_a_missing_inotify_instance_mean_polled_mode() {
         .iter()
         .any(|a| a.contains("max_user_watches")));
 
+    // No watch at all: the project is polled as a whole.
+    let mut f = fx_with(
+        1000,
+        Some(Fake {
+            kernel_max: Some(0),
+            ..Fake::default()
+        }),
+    );
+    let a = f.project("a", &["s/x"]);
+    f.plan(&[("a", &a)]);
+    assert_eq!(
+        f.mode("a"),
+        (Monitoring::Polled, Some(PollReason::KernelLimit))
+    );
+    assert!(
+        f.shared.poll_target("a").is_none(),
+        "polled projects are walked whole"
+    );
+    assert_eq!(f.shared.snapshot().polled_projects, 1);
+
     let mut f = fx_with(1000, None);
     let a = f.project("a", &[]);
     f.plan(&[("a", &a)]);
     let st = f.shared.snapshot();
     assert_eq!(st.watcher, "unavailable");
     assert_eq!(
-        f.shared.of("a").unwrap(),
+        f.mode("a"),
         (Monitoring::Polled, Some(PollReason::WatcherUnavailable))
     );
     assert!(st.degraded && st.watches == 0);
+}
+
+/// §5.1: gitignored directories are never watched, including ones created at runtime (walked
+/// with the project's rules, not from scratch).
+#[tokio::test]
+async fn gitignored_directories_are_never_watched_even_when_created_later() {
+    let mut f = fx();
+    let p = f.project("p", &["src/a", "logs/today/x", "src/gen/out/x"]);
+    fs::write(p.join(".gitignore"), "logs/\nout/\n").unwrap();
+    f.plan(&[("p", &p)]);
+    assert_eq!(f.watched(), ["", "p", "p/.git", "p/src", "p/src/gen"]);
+    // A new directory with an ignored subdirectory appears.
+    fs::create_dir_all(p.join("tools/out/deep")).unwrap();
+    fs::create_dir_all(p.join("tools/keep")).unwrap();
+    f.event(EventKind::Create(CreateKind::Folder), &[&p.join("tools")]);
+    f.drain_cmds().await;
+    let w = f.watched();
+    assert!(
+        w.contains(&"p/tools".to_string()) && w.contains(&"p/tools/keep".to_string()),
+        "{w:?}"
+    );
+    assert!(!w.iter().any(|d| d.contains("out")), "{w:?}");
 }
 
 #[tokio::test]

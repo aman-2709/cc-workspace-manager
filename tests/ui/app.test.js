@@ -57,6 +57,7 @@ test("describeDiscovery counts directories that changed during the walk as probl
 // ---- M2 helpers -----------------------------------------------------------------------------------
 const {
   readPrefs, buildQuery, withView, withSort, relativeTime, gitSummary, paginate, reconnectDelay, wsUrl, PREFS_KEY, DEFAULT_QUERY,
+  plural, describeUnreadable, degradedSummary, truncatePath, calendarDaysAgo,
 } = require("../../web/app.js");
 
 const storage = (v) => ({ getItem: (k) => (k === PREFS_KEY ? v : null) });
@@ -100,16 +101,80 @@ test("column sorting starts in the natural order and flips on the second click",
   assert.deepStrictEqual([s.sort, s.order], ["commit", "desc"]);
 });
 
-test("relative times", () => {
+test("relative times count calendar days, like the activity status", () => {
   const now = 1_800_000_000;
   assert.strictEqual(relativeTime(null, now), "unknown");
-  assert.strictEqual(relativeTime(now - 5, now), "just now");
-  assert.strictEqual(relativeTime(now + 100, now), "just now", "future times are not negative");
-  assert.strictEqual(relativeTime(now - 300, now), "5 min ago");
-  assert.strictEqual(relativeTime(now - 7200, now), "2 h ago");
-  assert.strictEqual(relativeTime(now - 86400, now), "yesterday");
-  assert.strictEqual(relativeTime(now - 3 * 86400, now), "3 days ago");
-  assert.strictEqual(relativeTime(now - 21 * 86400, now), "3 weeks ago");
+  assert.strictEqual(relativeTime(now - 5, now, 0), "just now");
+  assert.strictEqual(relativeTime(now + 100, now, 0), "just now", "future times are not negative");
+  assert.strictEqual(relativeTime(now - 300, now, 0), "5 min ago");
+  assert.strictEqual(relativeTime(now - 7200, now, 0), "2 h ago");
+  assert.strictEqual(relativeTime(now - 86400, now, 1), "yesterday");
+  assert.strictEqual(relativeTime(now - 3 * 86400, now, 3), "3 days ago");
+  assert.strictEqual(relativeTime(now - 21 * 86400, now, 21), "3 weeks ago");
+  assert.strictEqual(relativeTime(now + 9999, now, -1), "just now", "a negative day count is today");
+});
+
+test("the 6/7-day boundary at a non-midnight time agrees with the bucket", () => {
+  // The real-home report: 6.46 × 24 h ago is 7 calendar days ago, Inactive, not "6 days ago".
+  const now = 1_782_828_000; // 2026-06-30 10:00 EDT
+  const at = now - 155 * 3600; // 2026-06-23 23:00 EDT
+  assert.strictEqual(relativeTime(at, now, 7), "7 days ago", "the server's calendar days win");
+  assert.notStrictEqual(relativeTime(at, now, 7), "6 days ago");
+  assert.strictEqual(relativeTime(now - 153 * 3600, now, 6), "6 days ago");
+  // A minute after midnight, a change two minutes earlier was yesterday, as its bucket says.
+  assert.strictEqual(relativeTime(now - 120, now, 1), "yesterday");
+});
+
+test("local calendar days in the browser (fallback without days_ago)", () => {
+  const t = (y, m, d, h, min = 0) => new Date(y, m - 1, d, h, min).getTime() / 1000;
+  assert.strictEqual(calendarDaysAgo(t(2026, 6, 23, 23), t(2026, 6, 30, 10)), 7);
+  assert.strictEqual(calendarDaysAgo(t(2026, 6, 24, 0, 30), t(2026, 6, 30, 10)), 6);
+  assert.strictEqual(calendarDaysAgo(t(2026, 6, 29, 23, 59), t(2026, 6, 30, 0, 1)), 1);
+  assert.strictEqual(calendarDaysAgo(t(2026, 6, 30, 9), t(2026, 6, 30, 10)), 0);
+  assert.strictEqual(calendarDaysAgo(t(2026, 7, 1, 9), t(2026, 6, 30, 10)), 0, "future: today");
+  assert.strictEqual(relativeTime(t(2026, 6, 23, 23), t(2026, 6, 30, 10)), "7 days ago");
+});
+
+test("paths are shortened at a / boundary, keeping the end", () => {
+  const p = "~/dev/clients/acme/services/api";
+  assert.strictEqual(truncatePath(p, 100), p);
+  assert.strictEqual(truncatePath(p, p.length), p);
+  assert.strictEqual(truncatePath(p, p.length - 1), "…/clients/acme/services/api");
+  assert.strictEqual(truncatePath(p, 16), "…/services/api");
+  assert.strictEqual(truncatePath(p, 15), "…/services/api");
+  assert.strictEqual(truncatePath(p, 13), "…/api");
+  assert.strictEqual(truncatePath(p, 3), "…/api", "the last component is always whole");
+  assert.strictEqual(truncatePath("/srv/code/x", 8), "…/code/x");
+  assert.strictEqual(truncatePath("/srv/x", 6), "/srv/x");
+  assert.strictEqual(truncatePath("a-very-long-name", 4), "a-very-long-name", "no / to cut at");
+  for (const max of [5, 10, 20, 25]) {
+    const out = truncatePath(p, max);
+    assert.ok(out === p || out.startsWith("…/"), out);
+    assert.ok(p.endsWith(out.replace(/^…/, "")), `${out} is a /-aligned tail`);
+  }
+});
+
+test("folder counts are pluralized and the unreadable folders listed", () => {
+  assert.strictEqual(plural(1, "folder"), "1 folder");
+  assert.strictEqual(plural(0, "folder"), "0 folders");
+  assert.match(describeDiscovery({ phase: "idle", skipped: { permission: 1 }, last_success_at: 1 }), /, 1 folder could not be read$/);
+  assert.match(describeDiscovery({ phase: "scanning", dirs_visited: 1, projects_found: 1 }), /1 folder checked, 1 project found/);
+  assert.strictEqual(describeUnreadable({ skipped: {} }), "");
+  assert.strictEqual(describeUnreadable(null), "");
+  const st = { skipped: { permission: 2, vanished: 1 }, unreadable: [{ path: "~/a", reason: "permission" }, { path: "~/b", reason: "vanished" }] };
+  assert.strictEqual(describeUnreadable(st), "Could not be read in the last scan:\n~/a (permission)\n~/b (vanished)\n… and 1 more");
+});
+
+test("the degraded banner has a one-line summary", () => {
+  assert.strictEqual(degradedSummary(null), "");
+  assert.strictEqual(degradedSummary({ degraded: false, partial_projects: 3 }), "");
+  assert.strictEqual(degradedSummary({ degraded: true, partial_projects: 1, polled_projects: 0 }), "Monitoring is degraded: 1 project partly watched.");
+  assert.strictEqual(
+    degradedSummary({ degraded: true, watcher: "inotify", partial_projects: 5, polled_projects: 2, recovering_overflow: true }),
+    "Monitoring is degraded: 5 projects partly watched, 2 projects checked only at each scan, catching up after lost file events.",
+  );
+  assert.strictEqual(degradedSummary({ degraded: true, watcher: "unavailable", polled_projects: 1 }), "Monitoring is degraded: no inotify instance, 1 project checked only at each scan.");
+  assert.ok(!degradedSummary({ degraded: true, partial_projects: 9 }).includes("\n"));
 });
 
 test("git summaries never invent values", () => {
@@ -120,6 +185,8 @@ test("git summaries never invent values", () => {
   assert.strictEqual(gitSummary({ state: "ok", detached: true, staged: 0, modified: 0, untracked: 0 }), "detached HEAD: clean");
   assert.match(gitSummary({ state: "status_disabled_old_git", branch: "dev" }), /dev: status disabled, Git too old/);
   assert.match(gitSummary({ state: "unsafe_repository" }), /safe\.directory/);
+  assert.strictEqual(gitSummary({ state: "partial_clone", branch: "main" }), "main: Git status unavailable (partial clone)");
+  assert.strictEqual(gitSummary({ state: "partial_clone" }), "Git status unavailable (partial clone)");
 });
 
 test("table pagination clamps the page", () => {

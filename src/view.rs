@@ -12,6 +12,9 @@ use std::path::Path;
 pub struct ActivityView {
     pub status: Status,
     pub at: Option<i64>,
+    /// Local calendar days since `at` (0 = today; never negative), from the same calculation as
+    /// `status`, so the UI's "N days ago" always agrees with the bucket. `null` when unknown.
+    pub days_ago: Option<i64>,
     /// `inferred` (file times from a walk) or `observed` (live events).
     pub kind: Option<String>,
     /// The latest modified file, relative to the project.
@@ -56,7 +59,8 @@ pub struct ProjectView {
     pub git: Option<GitView>,
     pub missing_since: Option<i64>,
     pub ignored: bool,
-    /// `watched`, `polled`, or `null` when not monitored (ignored, missing, not yet set up).
+    /// `watched`, `partial` (root live, some subtrees checked at each scan), `polled` (checked
+    /// at each scan), or `null` when not monitored (ignored, missing, not yet set up).
     pub monitoring: Option<Monitoring>,
     pub monitoring_reason: Option<PollReason>,
 }
@@ -142,6 +146,10 @@ pub fn project_view(
         activity: ActivityView {
             status: classifier.status(row.activity_at, now),
             at: row.activity_at,
+            days_ago: row
+                .activity_at
+                .and_then(|at| classifier.days_ago(at, now))
+                .map(|d| d.max(0)),
             kind: row.activity_kind.clone(),
             path: row.activity_path.clone(),
         },
@@ -217,5 +225,52 @@ mod tests {
         let d = git_detail(&git(Some(1)));
         assert_eq!(d.head.unwrap().short.len(), 12);
         assert_eq!(d.files.unwrap()["staged"][0], "x");
+    }
+
+    #[test]
+    fn days_ago_comes_from_the_same_calendar_calculation_as_the_status() {
+        use jiff::tz::TimeZone;
+        let c = Classifier::new(
+            TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").unwrap(),
+            &crate::config::ActivityConfig::default(),
+        );
+        // 2026-06-30 10:00 EDT; the change was 2026-06-23 23:00 EDT (6.46 × 24 h earlier).
+        let now = 1_782_828_000;
+        let row = |at: Option<i64>| ProjectRow {
+            id: "a".repeat(32),
+            sort_key: "p".into(),
+            k1: 0,
+            name: "p".into(),
+            path: "/home/u/p".into(),
+            sources: vec!["marker".into()],
+            first_seen_at: 0,
+            activity_at: at,
+            activity_kind: Some("observed".into()),
+            activity_path: None,
+            missing_since: None,
+            ignored: false,
+            git: None,
+        };
+        let v = project_view(
+            &row(Some(now - 155 * 3600)),
+            &c,
+            now,
+            Path::new("/home/u"),
+            None,
+        );
+        assert_eq!(v.activity.days_ago, Some(7));
+        assert_eq!(v.activity.status, Status::Inactive);
+        let v = project_view(&row(Some(now + 3600)), &c, now, Path::new("/home/u"), None);
+        assert_eq!(
+            v.activity.days_ago,
+            Some(0),
+            "future times count as today, never negative"
+        );
+        assert_eq!(v.activity.status, Status::Today);
+        let v = project_view(&row(None), &c, now, Path::new("/home/u"), None);
+        assert_eq!(
+            (v.activity.days_ago, v.activity.status),
+            (None, Status::Unknown)
+        );
     }
 }

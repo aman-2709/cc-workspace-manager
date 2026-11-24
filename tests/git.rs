@@ -4,12 +4,14 @@
 //! operation) and **4** (malicious configurations cannot execute commands: each vector writes a
 //! sentinel file that must not appear). Every vector Git can reach with our commands has a
 //! **control** run with plain Git that proves the sentinel would appear without the mitigations.
+//! Promisor partial clones (a lazy fetch during `status`/`log` reaching `ext::`, `uploadpack` or
+//! `core.sshCommand`) are covered with the `HEAD` object removed.
 //! Skipped with a notice if `git` is not installed (a failure in CI).
 
 mod common;
 
 use cc_workspace_manager::git::{find_on_path, Git, State};
-use common::snapshot;
+use common::{snapshot, Promisor, PROMISORS};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -101,15 +103,7 @@ impl Fx {
 
     /// Like [`Self::sentinel_script`] with a custom body after the `touch`.
     fn sentinel_script_with(&self, name: &str, body: &str) -> (PathBuf, PathBuf) {
-        let sentinel = self.sentinels.join(format!("{name}.ran"));
-        let script = self.sentinels.join(format!("{name}.sh"));
-        fs::write(
-            &script,
-            format!("#!/bin/sh\ntouch '{}'\n{body}\n", sentinel.display()),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        (script, sentinel)
+        common::sentinel_script(&self.sentinels, name, body)
     }
 
     /// Make `file.txt` stat-dirty (same content, new mtime) so status must re-hash it, which is
@@ -565,28 +559,23 @@ fn acceptance_4_includes_and_include_if_pulling_in_vectors_are_neutralized() {
     assert!(!flt_sentinel.exists(), "include/includeIf filter executed");
 }
 
+/// `diff.external`, textconv and the pager are reached only by commands ccwm never runs (`diff`,
+/// a terminal); the controls prove the vectors are live. (`core.sshCommand` is reached by
+/// `status` through a promisor lazy fetch: see the partial-clone tests below.)
 #[test]
-fn acceptance_4_diff_external_textconv_pager_and_ssh_command_are_not_reached() {
+fn acceptance_4_diff_external_textconv_and_pager_are_not_reached() {
     let Some(f) = fx() else { return };
     let r = f.repo("r");
     let (ext, ext_s) = f.sentinel_script("diff-external");
     let (tc, tc_s) = f.sentinel_script("textconv");
     let (pager, pager_s) = f.sentinel_script("pager");
-    // An ssh stand-in must not wait for input: git would wait for it in turn.
-    let (ssh, ssh_s) = f.sentinel_script_with("ssh", "exit 1");
     f.git(&r, &["config", "diff.external", ext.to_str().unwrap()]);
     f.git(&r, &["config", "diff.tc.textconv", tc.to_str().unwrap()]);
     f.git(&r, &["config", "core.pager", pager.to_str().unwrap()]);
     f.git(&r, &["config", "pager.status", "true"]);
-    f.git(&r, &["config", "core.sshCommand", ssh.to_str().unwrap()]);
-    f.git(
-        &r,
-        &["remote", "add", "origin", "ssh://git@example.invalid/x.git"],
-    );
     fs::write(r.join(".gitattributes"), "* diff=tc\n").unwrap();
     fs::write(r.join("file.txt"), "changed\n").unwrap();
 
-    // Controls: these commands reach the vectors (no network: the ssh "client" is the script).
     let _ = f.git_cmd(&r, &["diff"]);
     assert!(ext_s.exists(), "control: git diff runs diff.external");
     let _ = f.git_cmd(&r, &["diff", "--no-ext-diff"]);
@@ -594,18 +583,154 @@ fn acceptance_4_diff_external_textconv_pager_and_ssh_command_are_not_reached() {
         tc_s.exists(),
         "control: git diff --textconv runs the textconv driver"
     );
-    let _ = f.git_cmd(&r, &["ls-remote", "origin"]);
-    assert!(ssh_s.exists(), "control: ls-remote runs core.sshCommand");
-    for s in [&ext_s, &tc_s, &ssh_s] {
+    for s in [&ext_s, &tc_s] {
         fs::remove_file(s).unwrap();
     }
     for (s, what) in [
         (&ext_s, "diff.external"),
         (&tc_s, "textconv"),
         (&pager_s, "core.pager / pager.status"),
-        (&ssh_s, "core.sshCommand"),
     ] {
         assert_not_executed(&f, &r, s, what);
+    }
+}
+
+impl Fx {
+    /// A promisor partial clone whose `HEAD` commit object was removed, so `status` and `log -1`
+    /// need an object only the promisor remote has. Returns the repository and the sentinel.
+    fn promisor_repo(&self, vector: Promisor) -> (PathBuf, PathBuf) {
+        let name = format!("{vector:?}").to_lowercase();
+        let r = self.repo(&format!("promisor-{name}"));
+        // A helper that records it ran and fails at once (Git must not wait for it).
+        let (script, sentinel) = self.sentinel_script_with(&format!("promisor-{name}"), "exit 1");
+        common::make_promisor(&r, vector, &script, &|args| self.git(&r, args));
+        (r, sentinel)
+    }
+
+    /// Plain Git (no ccwm hardening) plus the given environment and options: `status`, then the
+    /// `log -1` ccwm runs. Used for controls and to check each defense on its own.
+    fn status_and_log_with(&self, dir: &Path, env: &[(&str, &str)], opts: &[&str]) {
+        for args in [
+            &["status", "--porcelain=v2", "--branch", "-z", "--", "."][..],
+            &[
+                "log",
+                "-1",
+                "--no-show-signature",
+                "--no-notes",
+                "--format=%H",
+            ][..],
+        ] {
+            let mut c = Command::new("git");
+            c.env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &self.home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("LC_ALL", "C")
+                .envs(env.iter().copied())
+                .current_dir(dir)
+                .args(opts)
+                .args(args)
+                .stdin(std::process::Stdio::null());
+            let _ = c.output().unwrap(); // fails either way: the object is missing
+        }
+    }
+}
+
+/// Security acceptance test 4, promisor vector: with the `HEAD` object missing, plain `status`
+/// (a command ccwm runs) lazily fetches through the repository's transport and executes the
+/// helper; ccwm's `status`/`log` never do, and report the degraded `partial_clone` state.
+#[test]
+fn acceptance_4_promisor_lazy_fetch_never_runs_a_transport() {
+    let Some(f) = fx() else { return };
+    for vector in PROMISORS {
+        let (r, sentinel) = f.promisor_repo(vector);
+        f.status_and_log_with(&r, &[], &[]);
+        assert!(
+            sentinel.exists(),
+            "control ({vector:?}): plain git status/log runs the promisor transport"
+        );
+        fs::remove_file(&sentinel).unwrap();
+        assert_not_executed(&f, &r, &sentinel, &format!("promisor {vector:?}"));
+        let info = f.ccwm_git().inspect(&r);
+        assert!(
+            !sentinel.exists(),
+            "{vector:?}: executed on a second inspection"
+        );
+        assert_eq!(info.state, State::PartialClone, "{vector:?}");
+        assert!(info.worktree.is_none() && info.head.is_none(), "{vector:?}");
+        assert_eq!(info.branch.as_deref(), Some("main"), "{vector:?}");
+        assert!(
+            info.remote_url.is_some(),
+            "{vector:?}: the remote is still read"
+        );
+    }
+}
+
+/// Defense in depth: each of the three transport blocks stops every promisor vector on its own
+/// (the per-protocol `-c` denies, the empty `GIT_ALLOW_PROTOCOL`, and `GIT_NO_LAZY_FETCH`, the
+/// last only where this Git honors it).
+#[test]
+fn each_transport_block_alone_stops_the_promisor_vectors() {
+    let Some(f) = fx() else { return };
+    let protocol_denies: Vec<&str> = cc_workspace_manager::git::BASE_ARGS
+        .windows(2)
+        .filter(|w| w[0] == "-c" && w[1].starts_with("protocol."))
+        .flat_map(|w| [w[0], w[1]])
+        .collect();
+    let honors_no_lazy_fetch = {
+        let Some(probe) = fx() else { return };
+        let (r, _) = probe.promisor_repo(Promisor::Ext);
+        let out = Command::new("git")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &probe.home)
+            .env("LC_ALL", "C")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .current_dir(&r)
+            .args(["log", "-1"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).contains("lazy fetching disabled")
+    };
+    if !honors_no_lazy_fetch {
+        eprintln!("NOTICE: this Git ignores GIT_NO_LAZY_FETCH; checking the other two blocks only");
+    }
+    /// One defense: its name, the environment it adds and the options it adds.
+    struct Layer<'a> {
+        what: &'a str,
+        env: Vec<(&'a str, &'a str)>,
+        opts: Vec<&'a str>,
+    }
+    let mut layers = vec![
+        Layer {
+            what: "-c protocol.<name>.allow=never",
+            env: vec![],
+            opts: protocol_denies,
+        },
+        Layer {
+            what: "GIT_ALLOW_PROTOCOL=",
+            env: vec![("GIT_ALLOW_PROTOCOL", "")],
+            opts: vec![],
+        },
+    ];
+    if honors_no_lazy_fetch {
+        layers.push(Layer {
+            what: "GIT_NO_LAZY_FETCH=1",
+            env: vec![("GIT_NO_LAZY_FETCH", "1")],
+            opts: vec![],
+        });
+    }
+    for vector in PROMISORS {
+        let (r, sentinel) = f.promisor_repo(vector);
+        for l in &layers {
+            f.status_and_log_with(&r, &l.env, &l.opts);
+            assert!(
+                !sentinel.exists(),
+                "{} alone did not stop {vector:?}",
+                l.what
+            );
+        }
     }
 }
 

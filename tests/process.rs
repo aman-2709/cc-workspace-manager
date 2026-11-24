@@ -635,6 +635,51 @@ fn open_without_any_runtime_directory_explains_how_to_start_the_daemon() {
     );
 }
 
+/// `ccwm open` / `status` / `scan` wait (up to ~5 s) for a daemon that is still starting
+/// instead of failing at once; with no daemon at all they fail after the wait.
+#[test]
+fn cli_commands_wait_for_a_daemon_that_is_still_starting() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 1).unwrap();
+    let started = Instant::now();
+    let out = command(&env).arg("status").output().unwrap();
+    let waited = started.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("Waiting up to 5 s") && err.contains("is the daemon running"),
+        "{err}"
+    );
+    assert!(
+        waited >= Duration::from_secs(4) && waited < Duration::from_secs(10),
+        "{waited:?}"
+    );
+
+    // Started before the daemon: it waits and then succeeds.
+    for op in [&["status"][..], &["open", "--print"][..]] {
+        let cli = command(&env)
+            .args(op)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let d = Daemon::start(&env, &[]);
+        let out = cli.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{op:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            text.contains("ccwm daemon") || text.contains("#bt="),
+            "{op:?}: {text}"
+        );
+        assert_eq!(d.stop().0, Some(0));
+    }
+}
+
 #[test]
 fn serve_refuses_unsafe_directories() {
     let t = common::tempdir();
@@ -1215,6 +1260,106 @@ fn the_connect_log_classifier_flags_every_non_loopback_connect() {
     assert_eq!(pids, ["104", "105", "107", "108"], "{bad:#?}");
 }
 
+/// Every `execve` attempt in an strace log: `(path, argv)`. strace prints C-style quoted strings;
+/// escapes are kept verbatim (enough to compare program names and subcommands). An argument
+/// list strace abbreviated (`...`) ends early; the caller treats a missing subcommand as a
+/// violation.
+fn execs(log: &str) -> Vec<(String, Vec<String>)> {
+    fn quoted(s: &str) -> Option<(String, &str)> {
+        let rest = s.strip_prefix('"')?;
+        let mut out = String::new();
+        let mut chars = rest.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => out.push(chars.next()?.1),
+                '"' => return Some((out, &rest[i + 1..])),
+                c => out.push(c),
+            }
+        }
+        None
+    }
+    log.lines()
+        .filter_map(|l| {
+            let (_, call) = l.split_once("execve(")?;
+            let (path, mut rest) = quoted(call)?;
+            rest = rest.strip_prefix(", [")?;
+            let mut argv = Vec::new();
+            while let Some((arg, after)) = quoted(rest) {
+                argv.push(arg);
+                rest = after.strip_prefix(", ").unwrap_or(after);
+            }
+            Some((path, argv))
+        })
+        .collect()
+}
+
+/// Git subcommands ccwm runs (REQUIREMENTS.md §6). Anything else Git starts on its own (a lazy
+/// `fetch`, `remote-*` helpers) is a violation.
+const ALLOWED_GIT_SUBCOMMANDS: [&str; 5] = ["--version", "rev-parse", "status", "log", "config"];
+
+/// The first argument that is not a global option (`-c k=v`, `-C dir`, `--flag[=v]`).
+fn git_subcommand(argv: &[String]) -> Option<&str> {
+    let mut it = argv.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-c" | "-C" => {
+                it.next();
+            }
+            "--version" => return Some("--version"),
+            a if a.starts_with("--") => {}
+            a => return Some(a),
+        }
+    }
+    None
+}
+
+/// `None` if the daemon may exec this: itself, or `git` (or a `git-<sub>` binary) running an
+/// allowlisted subcommand. Otherwise the reason it is a violation.
+fn exec_violation(path: &str, argv: &[String], daemon: &str) -> Option<String> {
+    if path == daemon {
+        return None;
+    }
+    let name = Path::new(path).file_name()?.to_str()?.to_string();
+    let sub = match name.as_str() {
+        "git" => git_subcommand(argv).map(str::to_string),
+        n => n.strip_prefix("git-").map(str::to_string),
+    };
+    match sub {
+        Some(sub) if ALLOWED_GIT_SUBCOMMANDS.contains(&sub.as_str()) => None,
+        Some(sub) => Some(format!("{path} ran the Git subcommand {sub:?}: {argv:?}")),
+        None => Some(format!("{path} is not git or the daemon: {argv:?}")),
+    }
+}
+
+#[test]
+fn the_exec_allowlist_admits_only_the_daemon_and_allowlisted_git_commands() {
+    let log = r#"
+1 execve("/x/target/debug/ccwm", ["/x/target/debug/ccwm", "serve", "--port", "0"], 0x7ff /* 9 vars */) = 0
+2 execve("/usr/bin/git", ["git", "--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904", "status", "--porcelain=v2"], 0x5 /* 8 vars */) = 0
+3 execve("/usr/bin/git", ["git", "--no-pager", "-c", "x=y", "log", "-1"], 0x5 /* 8 vars */) = 0
+4 execve("/usr/bin/git", ["git", "--no-pager", "rev-parse", "--show-toplevel"], 0x5 /* 8 vars */) = 0
+5 execve("/usr/bin/git", ["git", "--no-pager", "config", "-z", "--get-regexp", "x"], 0x5 /* 8 vars */) = 0
+6 execve("/usr/bin/git", ["git", "--no-pager", "-c", "a=b", "--version"], 0x5 /* 8 vars */) = 0
+7 execve("/usr/lib/git-core/git", ["/usr/lib/git-core/git", "-c", "fetch.negotiationAlgorithm=noop", "fetch", "origin", "--filter=blob:none"], 0x5 /* 82 vars */) = 0
+8 execve("/usr/lib/git-core/git-remote-ext", ["git-remote-ext", "origin", "sh /x/helper.sh"], 0x5 /* 8 vars */) = 0
+9 execve("/bin/sh", ["sh", "-c", "ssh \"$@\""], 0x5 /* 8 vars */) = 0
+10 execve("/usr/bin/ssh", ["ssh", "git@example.invalid"], 0x5 /* 8 vars */ <unfinished ...>
+11 execve("/usr/bin/git", ["git", "--no-pager", "-c", "a=b", ...], 0x5 /* 8 vars */) = 0
+12 execve("/usr/lib/git-core/git-status", ["git-status"], 0x5 /* 8 vars */) = -1 ENOENT (No such file or directory)
+13 execve("/usr/bin/git", ["git", "say \"hi\"", "-c"], 0x5) = 0
+"#;
+    let found = execs(log);
+    assert_eq!(found.len(), 13, "{found:#?}");
+    assert_eq!(found[12].1[1], "say \"hi\"", "escapes are decoded");
+    let bad: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, (p, a))| exec_violation(p, a, "/x/target/debug/ccwm").is_some())
+        .map(|(i, _)| i + 1)
+        .collect();
+    assert_eq!(bad, [7, 8, 9, 10, 11, 13], "{found:#?}");
+}
+
 /// Which isolation security acceptance test 5 can use on this host: a network namespace
 /// (`unshare`, mapping the current user: ccwm refuses to run as root) and/or `strace`. Each is
 /// probed with the exact wrapper it would run.
@@ -1233,6 +1378,9 @@ fn test5_wrapper(log: &Path) -> Option<(Vec<String>, &'static str)> {
         "strace",
         "-f",
         "-qq",
+        // Print up to 256 array elements and string bytes, so every Git argument list is whole.
+        "-s",
+        "256",
         "-e",
         "trace=connect,execve",
         "-o",
@@ -1264,32 +1412,71 @@ fn test5_wrapper(log: &Path) -> Option<(Vec<String>, &'static str)> {
     }
 }
 
+/// Plain Git for fixtures (author set, no ccwm hardening); panics on failure.
+fn fixture_git(dir: &Path, home: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Synthetic Author")
+        .env("GIT_AUTHOR_EMAIL", "synthetic@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Synthetic Author")
+        .env("GIT_COMMITTER_EMAIL", "synthetic@example.invalid")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// Security acceptance test 5: through a discovery, live-watch, Git and reconciliation cycle, the
 /// daemon and its Git subprocesses attempt no non-loopback connect (strace), and/or run in a
-/// network namespace with only loopback. Skipped with a notice when neither is available.
-/// (The session cycle joins in M3, when sessions are parsed.)
+/// network namespace with only loopback. With strace, every `execve` must also be allowlisted:
+/// the daemon itself or `git` running a §6 subcommand; a `fetch`, `remote-*` helper, `sh` or `ssh`
+/// fails the test. Promisor partial clones (one per transport, `HEAD` object missing) must cause
+/// zero fetch children and run no helper (M2 review H1/L3). Skipped with a notice when neither
+/// isolation is available. (The session cycle joins in M3, when sessions are parsed.)
 #[test]
 fn acceptance_5_no_external_network_connections() {
     let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 3).unwrap();
     let real_git = synth::init_git(&env).unwrap();
-    // Make Git's network paths tempting: remotes over https and ssh.
+    let helpers = t.path().join("helpers");
+    std::fs::create_dir(&helpers).unwrap();
+    let mut promisors = Vec::new();
     if real_git {
+        // Make Git's network paths tempting: remotes over https and ssh.
         let beta = env.home.join("dev/beta");
-        let out = Command::new("git")
-            .current_dir(&beta)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &env.home)
-            .args([
+        fixture_git(
+            &beta,
+            &env.home,
+            &[
                 "remote",
                 "add",
                 "origin",
                 "ssh://git@example.invalid/beta.git",
-            ])
-            .output()
-            .unwrap();
-        assert!(out.status.success());
+            ],
+        );
+        for vector in common::PROMISORS {
+            let name = format!("t5-promisor-{vector:?}").to_lowercase();
+            let dir = env.home.join("dev").join(&name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("CLAUDE.md"), "# promisor\n").unwrap();
+            fixture_git(&dir, &env.home, &["init", "-q", "-b", "main"]);
+            fixture_git(&dir, &env.home, &["add", "CLAUDE.md"]);
+            fixture_git(&dir, &env.home, &["commit", "-q", "-m", "c"]);
+            let (helper, sentinel) = common::sentinel_script(&helpers, &name, "exit 1");
+            common::make_promisor(&dir, vector, &helper, &|args| {
+                fixture_git(&dir, &env.home, args)
+            });
+            promisors.push((name, sentinel));
+        }
     }
     let log_path = t.path().join("connect.log");
     let Some((wrapper, variant)) = test5_wrapper(&log_path) else {
@@ -1313,8 +1500,28 @@ fn acceptance_5_no_external_network_connections() {
     // Reconciliation over the socket, then let the Git refreshes run.
     refresh_and_wait(&env);
     std::thread::sleep(Duration::from_secs(2));
+    if !promisors.is_empty() {
+        // Each promisor project was inspected and degraded, not fetched.
+        let token = d.login(&env);
+        wait_until("partial-clone Git states", 20, || {
+            let list = d.get_json(&token, "/api/v1/projects?limit=200");
+            promisors.iter().all(|(name, _)| {
+                list["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["name"] == name.as_str() && p["git"]["state"] == "partial_clone")
+            })
+        });
+    }
     let (code, daemon_log) = d.stop();
     assert_eq!(code, Some(0), "{daemon_log}");
+    for (name, sentinel) in &promisors {
+        assert!(
+            !sentinel.exists(),
+            "{name}: the promisor transport helper ran"
+        );
+    }
     if variant.contains("strace") {
         let log = std::fs::read_to_string(&log_path).unwrap();
         let bad = non_loopback_connects(&log);
@@ -1323,10 +1530,25 @@ fn acceptance_5_no_external_network_connections() {
             "non-loopback connect attempts:\n{}",
             bad.join("\n")
         );
+        let all = execs(&log);
+        let violations: Vec<String> = all
+            .iter()
+            .filter_map(|(path, argv)| exec_violation(path, argv, BIN))
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "the daemon or its children executed something outside the allowlist:\n{}",
+            violations.join("\n")
+        );
+        let fetches = all
+            .iter()
+            .filter(|(_, argv)| argv.iter().any(|a| a == "fetch"))
+            .count();
+        assert_eq!(fetches, 0, "promisor repositories started fetch children");
         if real_git {
-            let git_runs = log
-                .lines()
-                .filter(|l| l.contains("execve(") && l.contains("git\""))
+            let git_runs = all
+                .iter()
+                .filter(|(p, _)| Path::new(p).file_name().is_some_and(|n| n == "git"))
                 .count();
             assert!(
                 git_runs >= 3,
@@ -1335,7 +1557,9 @@ fn acceptance_5_no_external_network_connections() {
         }
         let connects = log.lines().filter(|l| l.contains("connect(")).count();
         eprintln!(
-            "NOTICE: test 5: {connects} connect() calls traced, all loopback or Unix sockets"
+            "NOTICE: test 5: {connects} connect() calls and {} execs traced; connects all loopback or Unix sockets, execs all allowlisted, {} promisor repositories without a fetch",
+            all.len(),
+            promisors.len()
         );
     }
 }

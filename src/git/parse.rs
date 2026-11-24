@@ -143,6 +143,29 @@ pub fn filter_driver_names(raw: &[u8]) -> Vec<String> {
     out
 }
 
+/// `git config -z --get-regexp ^(extensions\.partialclone|remote\..*\.promisor)$`: whether the
+/// repository has a promisor remote (`extensions.partialClone = <remote>`, or
+/// `remote.<name>.promisor` true; a key without a value is true, as in Git).
+pub fn any_promisor(raw: &[u8]) -> bool {
+    raw.split(|b| *b == 0).any(|entry| {
+        let text = String::from_utf8_lossy(entry);
+        let (key, value) = match text.split_once('\n') {
+            Some((k, v)) => (k, Some(v)),
+            None => (text.as_ref(), None),
+        };
+        if key == "extensions.partialclone" {
+            return value.is_some_and(|v| !v.is_empty());
+        }
+        key.starts_with("remote.")
+            && key.ends_with(".promisor")
+            && value.is_none_or(|v| {
+                ["true", "yes", "on", "1"]
+                    .iter()
+                    .any(|t| v.eq_ignore_ascii_case(t))
+            })
+    })
+}
+
 /// A driver name can be neutralized with `-c filter.<name>.<var>=` only if `-c` cannot misparse
 /// it: Git splits `-c` at the first `=`, so a name containing `=` would set a different key.
 pub fn neutralizable(name: &str) -> bool {
@@ -323,5 +346,22 @@ u UU N... 100644 100644 100644 100644 a b c conflict.txt\0\
         for (raw, want) in cases {
             assert_eq!(sanitize_remote_url(raw), want, "{raw}");
         }
+    }
+
+    #[test]
+    fn promisor_remotes_are_recognized_from_config_output() {
+        assert!(any_promisor(b"extensions.partialclone\norigin\0"));
+        assert!(any_promisor(b"remote.origin.promisor\ntrue\0"));
+        assert!(
+            any_promisor(b"remote.a.b.promisor\0"),
+            "no value means true"
+        );
+        assert!(any_promisor(
+            b"remote.x.promisor\nfalse\0remote.y.promisor\nYes\0"
+        ));
+        assert!(!any_promisor(b"remote.origin.promisor\nfalse\0"));
+        assert!(!any_promisor(b"extensions.partialclone\n\0"));
+        assert!(!any_promisor(b""));
+        assert!(!any_promisor(b"remote.origin.url\nx\0"));
     }
 }
