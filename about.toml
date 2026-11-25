@@ -1,0 +1,36 @@
+# cargo-about configuration: generates THIRD_PARTY_LICENSES for the release archive (REQUIREMENTS.md §17).
+# Locally (cargo-about 0.9.3; the binary needs the `cli` feature; MSRV 1.88, builds with rustc 1.94.0):
+#   cargo install --locked --root target/tools cargo-about --version 0.9.3 --features cli
+#   cargo fetch --locked
+#   target/tools/bin/cargo-about generate --frozen --fail about.hbs > THIRD_PARTY_LICENSES
+# `--frozen` (= --locked --offline): license texts come from the crates in the cargo cache only, no
+# ClearlyDefined lookup; the output was identical to the online run for this tree. release.yml installs
+# and runs the same version the same way.
+#
+# The accepted licenses are exactly the set deny.toml allows: its `allow` list (same order: the first match
+# wins when a crate offers a choice, so dual-licensed crates resolve to MIT) plus its per-crate exceptions.
+# Keep the two files in sync; a new license must be reviewed and added to both.
+
+# The release archive ships only the musl binary.
+targets = ["x86_64-unknown-linux-musl"]
+# Dev-dependencies (tempfile, tower) are not linked into the binary. Build dependencies stay listed.
+ignore-dev-dependencies = true
+ignore-build-dependencies = false
+ignore-transitive-dependencies = false
+# ccwm itself (`publish = false`) is not third-party; its LICENSE ships next to the binary.
+private = { ignore = true }
+
+accepted = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0", "Unlicense", "Zlib"]
+
+# Per-crate exceptions (deny.toml `[licenses] exceptions`).
+[inotify]
+accepted = ["ISC"]
+
+[inotify-sys]
+accepted = ["ISC"]
+
+[notify]
+accepted = ["CC0-1.0"]
+
+[xxhash-rust]
+accepted = ["BSL-1.0"]

@@ -70,6 +70,8 @@ struct Prepared {
     session_dir: PathBuf,
     policy: Policy,
     report: SandboxReport,
+    peer_lookup: crate::http::peer::PeerUidLookup,
+    peer_method: &'static str,
 }
 
 /// Run the daemon until SIGTERM/SIGINT. Called on the main thread.
@@ -121,6 +123,9 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         },
         config.server.port,
     );
+    // The TCP peer check's lookup is chosen by a self-test over an ephemeral loopback connection,
+    // which only works before the sandbox limits binds to the configured port.
+    let (peer_lookup, peer_method) = crate::http::peer::select_lookup();
     let mut report =
         sandbox::apply(&policy).unwrap_or_else(|e| SandboxReport::disabled(e.to_string()));
     report.flag_broad_reads(&policy.read, &canon(&home));
@@ -143,7 +148,29 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         session_dir,
         policy,
         report,
+        peer_lookup,
+        peer_method,
     }))
+}
+
+/// M4: once the listeners are bound, probe from the blocking pool that the daemon cannot write
+/// outside its directories or connect out, install the seccomp socket filter on every thread,
+/// and probe socket creation from a worker and a blocking-pool thread.
+async fn deny_sockets_and_probe(home: &Path, report: &mut SandboxReport) {
+    let dir = home.to_path_buf();
+    let (write, connect) =
+        tokio::task::spawn_blocking(move || (sandbox::probe_write(&dir), sandbox::probe_connect()))
+            .await
+            .unwrap_or_else(|_| ("error:panicked".into(), "error:panicked".into()));
+    report.record_daemon_probes(&write, &connect);
+    let applied = sandbox::deny_new_sockets();
+    let worker = tokio::spawn(async { sandbox::probe_socket() })
+        .await
+        .unwrap_or_else(|_| "error:panicked".into());
+    let blocking = tokio::task::spawn_blocking(sandbox::probe_socket)
+        .await
+        .unwrap_or_else(|_| "error:panicked".into());
+    report.record_seccomp(&applied, &worker, &blocking);
 }
 
 /// M1.1 (M4): verify from a worker thread and a blocking-pool thread, both created after the
@@ -172,9 +199,10 @@ async fn run(p: Prepared) -> Result<()> {
         session_dir,
         policy,
         mut report,
+        peer_lookup,
+        peer_method,
     } = p;
     probe_runtime_threads(&policy, &mut report).await;
-    tracing::info!("{}", report.summary());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let _lock = InstanceLock::acquire(&dirs)?;
 
@@ -195,6 +223,7 @@ async fn run(p: Prepared) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", wanted)).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
             Error::new(format!("port {wanted} is already in use. Choose another with `ccwm serve --port N` or set [server] port in the config file"))
+                .with_exit_code(crate::error::EXIT_PORT_IN_USE)
         } else {
             Error::io(format!("cannot listen on 127.0.0.1:{wanted}"), &e)
         }
@@ -203,6 +232,11 @@ async fn run(p: Prepared) -> Result<()> {
         .local_addr()
         .map_err(|e| Error::io("cannot read the bound port", &e))?
         .port();
+    let socket = crate::ipc::server::bind(&dirs.socket_path(), uid)?;
+    // Both listeners exist: from now on the daemon creates no socket (seccomp, M4).
+    deny_sockets_and_probe(&home, &mut report).await;
+    tracing::info!("{}", report.summary());
+    tracing::info!(method = peer_method, "tcp peer check");
 
     // ---- tracking: Git, the single inotify instance, the monitor and the tracker (M2) ----
     let git = Arc::new(Git::detect(
@@ -322,8 +356,8 @@ async fn run(p: Prepared) -> Result<()> {
         session_dir: canonical_session_dir,
         roots,
         claude: Some(claude),
+        peer_lookup: peer_method,
     }));
-    let socket = crate::ipc::server::bind(&dirs.socket_path(), uid)?;
     write_instance(
         &dirs,
         &InstanceInfo {
@@ -386,7 +420,10 @@ async fn run(p: Prepared) -> Result<()> {
     let served = crate::http::serve(
         listener,
         Arc::clone(&service),
-        crate::http::ServeOptions::new(uid),
+        crate::http::ServeOptions {
+            peer_uid: peer_lookup,
+            ..crate::http::ServeOptions::new(uid)
+        },
         shutdown,
     )
     .await;

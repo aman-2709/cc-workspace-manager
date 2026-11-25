@@ -18,10 +18,23 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_ccwm");
 
+/// A CLI command in the synthetic environment. `PATH` starts with a stub `systemctl` that
+/// knows nothing, so `ccwm status` never asks the real user manager (tests/service.rs has a
+/// working stand-in).
 fn command(env: &SynthEnv) -> Command {
+    let stub = env.root.join("stub-bin");
+    if !stub.join("systemctl").exists() {
+        std::fs::create_dir_all(&stub).unwrap();
+        std::fs::write(stub.join("systemctl"), "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(
+            stub.join("systemctl"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
     let mut c = Command::new(BIN);
     c.env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
         .env("NO_COLOR", "1");
     for (k, v) in env.env_pairs() {
         c.env(k, v);
@@ -271,8 +284,19 @@ fn sandbox_report(env: &SynthEnv) -> serde_json::Value {
         .clone()
 }
 
-/// Every claim the daemon makes about itself, checked exactly (EACCES probes, single thread).
+/// Every claim the daemon makes about itself, checked exactly (EACCES probes, single thread; M4:
+/// the daemon's own write/connect probes denied, the seccomp filter verified on a worker and a
+/// blocking thread, so UDP and path-based Unix connect are no longer unconfined).
 fn assert_daemon_confined(r: &serde_json::Value) {
+    assert_eq!(r["seccomp"], "socket_denied", "{r}");
+    assert_eq!(r["daemon_probes"]["socket_worker"], "eperm", "{r}");
+    assert_eq!(r["daemon_probes"]["socket_blocking"], "eperm", "{r}");
+    for u in cc_workspace_manager::sandbox::UNCONFINED_BY_LANDLOCK {
+        assert!(
+            !r["unconfined"].as_array().unwrap().iter().any(|v| v == u),
+            "{u} still unconfined: {r}"
+        );
+    }
     if r["filesystem"] != true {
         assert!(
             std::env::var(REQUIRE_LANDLOCK).as_deref() != Ok("1"),
@@ -290,10 +314,15 @@ fn assert_daemon_confined(r: &serde_json::Value) {
         r["network"] == "tcp_only" || r["abi"].as_u64() < Some(4),
         "{r}"
     );
-    for u in cc_workspace_manager::sandbox::ALWAYS_UNCONFINED {
-        assert!(
-            r["unconfined"].as_array().unwrap().iter().any(|v| v == u),
-            "{r}"
+    assert_eq!(r["daemon_probes"]["write"], "eacces", "{r}");
+    if r["network"] == "tcp_only" {
+        assert_eq!(r["daemon_probes"]["connect"], "eacces", "{r}");
+    }
+    if r["abi"].as_u64() >= Some(6) {
+        assert_eq!(
+            r["unconfined"],
+            serde_json::json!([]),
+            "Landlock (ABI 6+) and seccomp leave nothing listed: {r}"
         );
     }
 }
@@ -481,6 +510,12 @@ fn serve_open_browser_flow_security_checks_and_clean_shutdown() {
     let report = sandbox_report(&env);
     assert_daemon_confined(&report);
     assert!(d.log.lock().unwrap().contains("landlock"));
+    // M4: the TCP peer check uses one exact sock_diag lookup per connection on this kernel
+    // (every request above went through it, under the seccomp filter).
+    assert_eq!(
+        socket_call(&env, "service.status")["peer_lookup"],
+        "sock_diag"
+    );
 
     // Graceful shutdown: exit 0, runtime files removed.
     let (code, log) = d.stop();
@@ -559,7 +594,11 @@ fn a_second_daemon_in_the_same_environment_refuses_to_start() {
         .args(["serve", "--port", "0"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.status.code(),
+        Some(cc_workspace_manager::error::EXIT_ALREADY_RUNNING),
+        "the dedicated code listed in RestartPreventExitStatus="
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("already running"),
         "{}",
@@ -581,7 +620,11 @@ fn port_collision_fails_fast_with_a_clear_message() {
         .args(["serve", "--port", &port.to_string()])
         .output()
         .unwrap();
-    assert_ne!(out.status.code(), Some(0));
+    assert_eq!(
+        out.status.code(),
+        Some(cc_workspace_manager::error::EXIT_PORT_IN_USE),
+        "the dedicated code listed in RestartPreventExitStatus="
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains(&format!("port {port} is already in use")) && err.contains("--port"),
@@ -1516,6 +1559,14 @@ fn acceptance_5_no_external_network_connections() {
         return;
     };
     eprintln!("NOTICE: security acceptance test 5 variant: {variant}");
+    // CI sets this where its probe found unprivileged user namespaces (REQUIREMENTS.md §16:
+    // both variants run when both are available; the network-namespace one has not run here).
+    if std::env::var("CCWM_REQUIRE_NETNS").as_deref() == Ok("1") {
+        assert!(
+            variant.starts_with("network namespace"),
+            "CCWM_REQUIRE_NETNS=1 but test 5 ran without a network namespace ({variant})"
+        );
+    }
     let d = Daemon::start_wrapped(&env, &[], &[("PATH", &path_env)], &wrapper);
     wait_scans_finished(&env, 1);
     // Sessions: a live session file, then the detail panel's on-demand prompt reads.
@@ -1742,8 +1793,13 @@ fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
         "SYNTHETIC session-only prompt with a token [REDACTED] and password=[REDACTED]",
         "untitled: the first prompt, redacted"
     );
-    let detail = d.get_json(&token, &format!("/api/v1/projects/{so_id}"));
     if real_git {
+        // Git inspection runs in the Git queue after enrollment (`git: null` until stored).
+        let mut detail = serde_json::Value::Null;
+        wait_until("the session-only project's Git status", 15, || {
+            detail = d.get_json(&token, &format!("/api/v1/projects/{so_id}"));
+            !detail["git"].is_null()
+        });
         assert_eq!(detail["git"]["state"], "ok", "{detail}");
         assert!(detail["git_detail"]["files"].is_object(), "{detail}");
     }
@@ -1763,6 +1819,7 @@ fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
         format!("/api/v1/projects/{alpha_id}?privacy=1"),
         format!("/api/v1/projects/{alpha_id}/sessions?limit=2&privacy=1"),
         "/api/v1/discovery/status?privacy=1".to_string(),
+        "/api/v1/service/status?privacy=1".to_string(),
         "/api/v1/settings?privacy=1".to_string(),
     ] {
         let text = d.get_json(&token, &path).to_string();
@@ -1776,6 +1833,12 @@ fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
             assert!(!text.contains(hidden), "{path} leaks {hidden}");
         }
     }
+    assert!(
+        d.get_json(&token, "/api/v1/service/status")
+            .to_string()
+            .contains(&home),
+        "control: without privacy the service status names the claude program in home"
+    );
 
     // Settings are saved under the sandbox; `--port 0` is a command-line override, not saved.
     let settings = d.get_json(&token, "/api/v1/settings");
@@ -1920,4 +1983,118 @@ fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
         home_before,
         "project data changed"
     );
+}
+
+/// Security acceptance test 8, error paths (M3 review suggestion, M4): canary secrets inside a
+/// malformed line, an oversized (> 8 MiB) line, a malformed line appended while the daemon runs
+/// and an unreadable session file never reach the log at any level, while the counters prove
+/// that the parser really went through those paths.
+#[test]
+fn acceptance_8_canaries_in_malformed_oversized_and_unreadable_session_files_stay_out_of_logs() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 0).unwrap();
+    let dir = env.claude_dir.join("projects/-synthetic-canaries");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = env.home.join("dev/alpha");
+    let valid = |sid: &str, text: &str| {
+        serde_json::json!({"type": "user", "sessionId": sid, "timestamp": "2026-11-24T10:00:00.000Z",
+                           "cwd": cwd, "promptSource": "typed",
+                           "message": {"role": "user", "content": text}})
+        .to_string()
+    };
+    let broken = "aaaa0001-0000-4000-8000-000000000001";
+    let oversized_line = format!(
+        r#"{{"type":"user","sessionId":"{broken}","message":{{"content":"SYNTHETIC-CANARY-OVERSIZED ghp_SYNTHETICOVERSIZED0123456789 {}"}}}}"#,
+        "x".repeat(9 * 1024 * 1024)
+    );
+    std::fs::write(
+        dir.join(format!("{broken}.jsonl")),
+        format!(
+            "{}\n{{\"type\":\"user\",\"sessionId\":\"{broken}\",\"message\":\"SYNTHETIC-CANARY-MALFORMED password=synthetic-malformed-pw\n{oversized_line}\n{}\n",
+            valid(broken, "SYNTHETIC-CANARY-VALID-PROMPT"),
+            valid(broken, "SYNTHETIC-CANARY-LAST-PROMPT")
+        ),
+    )
+    .unwrap();
+    let locked = "aaaa0002-0000-4000-8000-000000000002";
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o000)
+        .open(dir.join(format!("{locked}.jsonl")))
+        .unwrap()
+        .write_all(
+            valid(
+                locked,
+                "SYNTHETIC-CANARY-UNREADABLE sk-ant-SYNTHETICUNREADABLE01",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let d = Daemon::start_with_env(&env, &[], &[("CCWM_LOG", "trace")]);
+    let token = d.login(&env);
+    d.wait_scan_done(&token);
+    // An append with another malformed line, parsed incrementally (live watch or the refresh).
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join(format!("{broken}.jsonl")))
+        .unwrap()
+        .write_all(b"{\"type\":\"user\",\"message\":\"SYNTHETIC-CANARY-APPENDED secret=synthetic-appended\n")
+        .unwrap();
+    refresh_and_wait(&env);
+    let st = d.get_json(&token, "/api/v1/discovery/status");
+    assert!(
+        st["sessions"]["malformed_lines"].as_u64() >= Some(2),
+        "both malformed lines were parsed and counted: {st}"
+    );
+    assert!(
+        st["sessions"]["oversized_lines"].as_u64() >= Some(1),
+        "the oversized line was skipped and counted: {st}"
+    );
+    let (files, indexed) = (
+        st["sessions"]["files"].as_u64().unwrap(),
+        st["sessions"]["indexed"].as_u64().unwrap(),
+    );
+    assert_eq!(
+        files,
+        indexed + 1,
+        "the unreadable file is listed, not indexed (the rest are the fixture corpus): {st}"
+    );
+    // The detail panel reads the prompt on demand from the file with the bad lines.
+    let page = d.get_json(&token, "/api/v1/projects?limit=200");
+    let alpha = project_by_name(&page, "alpha")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sessions = d.get_json(
+        &token,
+        &format!("/api/v1/projects/{alpha}/sessions?limit=10"),
+    );
+    assert!(
+        sessions
+            .to_string()
+            .contains("SYNTHETIC-CANARY-LAST-PROMPT"),
+        "{sessions}"
+    );
+    let (code, log) = d.stop();
+    assert_eq!(code, Some(0), "{log}");
+    assert!(log.contains("socket request"), "trace events were logged");
+    for canary in [
+        "SYNTHETIC-CANARY",
+        "SYNTHETICOVERSIZED",
+        "SYNTHETICUNREADABLE",
+        "synthetic-malformed-pw",
+        "synthetic-appended",
+        "xxxxxxxxxxxxxxxx",
+    ] {
+        assert!(!log.contains(canary), "{canary:?} reached the log");
+    }
+    // Let the temp dir be removed.
+    std::fs::set_permissions(
+        dir.join(format!("{locked}.jsonl")),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
 }

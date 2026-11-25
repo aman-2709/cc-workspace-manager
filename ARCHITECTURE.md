@@ -34,7 +34,7 @@ Modules appear in the milestone that needs them; none are pre-created empty.
 src/
   main.rs         # parse args; refuse root; apply Landlock BEFORE any thread is spawned; build runtime; map errors -> exit codes
   lib.rs
-  exit.rs         # exit-code constants (M1: OK, ERROR, USAGE; M4 adds PORT_IN_USE, ALREADY_RUNNING)
+  error.rs        # errors + exit codes (EXIT_OK 0, EXIT_ERROR 1; M4: EXIT_PORT_IN_USE 10, EXIT_ALREADY_RUNNING 11)
   cli.rs          # clap definitions (+ unofficial notice in --help)
   client.rs       # M1: `open` -> Unix-socket client (peer verification, JSON lines). No HTTP client.
   paths.rs        # M1: Dirs{config,data,state,runtime}; XDG + fallbacks; 0700 creation + owner/mode verification; home = owned `$HOME`, else passwd;
@@ -70,6 +70,9 @@ src/
                   #     prompt.rs (genuine-prompt classifier, bounded on-demand reads), redact.rs, resume.rs (UUID, POSIX quoting),
                   #     cli.rs (`claude --version/--help`, cached by path+size+mtime)
   discovery/resolve.rs         # M3: session cwd -> project root, unassigned reasons
+  systemd.rs      # M4: the user unit text, `systemctl --user` wrapper (found on PATH), unit write (trusted dir, atomic),
+                  #     purge of ccwm's four directories, linger check; CLI-side only, never a daemon child
+  doctor.rs       # M4: `ccwm doctor`: gathers (socket, /proc, git --version, bind test) + pure evaluations -> suggestions
   (privacy)                    # M3: no module of its own: `view::Privacy` omits fields on the server (view.rs, service.rs)
 build.rs                       # M2-pre: CCWM_GIT_COMMIT = 12-hex HEAD (+ "-dirty"), or "unknown"; runs git on THIS repo at build time only
 web/ index.html app.css app.js # embedded with include_str!
@@ -132,7 +135,7 @@ The CLI never uses TCP and never reads a token file; the browser never reaches t
 3. Load `config.toml` (absent ⇒ defaults; present ⇒ the file and its ancestors must be trusted too); compute discovery roots (config or home) and the session dir (`CLAUDE_CONFIG_DIR` if absolute, else `~/.claude`).
 4. **Apply Landlock now, on the main thread, before the Tokio runtime or any other thread exists** (`landlock_restrict_self` confines only the calling thread and its future children; threads created earlier would stay unconfined). `apply` counts `/proc/self/task` first: ≠ 1 ⇒ the report claims nothing. Flag broad read rules.
 5. Build the Tokio runtime; probe a worker and a blocking-pool thread (read of `/` must fail with `EACCES`); log the `SandboxReport`. Take the `flock` (lock file in the runtime dir). Open SQLite (`temp_store=MEMORY` so no temp files are needed under the sandbox), migrate, spawn writer + reader pool.
-6. Bind TCP `127.0.0.1:port` (failure ⇒ clear message naming the port; exit 1 in M1, dedicated code in M4) and the Unix socket (remove a stale socket only if it is a socket we own; the lock proves no live daemon).
+6. Bind TCP `127.0.0.1:port` (failure ⇒ clear message naming the port, exit code 10; a held lock in step 5 ⇒ exit 11) and the Unix socket (remove a stale socket only if it is a socket we own; the lock proves no live daemon). **M4:** then, from the blocking pool, the write probe (`O_TMPFILE` in home) and the connect probe (`127.0.0.1:1`); then `sandbox::deny_new_sockets()` (seccomp, TSYNC: every existing thread, inherited by later ones and children); then socket probes on a worker and a blocking thread; then the report is logged. Before step 4 (still single-threaded, before Landlock limits binds), `http::peer::select_lookup()` self-tests `sock_diag` on an ephemeral loopback connection.
 7. Write `instance.json` (pid, port, version, started_at; atomic rename).
 8. Detect `git` on `PATH` (version, hardened?); create the single inotify instance (failure ⇒ every project polled, reported); build Tracker, Monitor, Service; spawn the monitor, the reconciler (first scan immediately), the signal handler, the WebSocket publisher, the hourly session purge, and serve. Cached projects are readable immediately.
 9. SIGTERM/SIGINT: stop accepting → cancel discovery → stop monitor/tracker/publisher → writer `Flush` + join → remove socket and `instance.json` → exit 0.
@@ -157,6 +160,7 @@ banned (§11.5).**
 | `notify` 9 (M2) | the single inotify watcher; brings `inotify`, `inotify-sys` (ISC), `mio`, `walkdir`, `xxhash-rust` (BSL-1.0); `notify` itself is CC0-1.0 — licenses added to `deny.toml` (flagged for review) |
 | `axum` `ws` (M2) | WebSocket upgrade; brings `tokio-tungstenite`/`tungstenite`, `sha1` 0.10, `base64` 0.22, `rand` 0.9 (`getrandom` 0.3). **axum enables `tokio-tungstenite`'s default `connect` feature** (a WebSocket client entry point): no extra crate, never called, TCP connect denied by Landlock; noted in SECURITY.md. Duplicate-version warnings (base64, digest/sha1 vs sha2, getrandom) are accepted (`multiple-versions = "warn"`) |
 | `regex` 1.x (M3, approved; `default-features = false`, `std`, `perf`, `unicode-perl`, `unicode-case`) | secret redaction of titles and prompts (`claude/redact.rs`); `regex-automata`/`regex-syntax` were already in the tree through `ignore` |
+| `seccompiler` 0.5 (M4; rust-vmm/Firecracker; Apache-2.0 OR BSD-3-Clause; `default-features = false`, only `libc`) | the §11.5 seccomp `socket()` filter. Builds a BPF program from a syscall → argument-condition map and installs it with `SECCOMP_FILTER_FLAG_TSYNC`; `unsafe_code = "forbid"` rules out doing the `prctl`/`seccomp` calls ourselves, and `libseccomp` would need the C library (no static musl build). Its arch check kills on a foreign architecture (i386 `int 0x80`); x32 numbers are denied explicitly |
 | dev: `tempfile` | temp dirs/repos |
 
 Not added: `ureq`/`reqwest`/any client; `rust-embed` (`include_str!` for three files); `tracing-journald`
@@ -237,6 +241,16 @@ NULL`, resolved again at the next ingest); `CachePrompt` is a no-op unless `Writ
 clears it before `ClearPromptCache`, sets it when the setting turns on); after a batch that contains
 `ClearPromptCache` or `ClearSessionIndex` commits, the writer runs `PRAGMA wal_checkpoint(TRUNCATE)` before it
 replies. `session_counts` adds the top 10 `(reason, first_cwd, n)` of unassigned sessions.
+
+### Parser version (M4)
+`claude::parse::PARSER_VERSION` (2 = M3.1 rules; an M3 database has no entry) is compared with
+`meta.session_parser_version` by `db::writer::reindex_if_parser_changed` when the writer opens the database:
+a difference clears `sessions` + `session_file_checkpoints` (the `ClearSessionIndex` code, projects' session
+counts recomputed) and records the version, in one transaction, then checkpoints the WAL. No schema change.
+
+**Reader permits (M4):** `Reader::with` takes one of `POOL_SIZE` async permits **before** `spawn_blocking`, so
+reads never park blocking-pool threads on the pool's condition variable (500 simultaneous Git refreshes did:
+517 threads in the 500-project benchmark, 25 after the fix).
 
 **Writer:** one `std::thread`, `sync_channel(1024)` of `WriteCmd` (`UpsertProjects`, `CreateSession`,
 `RotateSession`, `DeleteSession`, `TouchSession`, `RevokeAll`, `SetMeta`, `Flush`, `Shutdown`); commands needing
@@ -396,9 +410,11 @@ omit their fields; status and settings JSON have path keys removed. Search in pr
 
 ### Connection handling (M1.1)
 `http::serve` (hyper http1, not `axum::serve`): take one of 64 slots **before** `accept`; on accept,
-look up the client socket's owner in `/proc/net/tcp{,6}` (row with local = client address, remote =
-our address; v4-mapped v6 canonicalized; TIME_WAIT rows ignored; exactly one distinct owner required)
-on the blocking pool; serve only if it equals the daemon's euid, else close without reading (rejections
+look up the client socket's owner on the blocking pool — **M4:** one exact `sock_diag` request
+(`SOCK_DIAG_BY_FAMILY`, `NLM_F_REQUEST` without `DUMP`, `inet_diag_req_v2` for the client's 4-tuple; the reply's
+family, ports and addresses must equal the request, state not `LISTEN`/`TIME_WAIT`, `ENOENT` = not found), or,
+when the startup self-test failed, `/proc/net/tcp{,6}` (row with local = client address, remote = our address;
+v4-mapped v6 canonicalized; TIME_WAIT rows ignored; exactly one distinct owner required); serve only if it equals the daemon's euid, else close without reading (rejections
 logged at most once a minute). Then hyper http1 with `header_read_timeout = 10 s` and upgrades.
 Shutdown: stop accepting, `graceful_shutdown` every connection, wait at most 5 s.
 
@@ -523,11 +539,15 @@ active (never what was requested).
 | read + write file | `/dev/null` only |
 | network (ABI ≥ 4) | all TCP `connect` denied; `bind` allowed only on the configured port — reported as `network: "tcp_only"` |
 | scopes (ABI ≥ 6) | abstract Unix sockets and signals cannot reach processes outside the domain |
-| **not confined** | UDP and other non-TCP families; `connect()` on path-based Unix sockets (`ResolveUnix` exists only from ABI 9, not requested in v0.1); listed in `unconfined[]`. Mitigation: `sandbox::child_command` drops `DBUS_*`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, display/agent/systemd IPC variables from every child's environment. Seccomp `socket()` deny: M4 |
+| **not confined by Landlock** | UDP and other non-TCP families; `connect()` on path-based Unix sockets (`ResolveUnix` exists only from ABI 9, not requested in v0.1); listed in `unconfined[]` **unless the seccomp filter is active**. `sandbox::child_command` drops `DBUS_*`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, display/agent/systemd IPC variables from every child's environment |
+| seccomp (M4, after the listeners are bound, all threads) | `socket()` ⇒ `EPERM` unless `AF_NETLINK` + `NETLINK_SOCK_DIAG`; `io_uring_setup/enter/register` and x32 `socket`/`io_uring_setup` ⇒ `EPERM`; foreign architecture ⇒ kill. Reported as `seccomp: "socket_denied"` only if both socket probes saw `EPERM` |
 
 `SandboxReport {abi, status, filesystem, network, abstract_unix_socket, signal, no_new_privs, threads_at_apply,
-thread_probes{worker,blocking}, broad_read_rules[], unconfined[], notes[]}` goes to the startup log and
-`service.status`. If `/proc/self/task` ≠ 1 entry at `apply`, or a thread probe is not `eacces`, every claim
+thread_probes{worker,blocking}, seccomp, daemon_probes{write,connect,socket_worker,socket_blocking},
+broad_read_rules[], unconfined[], notes[]}` goes to the startup log and `service.status` (which also carries
+`peer_lookup`: `sock_diag` | `procfs`). `record_daemon_probes`: write `allowed` ⇒ every claim withdrawn,
+connect `allowed` ⇒ `network: none`, other errors ⇒ a note only. `record_seccomp`: claimed only with both
+socket probes `eperm`. If `/proc/self/task` ≠ 1 entry at `apply`, or a thread probe is not `eacces`, every claim
 is withdrawn (`not_enforced`). Child processes inherit the ruleset. Known consequences: roots added at
 runtime (M3 settings) outside the startup read set cannot be read until restart — reported as "requires
 restart" (**Open**, M3); `claude` located outside the allowed system paths cannot be executed (M3).
@@ -634,6 +654,16 @@ document: git-lfs/`eol` repos can show different status than the user's own `git
 
 ## 13. systemd user unit — verified (systemd 255)
 
+**M4 (real daemon, synthetic env, transient user units via `systemd-run --user`):** with `Type=exec`,
+`Restart=on-failure`, `RestartSec=5`, `RestartPreventExitStatus=10 11`, `TimeoutStopSec=10`, `UMask=0077`, `Nice=10`,
+`IOSchedulingClass=idle`, `NoNewPrivileges`, `LockPersonality`, `RestrictRealtime`, `RestrictSUIDSGID`,
+`RestrictNamespaces`, `SystemCallArchitectures=native` the daemon ran `fully_enforced` (Landlock ABI 8, seccomp
+`socket_denied` on top of systemd's own filters, TSYNC fine), `ccwm status` worked, SIGTERM stopped it in 0.02 s.
+With `ProtectSystem=strict` + `ProtectHome=read-only` (+ `ReadWritePaths`) and, separately, `PrivateTmp=yes`,
+systemd 255 runs the user service in a user namespace: `/tmp` (and `/`, `/home`) appear owned by uid 65534, and
+ccwm refuses to start ("/tmp is owned by uid 65534, not by you or root") — correct behaviour of the §11.3 trust
+checks, so these directives are not used. `systemd-analyze --user verify` accepts the generated unit (its only
+complaint: `%h/.local/bin/ccwm` absent in the real home). Earlier (M1) acceptance list:
 Accepted in a transient user unit: `NoNewPrivileges`, `Nice`, `IOSchedulingClass=idle`, `UMask`, `PrivateTmp`,
 `ProtectSystem=strict`, `ProtectHome=read-only`, `ProtectKernelTunables`, `RestrictNamespaces`,
 `RestrictAddressFamilies`, `MemoryDenyWriteExecute`, `LockPersonality`, `SystemCallArchitectures`,
@@ -727,6 +757,30 @@ codes go in `RestartPreventExitStatus=`.
   (ABI 8, `/proc` in the read set) reading an unrelated process started before it: `readlink /proc/<pid>/cwd` and
   `/exe` → `EACCES`; `/proc/<pid>/cmdline` and `status` readable; `stat` shortened. See §14.
 
+## 13g. M4 verification notes (what was actually run, 2026-11-24)
+
+- `cargo test` with `CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_INOTIFY=1`, fmt, clippy `-D warnings`, `cargo deny check`.
+- Seccomp (`tests/sandbox.rs`, harness-less child applying the real policy, then the filter): a thread created
+  **before** the filter, threads after it, the main thread and grandchildren get `EPERM` for UDP and Unix sockets;
+  path-based Unix connect (Landlock's residual) ⇒ `EPERM`; `NETLINK_ROUTE` ⇒ `EPERM`; a `sock_diag` lookup of a
+  pre-existing connection still works; `socketpair` and exec still work. Daemon-level probes: `O_TMPFILE` outside
+  ⇒ `EACCES` (Landlock covers `O_TMPFILE`), inside ⇒ allowed; connect ⇒ `EACCES`.
+- Real daemon (`tests/process.rs`, every test under the filter, incl. test 5 under strace): report
+  `daemon_probes=write:eacces,connect:eacces,socket:eperm/eperm seccomp=socket_denied unconfined=` and
+  `peer_lookup: sock_diag`.
+- `sock_diag`: unit tests on hand-built replies (foreign tuple, our own end, `TIME_WAIT`, `LISTEN`, another
+  sequence, `ENOENT`, `ENOMEM`, truncated, ambiguous) and a real loopback connection whose lookup equals procfs's.
+- Service management end to end (`tests/service.rs`) with a stand-in `systemctl` that really starts and stops
+  `~/.local/bin/ccwm`: install.sh (twice: idempotent, restarts an active service), start/stop/restart, status,
+  doctor, revoke-all, uninstall.sh (data kept), `--purge` answered "no" (nothing deleted) and "yes"; tests 2 and
+  10 snapshots unchanged after the purge.
+- Benchmarks: [docs/benchmarks.md](docs/benchmarks.md) (`scripts/bench.py`, release build, synthetic data); they
+  found the reader's blocking-thread growth (§5).
+- Release engineering (CI not run — nothing pushed): workflows linted with actionlint 1.7.12; musl static build,
+  strip, `--version`, a synthetic smoke test, cargo-about 0.9.3 (`--frozen --fail`) and `package-release.sh`
+  (`sha256sum -c`, reproducible) run locally; gitleaks 8.30.1 over the history: no leaks after reviewing 14
+  synthetic findings.
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -779,13 +833,13 @@ documents the hook configuration for the user to add; it never edits `~/.claude`
 verified against the installed Claude Code version (per §19: from documentation or the maintainer, not by reading
 real session data) before building it.
 
+Decided 2026-11-24 (before M4): **O1** approved and permanent (roots, exclusions, depth, same-file-system, budget,
+port and session directory need a restart; Landlock cannot widen a running process's rules, so no in-process
+restart is planned); **O7** approved (`<pasted_content>` is user text; privacy also hides the status/settings paths;
+the cwd walk-up also stops at a `CLAUDE.md`); the M3.1 narrowed Basic-auth redaction rule approved.
+
 Open:
-- **O1 (M3, needs approval):** roots, exclusions, depth, same-file-system, watch budget, port and session directory
-  changes are saved and marked "requires restart" (live reconfiguration of the tracker and monitor is not built;
-  Landlock needs a restart for new roots anyway). Alternative: an in-process restart of tracker + monitor in M4.
-- **O7 (M3, needs approval):** `<pasted_content>` is user text, not a synthetic tag; privacy mode also hides the
-  status/settings paths listed in §10; the cwd walk-up also stops at a `CLAUDE.md` directory (the user's wording
-  named the Git root only; kept from §4.4 so a session in a monorepo package and the package's marker agree).
+- **O8 (M4, needs approval):** the M4 spec changes listed in REQUIREMENTS.md Appendix A ("M4, needs approval").
 - **O2:** a `claude` binary outside the sandbox read set cannot be executed: reported as `failed` (the usual
   `~/.local/bin/claude` → `~/.local/share/claude/…` install is inside home, a root).
 - **O3 (M4):** crate/GitHub/distro naming-conflict check needs outbound requests — needs the maintainer's OK.

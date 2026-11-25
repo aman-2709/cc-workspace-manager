@@ -1,0 +1,11 @@
+# gitleaks configuration (CI: `gitleaks git` over the full history). The default rules apply; the only
+# exception is a match that contains `SYNTHETIC`: every canary secret in ccwm's tests is marked that way
+# (REQUIREMENTS.md §16 test 8, §19: synthetic data only). Older reviewed findings without the marker are
+# listed by fingerprint in .gitleaksignore.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic canary secrets in tests (they all contain SYNTHETIC)"
+regexTarget = "match"
+regexes = ['''SYNTHETIC''']

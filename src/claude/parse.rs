@@ -20,6 +20,15 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 
+/// Version of the session parsing rules. **Bump it** whenever a change to the parser, to the
+/// cleaning or capping of stored strings, or to which files count as sessions would store a
+/// different aggregate for the same file. The database writer compares it with the version the
+/// index was built with (`meta.session_parser_version`) when it opens the database and, if they
+/// differ, clears the derived session index, so every file is parsed again from byte 0 and no
+/// row keeps a value computed by older rules (REQUIREMENTS.md §7.2).
+/// History: 1 = M3 (no `meta` entry), 2 = M3.1 (cleaned and capped strings, lower-case ids,
+/// one file per id, early stop).
+pub const PARSER_VERSION: u32 = 2;
 /// Longer lines are skipped and counted (the longest real line seen was 1.9 MB).
 pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// Stored titles are cut to this many characters (after redaction).

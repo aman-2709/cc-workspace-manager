@@ -8,6 +8,16 @@
 //! `claude --version`), which must be built with [`child_command`] so that session IPC endpoints
 //! (D-Bus, agents) are not advertised to them. The [`SandboxReport`] states what is actually
 //! enforced, never what was requested.
+//!
+//! **Seccomp (M4).** Once the TCP and Unix listeners are bound, [`deny_new_sockets`] installs a
+//! seccomp filter on every thread (TSYNC) that makes `socket()` fail with `EPERM` for every family
+//! except the `NETLINK_SOCK_DIAG` netlink socket the TCP peer check needs, and denies `io_uring`
+//! (which can create sockets without `socket()`). Children inherit it. This closes what Landlock
+//! ABI ≤ 8 leaves open: new UDP sockets and `connect()` to path-based Unix sockets.
+//! **Daemon-level probes (M4).** The running daemon also tries, from its blocking pool, a write
+//! outside its directories ([`probe_write`]) and an outbound TCP connect ([`probe_connect`]),
+//! and, after the filter, creating sockets from a worker and a blocking thread
+//! ([`probe_socket`]); a probe that is not denied withdraws the matching claim.
 
 use crate::error::{Error, Result};
 use landlock::{
@@ -54,8 +64,9 @@ pub const IPC_ENV_VARS: [&str; 18] = [
     "LISTEN_FDNAMES",
 ];
 
-/// What Landlock never confines in v0.1, whatever the kernel: always listed in the report.
-pub const ALWAYS_UNCONFINED: [&str; 2] = ["udp", "unix_socket_connect_by_path"];
+/// What Landlock never confines in v0.1, whatever the kernel; listed in the report unless the
+/// seccomp filter ([`deny_new_sockets`]) is active, which closes both.
+pub const UNCONFINED_BY_LANDLOCK: [&str; 2] = ["udp", "unix_socket_connect_by_path"];
 
 #[derive(Debug, Clone, Default)]
 pub struct Policy {
@@ -72,6 +83,35 @@ pub const PROBE_DENIED: &str = "eacces";
 pub const PROBE_ALLOWED: &str = "allowed";
 pub const PROBE_SKIPPED: &str = "skipped";
 pub const PROBE_NOT_RUN: &str = "not_run";
+/// Outcome of a socket-creation probe that the seccomp filter denied.
+pub const PROBE_EPERM: &str = "eperm";
+/// `seccomp` values: the filter is active and verified, or not.
+pub const SECCOMP_ACTIVE: &str = "socket_denied";
+pub const SECCOMP_INACTIVE: &str = "not_applied";
+
+/// Probes run by the daemon itself (M4), after the listeners are bound.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DaemonProbes {
+    /// An anonymous file (`O_TMPFILE`) created in the home directory, outside ccwm's directories.
+    pub write: String,
+    /// A TCP connect to a loopback port.
+    pub connect: String,
+    /// Creating a UDP and a Unix socket after the seccomp filter, from a worker thread…
+    pub socket_worker: String,
+    /// …and from a blocking-pool thread.
+    pub socket_blocking: String,
+}
+
+impl Default for DaemonProbes {
+    fn default() -> Self {
+        Self {
+            write: PROBE_NOT_RUN.into(),
+            connect: PROBE_NOT_RUN.into(),
+            socket_worker: PROBE_NOT_RUN.into(),
+            socket_blocking: PROBE_NOT_RUN.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ThreadProbes {
@@ -101,6 +141,11 @@ pub struct SandboxReport {
     pub threads_at_apply: Option<usize>,
     /// Confinement verified from threads created after `apply`.
     pub thread_probes: ThreadProbes,
+    /// `socket_denied`: the seccomp filter blocks new sockets (except the peer check's netlink
+    /// socket) on every thread and in children; `not_applied` otherwise.
+    pub seccomp: &'static str,
+    /// What the running daemon's own probes showed.
+    pub daemon_probes: DaemonProbes,
     /// Read rules that are `/` or an ancestor of the home directory (read confinement is weak).
     pub broad_read_rules: Vec<String>,
     /// Kinds of access that are not confined.
@@ -123,6 +168,8 @@ impl SandboxReport {
                 worker: PROBE_NOT_RUN.into(),
                 blocking: PROBE_NOT_RUN.into(),
             },
+            seccomp: SECCOMP_INACTIVE,
+            daemon_probes: DaemonProbes::default(),
             broad_read_rules: Vec::new(),
             unconfined: Vec::new(),
             notes: vec![reason.into()],
@@ -143,7 +190,9 @@ impl SandboxReport {
         if self.network != "tcp_only" {
             out.push("tcp");
         }
-        out.extend(ALWAYS_UNCONFINED);
+        if self.seccomp != SECCOMP_ACTIVE {
+            out.extend(UNCONFINED_BY_LANDLOCK);
+        }
         if !self.abstract_unix_socket {
             out.push("abstract_unix_socket");
         }
@@ -187,6 +236,63 @@ impl SandboxReport {
         }
     }
 
+    /// Record the daemon's write and connect probes (run after the listeners are bound). A write
+    /// outside ccwm's directories that succeeded withdraws every claim; a connect that was not
+    /// denied withdraws the TCP claim. An error other than `EACCES` (e.g. a file system without
+    /// `O_TMPFILE`) proves nothing either way and is noted.
+    pub fn record_daemon_probes(&mut self, write: &str, connect: &str) {
+        self.daemon_probes.write = write.to_string();
+        self.daemon_probes.connect = connect.to_string();
+        if self.filesystem {
+            match write {
+                PROBE_DENIED => {}
+                PROBE_ALLOWED => self.downgrade(
+                    "the daemon could write outside its directories (write probe allowed)".into(),
+                ),
+                other => self
+                    .notes
+                    .push(format!("write probe inconclusive ({other})")),
+            }
+        }
+        if self.network == "tcp_only" {
+            match connect {
+                PROBE_DENIED => {}
+                PROBE_ALLOWED => {
+                    self.network = "none";
+                    self.notes.push(
+                        "the daemon could open a TCP connection (connect probe allowed)".into(),
+                    );
+                    self.unconfined = self.compute_unconfined();
+                }
+                other => self
+                    .notes
+                    .push(format!("connect probe inconclusive ({other})")),
+            }
+        }
+    }
+
+    /// Record the seccomp filter: `applied` is the result of [`deny_new_sockets`]; the probes ran
+    /// afterwards on a worker and a blocking-pool thread. The filter is claimed only if it was
+    /// applied and both probes were denied with `EPERM`.
+    pub fn record_seccomp(&mut self, applied: &Result<()>, worker: &str, blocking: &str) {
+        self.daemon_probes.socket_worker = worker.to_string();
+        self.daemon_probes.socket_blocking = blocking.to_string();
+        self.seccomp = match applied {
+            Ok(()) if worker == PROBE_EPERM && blocking == PROBE_EPERM => SECCOMP_ACTIVE,
+            Ok(()) => {
+                self.notes.push(format!(
+                    "the seccomp filter was installed but socket creation was not denied (worker: {worker}, blocking: {blocking})"
+                ));
+                SECCOMP_INACTIVE
+            }
+            Err(e) => {
+                self.notes.push(format!("seccomp filter not applied: {e}"));
+                SECCOMP_INACTIVE
+            }
+        };
+        self.unconfined = self.compute_unconfined();
+    }
+
     /// Note read rules that make read confinement meaningless or weak (M1.1, finding M2).
     pub fn flag_broad_reads(&mut self, read: &[PathBuf], home: &Path) {
         let broad = broad_read_rules(read, home);
@@ -203,7 +309,7 @@ impl SandboxReport {
 
     pub fn summary(&self) -> String {
         format!(
-            "landlock {}: abi={} filesystem={} network={} abstract_unix_socket={} signal={} threads_at_apply={} probes={}/{} unconfined={}{}",
+            "landlock {}: abi={} filesystem={} network={} abstract_unix_socket={} signal={} threads_at_apply={} probes={}/{} daemon_probes=write:{},connect:{},socket:{}/{} seccomp={} unconfined={}{}",
             self.status,
             self.abi
                 .map_or_else(|| "none".to_string(), |a| a.to_string()),
@@ -215,6 +321,11 @@ impl SandboxReport {
                 .map_or_else(|| "unknown".to_string(), |n| n.to_string()),
             self.thread_probes.worker,
             self.thread_probes.blocking,
+            self.daemon_probes.write,
+            self.daemon_probes.connect,
+            self.daemon_probes.socket_worker,
+            self.daemon_probes.socket_blocking,
+            self.seccomp,
             self.unconfined.join(","),
             if self.notes.is_empty() {
                 String::new()
@@ -331,6 +442,8 @@ pub fn report_from(
             worker: PROBE_NOT_RUN.into(),
             blocking: PROBE_NOT_RUN.into(),
         },
+        seccomp: SECCOMP_INACTIVE,
+        daemon_probes: DaemonProbes::default(),
         broad_read_rules: Vec::new(),
         unconfined: Vec::new(),
         notes: Vec::new(),
@@ -420,6 +533,128 @@ pub fn probe_read(target: Option<&Path>) -> String {
     }
 }
 
+/// Classify a probe's I/O outcome: `EACCES` is a denial; success is `allowed`.
+fn classify(result: std::io::Result<()>) -> String {
+    match result {
+        Ok(()) => PROBE_ALLOWED.into(),
+        Err(e) if e.raw_os_error() == Some(nix::errno::Errno::EACCES as i32) => PROBE_DENIED.into(),
+        Err(e) => format!("error:{:?}", e.kind()),
+    }
+}
+
+/// Try to create an anonymous file (`O_TMPFILE`: no directory entry, gone when closed, so a
+/// probe that is *allowed* changes nothing visible) in `dir`, a directory outside ccwm's own.
+pub fn probe_write(dir: &Path) -> String {
+    use std::os::unix::fs::OpenOptionsExt;
+    classify(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::fcntl::OFlag::O_TMPFILE.bits())
+            .mode(0o600)
+            .open(dir)
+            .map(drop),
+    )
+}
+
+/// The loopback address the connect probe targets: port 1 (tcpmux), where nothing normally
+/// listens, so an unconfined probe gets `ECONNREFUSED` (counted as allowed) and talks to no one.
+pub const CONNECT_PROBE_TARGET: ([u8; 4], u16) = ([127, 0, 0, 1], 1);
+
+/// Try an outbound TCP connect to a loopback port. Landlock (ABI ≥ 4) denies it with `EACCES`
+/// before anything is sent.
+pub fn probe_connect() -> String {
+    let (ip, port) = CONNECT_PROBE_TARGET;
+    let addr = std::net::SocketAddr::from((ip, port));
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1)) {
+        Ok(_) => PROBE_ALLOWED.into(),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => PROBE_ALLOWED.into(),
+        Err(e) => classify(Err(e)),
+    }
+}
+
+/// Try to create a UDP socket (bound to an ephemeral loopback port) and an unbound Unix datagram
+/// socket. `eperm` only if the seccomp filter denied both.
+pub fn probe_socket() -> String {
+    let eperm = |e: &std::io::Error| e.raw_os_error() == Some(nix::errno::Errno::EPERM as i32);
+    let udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).map(drop);
+    let unix = std::os::unix::net::UnixDatagram::unbound().map(drop);
+    match (udp, unix) {
+        (Err(a), Err(b)) if eperm(&a) && eperm(&b) => PROBE_EPERM.into(),
+        (Ok(()), Ok(())) => PROBE_ALLOWED.into(),
+        (a, b) => format!(
+            "mixed:udp={},unix={}",
+            a.map_or_else(|e| format!("{:?}", e.kind()), |()| "ok".into()),
+            b.map_or_else(|e| format!("{:?}", e.kind()), |()| "ok".into())
+        ),
+    }
+}
+
+/// x32 system calls carry this bit with the x86_64 audit architecture.
+const X32_SYSCALL_BIT: i64 = 0x4000_0000;
+
+/// The seccomp program of [`deny_new_sockets`] (separate so tests can build it without
+/// installing it).
+pub fn socket_filter() -> Result<seccompiler::BpfProgram> {
+    use nix::libc;
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen as Len, SeccompCmpOp as Op, SeccompCondition as Cond,
+        SeccompFilter, SeccompRule, TargetArch,
+    };
+    let e =
+        |what: &str, err: seccompiler::BackendError| Error::new(format!("seccomp: {what}: {err}"));
+    let arch = if cfg!(target_arch = "x86_64") {
+        TargetArch::x86_64
+    } else {
+        return Err(Error::new(
+            "seccomp: only x86_64 is supported by this build",
+        ));
+    };
+    let af = |v: libc::c_int| u64::try_from(v).unwrap_or(u64::MAX);
+    let cond = |arg, op, v| Cond::new(arg, Len::Dword, op, v).map_err(|x| e("condition", x));
+    // socket(domain, type, protocol): deny unless domain = AF_NETLINK and protocol =
+    // NETLINK_SOCK_DIAG (the TCP peer check). Rules are alternatives; conditions within one
+    // rule must all hold.
+    let deny_socket = vec![
+        SeccompRule::new(vec![cond(0, Op::Ne, af(libc::AF_NETLINK))?]).map_err(|x| e("rule", x))?,
+        SeccompRule::new(vec![
+            cond(0, Op::Eq, af(libc::AF_NETLINK))?,
+            cond(2, Op::Ne, af(libc::NETLINK_SOCK_DIAG))?,
+        ])
+        .map_err(|x| e("rule", x))?,
+    ];
+    let mut rules = std::collections::BTreeMap::new();
+    rules.insert(libc::SYS_socket, deny_socket);
+    // Always denied (an empty rule list matches unconditionally): io_uring can create sockets
+    // without socket(); the x32 entry points of socket and io_uring_setup.
+    for nr in [
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        X32_SYSCALL_BIT | libc::SYS_socket,
+        X32_SYSCALL_BIT | libc::SYS_io_uring_setup,
+    ] {
+        rules.insert(nr, Vec::new());
+    }
+    let errno = u32::try_from(libc::EPERM).unwrap_or(1);
+    SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(errno),
+        arch,
+    )
+    .map_err(|x| e("filter", x))?
+    .try_into()
+    .map_err(|x| e("compile", x))
+}
+
+/// Install [`socket_filter`] on **every** thread of the process (TSYNC); threads and children
+/// created afterwards inherit it. Call it once the listeners are bound: from then on the daemon
+/// needs no new socket except the peer check's netlink one.
+pub fn deny_new_sockets() -> Result<()> {
+    let program = socket_filter()?;
+    seccompiler::apply_filter_all_threads(&program).map_err(|e| Error::new(format!("seccomp: {e}")))
+}
+
 /// Names to remove from a child's inherited environment: [`IPC_ENV_VARS`] plus every `DBUS_*`.
 pub fn ipc_env_names(current: impl Iterator<Item = OsString>) -> Vec<OsString> {
     let mut names: Vec<OsString> = IPC_ENV_VARS.iter().map(OsString::from).collect();
@@ -466,7 +701,7 @@ mod tests {
         );
         assert!(r.abstract_unix_socket && r.signal);
         assert!(r.notes.is_empty(), "{:?}", r.notes);
-        assert_eq!(r.unconfined, ALWAYS_UNCONFINED.to_vec());
+        assert_eq!(r.unconfined, UNCONFINED_BY_LANDLOCK.to_vec());
     }
 
     #[test]
@@ -641,5 +876,115 @@ mod tests {
                 "{v} is not removed"
             );
         }
+    }
+
+    fn enforced_v8() -> SandboxReport {
+        let mut r = report_from(
+            RulesetStatus::FullyEnforced,
+            available(ABI::V8),
+            true,
+            Some(1),
+        );
+        r.record_thread_probes(PROBE_DENIED, PROBE_DENIED);
+        r
+    }
+
+    #[test]
+    fn daemon_write_and_connect_probes_withdraw_only_what_they_disprove() {
+        let mut ok = enforced_v8();
+        ok.record_daemon_probes(PROBE_DENIED, PROBE_DENIED);
+        assert_eq!((ok.status, ok.network), ("fully_enforced", "tcp_only"));
+        assert_eq!(ok.daemon_probes.write, PROBE_DENIED);
+        assert!(ok
+            .summary()
+            .contains("daemon_probes=write:eacces,connect:eacces"));
+
+        let mut wrote = enforced_v8();
+        wrote.record_daemon_probes(PROBE_ALLOWED, PROBE_DENIED);
+        assert_eq!(
+            (wrote.status, wrote.filesystem, wrote.network),
+            ("not_enforced", false, "none")
+        );
+        assert!(wrote
+            .notes
+            .iter()
+            .any(|n| n.contains("write probe allowed")));
+
+        let mut connected = enforced_v8();
+        connected.record_daemon_probes(PROBE_DENIED, PROBE_ALLOWED);
+        assert_eq!(
+            (connected.status, connected.filesystem),
+            ("fully_enforced", true)
+        );
+        assert_eq!(connected.network, "none");
+        assert!(connected.unconfined.contains(&"tcp"));
+
+        let mut odd = enforced_v8();
+        odd.record_daemon_probes("error:Unsupported", "error:TimedOut");
+        assert_eq!((odd.status, odd.network), ("fully_enforced", "tcp_only"));
+        assert_eq!(
+            odd.notes
+                .iter()
+                .filter(|n| n.contains("inconclusive"))
+                .count(),
+            2
+        );
+
+        let mut off = SandboxReport::disabled("no landlock");
+        off.record_daemon_probes(PROBE_ALLOWED, PROBE_ALLOWED);
+        assert_eq!(
+            off.daemon_probes.write, PROBE_ALLOWED,
+            "recorded, nothing to withdraw"
+        );
+    }
+
+    #[test]
+    fn seccomp_is_claimed_only_when_applied_and_both_socket_probes_were_denied() {
+        let mut r = enforced_v8();
+        assert!(r.unconfined.contains(&"udp"));
+        r.record_seccomp(&Ok(()), PROBE_EPERM, PROBE_EPERM);
+        assert_eq!(r.seccomp, SECCOMP_ACTIVE);
+        assert!(r.unconfined.is_empty(), "{:?}", r.unconfined);
+        assert!(r.summary().contains("seccomp=socket_denied unconfined="));
+
+        let mut half = enforced_v8();
+        half.record_seccomp(&Ok(()), PROBE_EPERM, PROBE_ALLOWED);
+        assert_eq!(half.seccomp, SECCOMP_INACTIVE);
+        assert_eq!(half.unconfined, UNCONFINED_BY_LANDLOCK.to_vec());
+
+        let mut failed = enforced_v8();
+        failed.record_seccomp(
+            &Err(Error::new("seccomp: EINVAL")),
+            PROBE_ALLOWED,
+            PROBE_ALLOWED,
+        );
+        assert_eq!(failed.seccomp, SECCOMP_INACTIVE);
+        assert!(failed.notes.iter().any(|n| n.contains("not applied")));
+
+        // Without Landlock, seccomp still closes UDP and Unix sockets.
+        let mut bare = SandboxReport::disabled("no landlock");
+        bare.record_seccomp(&Ok(()), PROBE_EPERM, PROBE_EPERM);
+        assert!(!bare.unconfined.contains(&"udp") && bare.unconfined.contains(&"filesystem"));
+    }
+
+    #[test]
+    fn the_socket_filter_compiles_and_probes_classify_outcomes() {
+        let program = socket_filter().unwrap();
+        assert!(!program.is_empty());
+        // Unconfined test process: everything is allowed (the real denials are checked in
+        // tests/sandbox.rs, which installs the filter in a child).
+        assert_eq!(probe_socket(), PROBE_ALLOWED);
+        assert_eq!(
+            probe_connect(),
+            PROBE_ALLOWED,
+            "connection refused counts as allowed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(probe_write(dir.path()), PROBE_ALLOWED);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "an allowed write probe leaves nothing behind"
+        );
     }
 }

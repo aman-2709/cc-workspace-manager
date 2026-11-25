@@ -2,9 +2,14 @@
 
 use std::fmt;
 
-/// Process exit codes. M4 adds dedicated codes for "port in use" and "already running".
+/// Process exit codes. The two dedicated codes are listed in the systemd unit's
+/// `RestartPreventExitStatus=`, so systemd does not restart-loop on them (REQUIREMENTS.md §13).
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
+/// The configured TCP port is used by another process.
+pub const EXIT_PORT_IN_USE: i32 = 10;
+/// Another daemon holds the instance lock.
+pub const EXIT_ALREADY_RUNNING: i32 = 11;
 
 #[derive(Debug)]
 pub struct Error {
@@ -35,7 +40,7 @@ impl Error {
         self.not_running
     }
 
-    /// An error that maps to a specific process exit code (M4: port in use, already running).
+    /// An error that maps to a specific process exit code ([`EXIT_PORT_IN_USE`], [`EXIT_ALREADY_RUNNING`]).
     pub fn with_exit_code(mut self, code: i32) -> Self {
         self.exit_code = code;
         self

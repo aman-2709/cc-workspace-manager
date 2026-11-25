@@ -144,6 +144,7 @@ pub async fn env() -> Env {
         session_dir: std::path::PathBuf::from(HOME).join(".claude"),
         roots: vec![std::path::PathBuf::from(HOME)],
         claude: None,
+        peer_lookup: "procfs",
     }));
     let router = http::router(service.clone());
     Env {

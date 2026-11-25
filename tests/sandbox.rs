@@ -9,12 +9,18 @@
 //! exactly like `ccwm serve`, and reports each probe's errno on stdout as `PROBE key=value`.
 //! Grandchildren (`op` mode) check that the ruleset is inherited.
 //!
+//! The `seccomp` child mode (M4) installs the real socket filter ([`sandbox::deny_new_sockets`])
+//! after the Landlock ruleset, like `ccwm serve` does once its listeners are bound, and checks
+//! that a thread created *before* the filter (TSYNC), threads created after it and grandchildren
+//! cannot create sockets, that the peer check's `NETLINK_SOCK_DIAG` socket still works, and that
+//! the daemon-level write and connect probes are denied.
+//!
 //! The real daemon's own confinement (its worker and blocking-pool thread probes) is checked in
 //! `tests/process.rs`. Set `CCWM_REQUIRE_LANDLOCK=1` to fail instead of skip when Landlock is
 //! unavailable.
 
 use cc_workspace_manager::paths::Dirs;
-use cc_workspace_manager::sandbox::{self, ALWAYS_UNCONFINED};
+use cc_workspace_manager::sandbox::{self, UNCONFINED_BY_LANDLOCK};
 use nix::errno::Errno;
 use std::collections::HashMap;
 use std::fs;
@@ -107,6 +113,8 @@ fn child_op(args: &[String]) {
             "127.0.0.1",
             arg.parse::<u16>().unwrap(),
         ))),
+        "udp" => outcome(std::net::UdpSocket::bind(("127.0.0.1", 0))),
+        "unix_connect" => outcome(UnixStream::connect(arg)),
         _ => "bad-op".into(),
     };
     println!("{result}");
@@ -134,9 +142,20 @@ fn child_main(mode: &str) {
         return;
     }
 
+    // For the seccomp mode: a loopback connection made before the sandbox (as the daemon's
+    // listeners are), for the peer check's netlink lookup under the filter.
+    let pre = (mode == "seccomp").then(|| {
+        let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        (server, client)
+    });
     let policy = policy(&l, allowed_port);
     let report = sandbox::apply(&policy).unwrap();
     probe("report", serde_json::to_string(&report).unwrap());
+    if let Some(connection) = pre {
+        seccomp_probes(&l, &connection);
+        return;
+    }
     if mode == "ephemeral" {
         probe("bind_ephemeral", outcome(TcpListener::bind("127.0.0.1:0")));
         return;
@@ -217,6 +236,81 @@ fn child_main(mode: &str) {
     // A system binary can still be executed (git and claude live under the system paths).
     probe(
         "exec_system_binary",
+        outcome(
+            sandbox::child_command("/bin/sh")
+                .args(["-c", "exit 0"])
+                .status()
+                .and_then(|s| {
+                    s.success()
+                        .then_some(())
+                        .ok_or_else(|| io::Error::other("sh failed"))
+                }),
+        ),
+    );
+}
+
+/// After the Landlock ruleset (the daemon's order): the seccomp socket filter and what it denies.
+fn seccomp_probes(l: &Layout, (server, client): &(TcpListener, TcpStream)) {
+    // Daemon-level probes before the filter (they need socket()).
+    probe("daemon_write_outside", sandbox::probe_write(&l.outside));
+    probe("daemon_write_readonly_root", sandbox::probe_write(&l.ro));
+    probe("daemon_write_inside", sandbox::probe_write(&l.dirs().data));
+    probe("daemon_connect", sandbox::probe_connect());
+    // A thread that exists before the filter is installed (TSYNC must cover it).
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
+    let early = std::thread::spawn(move || {
+        go_rx.recv().unwrap();
+        done_tx.send(sandbox::probe_socket()).unwrap();
+    });
+    let applied = sandbox::deny_new_sockets();
+    probe(
+        "seccomp_applied",
+        outcome(applied.map_err(io::Error::other)),
+    );
+    probe("socket_main", sandbox::probe_socket());
+    go_tx.send(()).unwrap();
+    probe("socket_thread_created_before", done_rx.recv().unwrap());
+    early.join().unwrap();
+    probe(
+        "socket_thread_created_after",
+        std::thread::spawn(sandbox::probe_socket).join().unwrap(),
+    );
+    probe(
+        "unix_connect_by_path_outside",
+        outcome(UnixStream::connect(l.outside.join("u.sock"))),
+    );
+    probe("socketpair", outcome(UnixStream::pair()));
+    probe(
+        "netlink_route",
+        outcome(
+            nix::sys::socket::socket(
+                nix::sys::socket::AddressFamily::Netlink,
+                nix::sys::socket::SockType::Datagram,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+                nix::sys::socket::SockProtocol::NetlinkRoute,
+            )
+            .map_err(io::Error::from),
+        ),
+    );
+    let me = nix::unistd::geteuid().as_raw();
+    probe(
+        "netlink_sock_diag",
+        match cc_workspace_manager::http::peer::sock_diag_query(
+            client.local_addr().unwrap(),
+            server.local_addr().unwrap(),
+        ) {
+            Ok(Some(uid)) if uid == me => "ok".to_string(),
+            other => format!("{other:?}"),
+        },
+    );
+    probe("grandchild_udp", in_grandchild("udp", ""));
+    probe(
+        "grandchild_unix_connect",
+        in_grandchild("unix_connect", l.outside.join("u.sock").to_str().unwrap()),
+    );
+    probe(
+        "exec_after_filter",
         outcome(
             sandbox::child_command("/bin/sh")
                 .args(["-c", "exit 0"])
@@ -434,7 +528,7 @@ fn landlock_confines_the_process_threads_and_children() {
 
     // Residual risk, asserted so that a kernel/policy change is noticed and the docs updated.
     want("unix_connect_by_path_outside", "ok");
-    for u in ALWAYS_UNCONFINED {
+    for u in UNCONFINED_BY_LANDLOCK {
         assert!(
             r["unconfined"].as_array().unwrap().iter().any(|v| v == u),
             "{u}: {r}"
@@ -500,6 +594,45 @@ fn a_second_thread_at_apply_time_makes_the_report_claim_nothing() {
     assert!(r["threads_at_apply"].as_u64().unwrap() >= 2, "{r}");
 }
 
+/// M4: the seccomp socket filter (installed after Landlock, on every thread) closes the two
+/// residuals Landlock leaves open, keeps the peer check's netlink lookup working, and the
+/// daemon-level write/connect probes are denied by Landlock.
+fn the_seccomp_filter_denies_new_sockets_everywhere_but_the_peer_check() {
+    let s = setup();
+    let p = run_child("seccomp", &s);
+    let want =
+        |k: &str, v: &str| assert_eq!(p.get(k).map(String::as_str), Some(v), "probe {k}: {p:#?}");
+    want("seccomp_applied", "ok");
+    for k in [
+        "socket_main",
+        "socket_thread_created_before",
+        "socket_thread_created_after",
+    ] {
+        want(k, sandbox::PROBE_EPERM);
+    }
+    want("unix_connect_by_path_outside", "EPERM");
+    want("netlink_route", "EPERM");
+    want("grandchild_udp", "EPERM");
+    want("grandchild_unix_connect", "EPERM");
+    want("socketpair", "ok");
+    want("exec_after_filter", "ok");
+    want("netlink_sock_diag", "ok");
+    if !enforced(&p) {
+        return;
+    }
+    want("daemon_write_outside", sandbox::PROBE_DENIED);
+    want("daemon_write_readonly_root", sandbox::PROBE_DENIED);
+    want("daemon_write_inside", sandbox::PROBE_ALLOWED);
+    if report(&p)["network"] == "tcp_only" {
+        want("daemon_connect", sandbox::PROBE_DENIED);
+    }
+    assert_eq!(
+        fs::read_dir(&s.layout.outside).unwrap().count(),
+        2,
+        "nothing created outside (only the fixture file and socket)"
+    );
+}
+
 fn child_processes_do_not_inherit_session_ipc_variables() {
     // Safe: this harness-less test binary is single-threaded here.
     std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus");
@@ -540,7 +673,7 @@ fn main() {
         }
         return;
     }
-    let tests: [(&str, fn()); 4] = [
+    let tests: [(&str, fn()); 5] = [
         (
             "landlock_confines_the_process_threads_and_children",
             landlock_confines_the_process_threads_and_children,
@@ -552,6 +685,10 @@ fn main() {
         (
             "a_second_thread_at_apply_time_makes_the_report_claim_nothing",
             a_second_thread_at_apply_time_makes_the_report_claim_nothing,
+        ),
+        (
+            "the_seccomp_filter_denies_new_sockets_everywhere_but_the_peer_check",
+            the_seccomp_filter_denies_new_sockets_everywhere_but_the_peer_check,
         ),
         (
             "child_processes_do_not_inherit_session_ipc_variables",

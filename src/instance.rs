@@ -60,7 +60,8 @@ impl InstanceLock {
         Err(Error::new(format!(
             "another ccwm daemon is already running (lock held on {}). Use `ccwm open` to reach it",
             path.display()
-        )))
+        ))
+        .with_exit_code(crate::error::EXIT_ALREADY_RUNNING))
     }
 }
 

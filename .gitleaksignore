@@ -1,0 +1,17 @@
+# gitleaks: reviewed findings in the history, all synthetic test data (M4 review, 2026-11-24):
+# the jwt.io sample JWT, the RFC 6455 sample Sec-WebSocket-Key, hexadecimal placeholder values,
+# stub key blocks and SYNTHETIC canaries in redaction tests. Format: <commit>:<file>:<rule>:<line>.
+8a0facb8e8b74353e8ee47edd8cfa893ee345e35:src/claude/redact.rs:jwt:79
+8a0facb8e8b74353e8ee47edd8cfa893ee345e35:src/claude/redact.rs:private-key:105
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:gcp-api-key:170
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:gitlab-pat:168
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:generic-api-key:131
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:generic-api-key:132
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:generic-api-key:133
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:generic-api-key:148
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:private-key:153
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:stripe-access-token:165
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:stripe-access-token:166
+93f6d2f43e04f08e83e2a0340299fec7c8fc0b76:src/claude/redact.rs:stripe-access-token:167
+be95a61113e31c9c91e4b22924ac5f36f753c65b:tests/common/mod.rs:generic-api-key:209
+be95a61113e31c9c91e4b22924ac5f36f753c65b:tests/http.rs:generic-api-key:1280

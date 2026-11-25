@@ -1,12 +1,21 @@
 //! TCP peer-UID verification (REQUIREMENTS.md §11.2/§11.3; M1.1 findings H1/H2).
 //!
 //! Every accepted loopback connection is attributed to the Linux user that owns the *client*
-//! socket, by finding the client's end of the connection in `/proc/net/tcp` (and `/proc/net/tcp6`
-//! for dual-stack clients): the row whose local address is the client's address and whose remote
-//! address is ours. The connection is served only if that user is the daemon's effective UID, so a
-//! sign-in link or session token leaked to another local user is useless to them. The check runs
-//! once per connection (HTTP keep-alive requests on it inherit the result) and fails closed: no
-//! row, several rows with different owners, or an unreadable table all mean "reject".
+//! socket: the socket whose local address is the client's address and whose remote address is
+//! ours. The connection is served only if that user is the daemon's effective UID, so a sign-in
+//! link or session token leaked to another local user is useless to them. The check runs once per
+//! connection (HTTP keep-alive requests on it inherit the result) and fails closed.
+//!
+//! Two lookups find that socket (M4):
+//! - **`sock_diag`** (preferred): one exact `SOCK_DIAG_BY_FAMILY` request over a `NETLINK_SOCK_DIAG`
+//!   socket for the client's 4-tuple; the kernel answers with that one socket (or `ENOENT`). No
+//!   table is scanned. The reply must describe exactly the requested 4-tuple in a state other than
+//!   `LISTEN`/`TIME_WAIT`, else "not found".
+//! - **procfs** (fallback when `sock_diag` is unusable, decided once at startup by
+//!   [`select_lookup`]): the matching row of `/proc/net/tcp` (and `/proc/net/tcp6` for
+//!   dual-stack clients). No row or several rows with different owners mean "not found".
+//!
+//! Either way, "not found", an error or another owner all mean "reject".
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -34,6 +43,198 @@ pub fn procfs_lookup() -> PeerUidLookup {
         }
         Ok(single_uid(uids))
     })
+}
+
+/// Which lookup the daemon uses (reported in `service.status` as `peer_lookup`).
+pub const METHOD_SOCK_DIAG: &str = "sock_diag";
+pub const METHOD_PROCFS: &str = "procfs";
+
+/// The production lookup: `sock_diag` if a self-test over a real loopback connection finds this
+/// process's own socket, else procfs. Must run before the seccomp filter and the Landlock rules
+/// exist (it binds an ephemeral loopback port), i.e. single-threaded at the start of `serve`.
+pub fn select_lookup() -> (PeerUidLookup, &'static str) {
+    if sock_diag_self_test().is_ok() {
+        (Arc::new(sock_diag_query), METHOD_SOCK_DIAG)
+    } else {
+        (procfs_lookup(), METHOD_PROCFS)
+    }
+}
+
+/// Look up our own connection to our own listener through `sock_diag`; `Ok` only if it names
+/// our effective UID.
+pub fn sock_diag_self_test() -> io::Result<()> {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let server = listener.local_addr()?;
+    let client = std::net::TcpStream::connect(server)?;
+    let (_accepted, remote) = listener.accept()?;
+    let me = nix::unistd::geteuid().as_raw();
+    debug_assert_eq!(remote, client.local_addr()?);
+    match sock_diag_query(remote, server)? {
+        Some(uid) if uid == me => Ok(()),
+        other => Err(io::Error::other(format!(
+            "sock_diag self-test returned {other:?}"
+        ))),
+    }
+}
+
+// ---- sock_diag (netlink) --------------------------------------------------------------------
+
+const NLMSG_HDR: usize = 16;
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+const NLM_F_REQUEST: u16 = 1;
+const SOCK_DIAG_BY_FAMILY: u16 = 20;
+const IPPROTO_TCP: u8 = 6;
+const TCP_STATE_TIME_WAIT: u8 = 6;
+const TCP_STATE_LISTEN: u8 = 10;
+/// `inet_diag_sockid`: sport, dport (big endian), src[16], dst[16], interface, cookie[2].
+const SOCKID_LEN: usize = 48;
+/// `inet_diag_req_v2`: family, protocol, ext, pad, states, sockid.
+const REQ_LEN: usize = 8 + SOCKID_LEN;
+/// `inet_diag_msg`: family, state, timer, retrans, sockid, expires, rqueue, wqueue, uid, inode.
+const MSG_LEN: usize = 4 + SOCKID_LEN + 20;
+const MSG_UID_OFFSET: usize = 4 + SOCKID_LEN + 12;
+const REQUEST_SEQ: u32 = 1;
+
+/// One exact `sock_diag` lookup of the socket whose local end is `client` and remote end is
+/// `server`: its owner, `None` if the kernel has no such socket.
+pub fn sock_diag_query(client: SocketAddr, server: SocketAddr) -> io::Result<Option<u32>> {
+    use nix::sys::socket::{self, AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol};
+    use std::os::fd::AsRawFd;
+    let (client, server) = (canonical(client), canonical(server));
+    let Some(request) = diag_request(client, server) else {
+        return Ok(None);
+    };
+    let fd = socket::socket(
+        AddressFamily::Netlink,
+        socket::SockType::Datagram,
+        SockFlag::SOCK_CLOEXEC,
+        SockProtocol::NetlinkSockDiag,
+    )
+    .map_err(io::Error::from)?;
+    socket::setsockopt(
+        &fd,
+        socket::sockopt::ReceiveTimeout,
+        &nix::sys::time::TimeVal::new(2, 0),
+    )
+    .map_err(io::Error::from)?;
+    socket::sendto(
+        fd.as_raw_fd(),
+        &request,
+        &NetlinkAddr::new(0, 0),
+        MsgFlags::empty(),
+    )
+    .map_err(io::Error::from)?;
+    let mut buf = vec![0u8; 8192];
+    let n = socket::recv(fd.as_raw_fd(), &mut buf, MsgFlags::empty()).map_err(io::Error::from)?;
+    parse_diag_reply(&buf[..n], client, server)
+}
+
+/// The address bytes of a `sockid` field (IPv4 in the first 4 bytes).
+fn diag_addr(ip: IpAddr) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    match ip {
+        IpAddr::V4(v4) => out[..4].copy_from_slice(&v4.octets()),
+        IpAddr::V6(v6) => out.copy_from_slice(&v6.octets()),
+    }
+    out
+}
+
+fn family(addr: SocketAddr) -> u8 {
+    let f = match addr {
+        SocketAddr::V4(_) => nix::libc::AF_INET,
+        SocketAddr::V6(_) => nix::libc::AF_INET6,
+    };
+    u8::try_from(f).unwrap_or(0)
+}
+
+fn sockid(local: SocketAddr, remote: SocketAddr) -> [u8; SOCKID_LEN] {
+    let mut id = [0u8; SOCKID_LEN];
+    id[0..2].copy_from_slice(&local.port().to_be_bytes());
+    id[2..4].copy_from_slice(&remote.port().to_be_bytes());
+    id[4..20].copy_from_slice(&diag_addr(local.ip()));
+    id[20..36].copy_from_slice(&diag_addr(remote.ip()));
+    // interface 0 (any); cookie INET_DIAG_NOCOOKIE
+    id[40..48].copy_from_slice(&[0xff; 8]);
+    id
+}
+
+/// The netlink request for the socket `client -> server` (`None` if the families differ, which
+/// no loopback connection to our IPv4 listener can produce).
+pub fn diag_request(client: SocketAddr, server: SocketAddr) -> Option<Vec<u8>> {
+    if family(client) != family(server) {
+        return None;
+    }
+    let len = u32::try_from(NLMSG_HDR + REQ_LEN).ok()?;
+    let mut m = Vec::with_capacity(NLMSG_HDR + REQ_LEN);
+    m.extend_from_slice(&len.to_ne_bytes());
+    m.extend_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    m.extend_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+    m.extend_from_slice(&REQUEST_SEQ.to_ne_bytes());
+    m.extend_from_slice(&0u32.to_ne_bytes()); // port id: the kernel fills it in
+    m.extend_from_slice(&[family(client), IPPROTO_TCP, 0, 0]);
+    m.extend_from_slice(&u32::MAX.to_ne_bytes()); // every state; checked in the reply
+    m.extend_from_slice(&sockid(client, server));
+    Some(m)
+}
+
+fn u16_at(b: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_ne_bytes(b.get(at..at + 2)?.try_into().ok()?))
+}
+
+fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn malformed() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "malformed sock_diag reply")
+}
+
+/// The owner of the socket in a `sock_diag` reply, if it describes exactly `client -> server`
+/// in an established-like state; `ENOENT` means not found; other errors are errors.
+pub fn parse_diag_reply(
+    buf: &[u8],
+    client: SocketAddr,
+    server: SocketAddr,
+) -> io::Result<Option<u32>> {
+    let want = sockid(client, server);
+    let mut found: Vec<u32> = Vec::new();
+    let mut at = 0;
+    while at + NLMSG_HDR <= buf.len() {
+        let len = u32_at(buf, at).ok_or_else(malformed)? as usize;
+        let kind = u16_at(buf, at + 4).ok_or_else(malformed)?;
+        let seq = u32_at(buf, at + 8).ok_or_else(malformed)?;
+        if len < NLMSG_HDR || at + len > buf.len() {
+            return Err(malformed());
+        }
+        let body = &buf[at + NLMSG_HDR..at + len];
+        match kind {
+            NLMSG_ERROR => {
+                let code = u32_at(body, 0).ok_or_else(malformed)? as i32;
+                match -code {
+                    0 => {}
+                    e if e == nix::libc::ENOENT => return Ok(None),
+                    e => return Err(io::Error::from_raw_os_error(e)),
+                }
+            }
+            NLMSG_DONE => break,
+            SOCK_DIAG_BY_FAMILY if seq == REQUEST_SEQ => {
+                if body.len() < MSG_LEN {
+                    return Err(malformed());
+                }
+                let state = body[1];
+                // The kernel echoes the cookie it found, so compare addresses and ports only.
+                let same = body[0] == family(client) && body[4..4 + 40] == want[..40];
+                if same && state != TCP_STATE_LISTEN && state != TCP_STATE_TIME_WAIT {
+                    found.push(u32_at(body, MSG_UID_OFFSET).ok_or_else(malformed)?);
+                }
+            }
+            _ => {}
+        }
+        // Messages are aligned to 4 bytes.
+        at += (len + 3) & !3;
+    }
+    Ok(single_uid(found))
 }
 
 /// Why a connection is or is not served.
@@ -243,5 +444,157 @@ mod tests {
         // A port pair that does not exist is not found.
         let bogus = SocketAddr::new(remote.ip(), remote.port().wrapping_add(1).max(1));
         assert_eq!(procfs_lookup()(bogus, addr("127.0.0.1:1")).unwrap(), None);
+    }
+
+    /// A reply message the way the kernel builds it for `local -> remote`.
+    fn diag_msg(local: SocketAddr, remote: SocketAddr, state: u8, uid: u32, seq: u32) -> Vec<u8> {
+        let mut body = vec![family(local), state, 0, 0];
+        let mut id = sockid(local, remote);
+        id[40..48].copy_from_slice(&[7; 8]); // a real cookie, not NOCOOKIE
+        body.extend_from_slice(&id);
+        body.extend_from_slice(&[0u8; 12]); // expires, rqueue, wqueue
+        body.extend_from_slice(&uid.to_ne_bytes());
+        body.extend_from_slice(&4242u32.to_ne_bytes()); // inode
+        nl(SOCK_DIAG_BY_FAMILY, seq, &body)
+    }
+
+    fn nl(kind: u16, seq: u32, body: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(NLMSG_HDR + body.len()).unwrap();
+        let mut m = len.to_ne_bytes().to_vec();
+        m.extend_from_slice(&kind.to_ne_bytes());
+        m.extend_from_slice(&0u16.to_ne_bytes());
+        m.extend_from_slice(&seq.to_ne_bytes());
+        m.extend_from_slice(&0u32.to_ne_bytes());
+        m.extend_from_slice(body);
+        while m.len() % 4 != 0 {
+            m.push(0);
+        }
+        m
+    }
+
+    fn nl_error(errno: i32) -> Vec<u8> {
+        let mut body = (-errno).to_ne_bytes().to_vec();
+        body.extend_from_slice(&[0u8; 16]); // the echoed request header
+        nl(NLMSG_ERROR, REQUEST_SEQ, &body)
+    }
+
+    #[test]
+    fn the_diag_request_describes_the_client_end_of_the_connection() {
+        let (client, server) = (addr("127.0.0.1:50000"), addr("127.0.0.1:8765"));
+        let r = diag_request(client, server).unwrap();
+        assert_eq!(r.len(), 72);
+        assert_eq!(u32_at(&r, 0), Some(72));
+        assert_eq!(u16_at(&r, 4), Some(SOCK_DIAG_BY_FAMILY));
+        assert_eq!(
+            u16_at(&r, 6),
+            Some(NLM_F_REQUEST),
+            "an exact lookup, not a dump"
+        );
+        assert_eq!(r[16], family(client));
+        assert_eq!(r[17], IPPROTO_TCP);
+        let id = &r[24..];
+        assert_eq!(&id[0..2], &50000u16.to_be_bytes(), "source = the client");
+        assert_eq!(&id[2..4], &8765u16.to_be_bytes(), "destination = us");
+        assert_eq!(&id[4..8], &[127, 0, 0, 1]);
+        assert_eq!(&id[20..24], &[127, 0, 0, 1]);
+        assert_eq!(&id[40..48], &[0xff; 8], "no cookie");
+        let mapped = addr("[::ffff:127.0.0.1]:50000");
+        assert_eq!(
+            diag_request(canonical(mapped), server),
+            Some(r),
+            "v4-mapped clients are looked up as IPv4"
+        );
+        assert_eq!(diag_request(addr("[::1]:1"), server), None);
+    }
+
+    #[test]
+    fn the_diag_reply_must_name_exactly_the_requested_socket() {
+        let (client, server) = (addr("127.0.0.1:50000"), addr("127.0.0.1:8765"));
+        let ok = diag_msg(client, server, 1, 1001, REQUEST_SEQ);
+        assert_eq!(parse_diag_reply(&ok, client, server).unwrap(), Some(1001));
+        let done = nl(NLMSG_DONE, REQUEST_SEQ, &[0; 4]);
+        assert_eq!(
+            parse_diag_reply(&[ok.clone(), done].concat(), client, server).unwrap(),
+            Some(1001)
+        );
+        for (what, reply) in [
+            (
+                "our own accepted end",
+                diag_msg(server, client, 1, 1000, REQUEST_SEQ),
+            ),
+            (
+                "another port",
+                diag_msg(addr("127.0.0.1:50001"), server, 1, 1000, REQUEST_SEQ),
+            ),
+            (
+                "TIME_WAIT",
+                diag_msg(client, server, TCP_STATE_TIME_WAIT, 0, REQUEST_SEQ),
+            ),
+            (
+                "LISTEN",
+                diag_msg(client, server, TCP_STATE_LISTEN, 1000, REQUEST_SEQ),
+            ),
+            (
+                "another request",
+                diag_msg(client, server, 1, 1000, REQUEST_SEQ + 1),
+            ),
+            ("not found", nl_error(nix::libc::ENOENT)),
+            ("empty", Vec::new()),
+        ] {
+            assert_eq!(
+                parse_diag_reply(&reply, client, server).unwrap(),
+                None,
+                "{what}"
+            );
+        }
+        let two = [ok.clone(), diag_msg(client, server, 1, 1002, REQUEST_SEQ)].concat();
+        assert_eq!(
+            parse_diag_reply(&two, client, server).unwrap(),
+            None,
+            "ambiguous"
+        );
+        let same_twice = [ok.clone(), ok.clone()].concat();
+        assert_eq!(
+            parse_diag_reply(&same_twice, client, server).unwrap(),
+            Some(1001)
+        );
+        assert_eq!(
+            parse_diag_reply(&nl_error(nix::libc::ENOMEM), client, server)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(nix::libc::ENOMEM)
+        );
+        for broken in [ok[..20].to_vec(), ok[..ok.len() - 8].to_vec(), {
+            let mut b = ok.clone();
+            b[0..4].copy_from_slice(&8u32.to_ne_bytes());
+            b
+        }] {
+            assert!(parse_diag_reply(&broken, client, server).is_err());
+        }
+    }
+
+    #[test]
+    fn sock_diag_finds_our_own_connection_like_procfs_and_nothing_else() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(server).unwrap();
+        let (_accepted, remote) = listener.accept().unwrap();
+        assert_eq!(remote, client.local_addr().unwrap());
+        let me = nix::unistd::geteuid().as_raw();
+        assert_eq!(sock_diag_query(remote, server).unwrap(), Some(me));
+        assert_eq!(
+            sock_diag_query(remote, server).unwrap(),
+            procfs_lookup()(remote, server).unwrap()
+        );
+        // The server's own end is not the client's.
+        assert_eq!(sock_diag_query(server, remote).unwrap(), Some(me));
+        let bogus = SocketAddr::new(remote.ip(), remote.port().wrapping_add(1).max(1));
+        assert_eq!(sock_diag_query(bogus, server).unwrap(), None);
+        // A closed connection is gone (or in TIME_WAIT): never attributed.
+        drop(client);
+        drop(_accepted);
+        assert_ne!(sock_diag_query(remote, server).unwrap(), Some(me));
+        sock_diag_self_test().unwrap();
+        assert_eq!(select_lookup().1, METHOD_SOCK_DIAG);
     }
 }

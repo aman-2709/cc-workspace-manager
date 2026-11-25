@@ -4,6 +4,7 @@ use crate::client;
 use crate::daemon::{self, ServeArgs};
 use crate::error::{Error, Result};
 use crate::paths::{current_home, Dirs, EnvVars, Owner};
+use crate::systemd;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -41,10 +42,47 @@ pub enum Command {
         #[arg(long)]
         print: bool,
     },
-    /// Show the running daemon's state (verified over the Unix socket).
+    /// Show the systemd unit's state and the running daemon's state (verified over the Unix socket).
     Status,
     /// Ask the daemon to rescan now and wait until the scan has finished.
     Scan,
+    /// Start the ccwm.service user unit (`systemctl --user start`).
+    Start,
+    /// Stop the ccwm.service user unit (`systemctl --user stop`).
+    Stop,
+    /// Restart the ccwm.service user unit (`systemctl --user restart`).
+    Restart,
+    /// Check the installation and the running daemon; suggests fixes, never applies them.
+    Doctor,
+    /// Install or remove the systemd user unit.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// Browser sign-in management.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Write ~/.config/systemd/user/ccwm.service, then `daemon-reload` and `enable --now`.
+    Install,
+    /// `disable --now` and remove the unit; your data is kept unless --purge is given.
+    Uninstall {
+        /// Also delete ccwm's configuration, database and state (asks for confirmation).
+        /// Project files and Claude Code sessions are never touched.
+        #[arg(long)]
+        purge: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthAction {
+    /// Sign out every browser session.
+    RevokeAll,
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -56,6 +94,19 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Open { print } => open(print),
         Command::Status => status(),
         Command::Scan => scan(),
+        Command::Start => unit_command("start"),
+        Command::Stop => unit_command("stop"),
+        Command::Restart => unit_command("restart"),
+        Command::Doctor => crate::doctor::run(),
+        Command::Service {
+            action: ServiceAction::Install,
+        } => service_install(),
+        Command::Service {
+            action: ServiceAction::Uninstall { purge },
+        } => service_uninstall(purge),
+        Command::Auth {
+            action: AuthAction::RevokeAll,
+        } => revoke_all(),
     }
 }
 
@@ -122,6 +173,10 @@ pub fn retry_while_starting<T>(
 }
 
 fn status() -> Result<()> {
+    println!(
+        "{}",
+        systemd::status_line(&systemd::Systemctl::find(systemd::path_var().as_deref()))
+    );
     let (socket, uid, st) = first_call("service.status")?;
     print!("{}", format_status(&st));
     if let Ok(d) = client::call(&socket, uid, "discovery.status") {
@@ -221,11 +276,12 @@ pub fn format_status(v: &serde_json::Value) -> String {
         s(v, "/claude/resume_supported")
     ));
     out.push_str(&format!(
-        "  sandbox: {} (abi {}, filesystem {}, network {})\n",
+        "  sandbox: {} (abi {}, filesystem {}, network {}, seccomp {})\n",
         s(v, "/sandbox/status"),
         s(v, "/sandbox/abi"),
         s(v, "/sandbox/filesystem"),
-        s(v, "/sandbox/network")
+        s(v, "/sandbox/network"),
+        s(v, "/sandbox/seccomp")
     ));
     out
 }
@@ -380,6 +436,179 @@ fn scan() -> Result<()> {
     }
 }
 
+/// How long `ccwm start|restart|service install` wait for the daemon to answer on its socket.
+const SERVICE_START_WAIT: Duration = Duration::from_secs(10);
+/// How long `ccwm stop` waits for the daemon to release its lock (the unit's TimeoutStopSec).
+const SERVICE_STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// Wait until a daemon answers `ping` over the Unix socket (verified peer), or give up.
+fn wait_until_running(wait: Duration) -> Result<serde_json::Value> {
+    retry_while_starting(wait, Duration::from_millis(100), || {
+        daemon_socket().and_then(|(socket, uid)| client::call(&socket, uid, "ping"))
+    })
+}
+
+/// Wait until nobody holds the instance lock (the daemon exited), or give up.
+fn wait_until_stopped(dirs: &Dirs, wait: Duration) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    while crate::instance::lock_held(dirs) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+fn report_running(verb: &str) -> Result<()> {
+    match wait_until_running(SERVICE_START_WAIT) {
+        Ok(ping) => {
+            println!(
+                "ccwm {} ({verb}). Open the dashboard with `ccwm open`.",
+                s(&ping, "/version")
+            );
+            Ok(())
+        }
+        Err(e) => Err(Error::new(format!(
+            "ccwm.service did not answer within {} s ({e}). See `systemctl --user status ccwm` and `journalctl --user -u ccwm`",
+            SERVICE_START_WAIT.as_secs()
+        ))),
+    }
+}
+
+/// `ccwm start|stop|restart`: `systemctl --user <verb> ccwm.service`, then wait for the result.
+fn unit_command(verb: &str) -> Result<()> {
+    let systemctl = systemd::Systemctl::find(systemd::path_var().as_deref())?;
+    systemctl.require_installed()?;
+    systemctl.run(&[verb, systemd::UNIT_NAME])?;
+    if verb == "stop" {
+        let (dirs, _) = daemon_dirs()?;
+        if wait_until_stopped(&dirs, SERVICE_STOP_WAIT) {
+            println!("ccwm stopped.");
+            return Ok(());
+        }
+        return Err(Error::new(
+            "ccwm.service stopped, but a ccwm daemon still holds the instance lock: one runs outside systemd (`ccwm serve`); stop it there",
+        ));
+    }
+    report_running(if verb == "start" {
+        "started"
+    } else {
+        "restarted"
+    })
+}
+
+fn service_install() -> Result<()> {
+    let (_, uid) = daemon_dirs()?;
+    let home = current_home(uid)?;
+    let env = EnvVars::from_process();
+    let binary = home.join(systemd::BINARY_IN_HOME);
+    let executable = std::fs::metadata(&binary).is_ok_and(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        m.is_file() && m.permissions().mode() & 0o111 != 0
+    });
+    if !executable {
+        let this = std::env::current_exe()
+            .map_or_else(|_| "ccwm".to_string(), |p| p.display().to_string());
+        return Err(Error::new(format!(
+            "the unit runs {}, which does not exist. Install the binary first (scripts/install.sh does both), e.g. `install -D -m 0755 {this} {}`",
+            binary.display(),
+            binary.display()
+        )));
+    }
+    let systemctl = systemd::Systemctl::find(systemd::path_var().as_deref())?;
+    let unit_dir = systemd::unit_dir(&env, &home);
+    let written = systemd::write_unit(&unit_dir, &Owner::current(uid))?;
+    let unit = unit_dir.join(systemd::UNIT_NAME);
+    match written {
+        systemd::UnitWrite::Created => println!("Installed {}", unit.display()),
+        systemd::UnitWrite::Updated => println!("Updated {}", unit.display()),
+        systemd::UnitWrite::Unchanged => println!("{} is up to date", unit.display()),
+    }
+    systemctl.run(&["daemon-reload"])?;
+    let was_active = systemctl.states().is_ok_and(|(a, _)| a == "active");
+    systemctl.run(&["enable", "--now", systemd::UNIT_NAME])?;
+    if was_active && written != systemd::UnitWrite::Unchanged {
+        println!("The service was already running: `ccwm restart` applies the new unit.");
+    }
+    report_running("running")?;
+    let linger = systemd::linger_enabled(systemd::user_name(uid).as_deref());
+    if linger != Some(true) {
+        println!(
+            "It starts when you log in. To start it at boot, before you log in, enable lingering: `loginctl enable-linger {}` (may need administrator authorization).",
+            systemd::user_name(uid).unwrap_or_else(|| "$USER".into())
+        );
+    }
+    Ok(())
+}
+
+fn service_uninstall(purge: bool) -> Result<()> {
+    let (dirs, uid) = daemon_dirs()?;
+    let home = current_home(uid)?;
+    let env = EnvVars::from_process();
+    let unit = systemd::unit_dir(&env, &home).join(systemd::UNIT_NAME);
+    let systemctl = systemd::Systemctl::find(systemd::path_var().as_deref())?;
+    if systemctl.installed()? {
+        systemctl.run(&["disable", "--now", systemd::UNIT_NAME])?;
+    }
+    match std::fs::remove_file(&unit) {
+        Ok(()) => println!("Removed {}", unit.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("{} is not installed", unit.display());
+        }
+        Err(e) => return Err(Error::io(format!("cannot remove {}", unit.display()), &e)),
+    }
+    systemctl.run(&["daemon-reload"])?;
+    if systemctl.installed()? {
+        println!(
+            "note: the user manager still knows ccwm.service from another location (not installed by ccwm); left alone"
+        );
+    }
+    if !purge {
+        println!(
+            "Your ccwm data is kept ({}, {}, {}). `ccwm service uninstall --purge` deletes it.",
+            dirs.config.display(),
+            dirs.data.display(),
+            dirs.state.display()
+        );
+        return Ok(());
+    }
+    if !wait_until_stopped(&dirs, SERVICE_STOP_WAIT) {
+        return Err(Error::new(
+            "a ccwm daemon is still running (outside systemd?); stop it before purging its data",
+        ));
+    }
+    let list: Vec<String> = dirs
+        .all()
+        .iter()
+        .map(|d| format!("  {}", d.display()))
+        .collect();
+    let prompt = format!(
+        "This deletes ccwm's configuration, database and state:\n{}\nYour projects and Claude Code sessions are not touched.",
+        list.join("\n")
+    );
+    if !systemd::confirm(&prompt, &mut std::io::stdin().lock()) {
+        return Err(Error::new("not confirmed; nothing was deleted"));
+    }
+    for d in systemd::purge_dirs(&dirs, uid)? {
+        println!("Deleted {}", d.display());
+    }
+    Ok(())
+}
+
+fn revoke_all() -> Result<()> {
+    let (_, _, r) = first_call("auth.revoke_all")?;
+    let n = r
+        .get("revoked")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    println!(
+        "Signed out {n} browser session{}. Run `ccwm open` to sign in again.",
+        if n == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
 fn open(print_only: bool) -> Result<()> {
     let (_, _, issued) = first_call("auth.bootstrap")?;
     let token = issued.get("bootstrap_token").and_then(|v| v.as_str());
@@ -488,7 +717,7 @@ mod status_tests {
             "monitoring": {"watcher": "inotify", "watches": 3, "budget": 8192, "watched_projects": 2,
                            "partial_projects": 4, "polled_projects": 1, "degraded": true, "advice": ["raise it"]},
             "git": {"program": "/usr/bin/git", "version": "2.43.0", "hardened_status": true},
-            "sandbox": {"status": "fully_enforced", "abi": 8, "filesystem": true, "network": "tcp_only"}
+            "sandbox": {"status": "fully_enforced", "abi": 8, "filesystem": true, "network": "tcp_only", "seccomp": "socket_denied"}
         });
         let t = format_status(&v);
         for want in [
@@ -499,7 +728,7 @@ mod status_tests {
             "2 watched, 4 partly watched, 1 polled",
             "! raise it",
             "2.43.0",
-            "tcp_only",
+            "network tcp_only, seccomp socket_denied)",
         ] {
             assert!(t.contains(want), "{want} in {t}");
         }

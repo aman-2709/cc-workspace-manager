@@ -288,7 +288,8 @@ fn random_id() -> Result<String> {
 impl Writer {
     /// Open (and migrate) the database, then start the writer thread.
     pub fn spawn(db_path: &Path) -> Result<Self> {
-        let conn = open_writer_connection(db_path)?;
+        let mut conn = open_writer_connection(db_path)?;
+        reindex_if_parser_changed(&mut conn, crate::claude::parse::PARSER_VERSION)?;
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let store_prompts = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&store_prompts);
@@ -949,6 +950,52 @@ fn clear_session_index(c: &Connection) -> Result<Vec<String>> {
         .map_err(|e| db_err("clear session index", &e))?;
     refresh_session_summary(c, &mut affected)?;
     Ok(affected)
+}
+
+/// `meta` key holding the [`crate::claude::parse::PARSER_VERSION`] the session index was built with.
+pub const PARSER_VERSION_KEY: &str = "session_parser_version";
+
+/// On an upgrade that changed the session parsing rules, clear the derived session index (in one
+/// transaction with the new version), so the next ingest parses every file again from byte 0
+/// and no row keeps a value computed by older rules. Projects stay; their session counts are
+/// recomputed. Returns whether the index was cleared.
+pub fn reindex_if_parser_changed(conn: &mut Connection, version: u32) -> Result<bool> {
+    let want = version.to_string();
+    let tx = conn.transaction().map_err(|e| db_err("begin", &e))?;
+    let have: Option<String> = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![PARSER_VERSION_KEY],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| db_err("read parser version", &e))?;
+    if have.as_deref() == Some(want.as_str()) {
+        return Ok(false);
+    }
+    let sessions: i64 = tx
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .map_err(|e| db_err("count sessions", &e))?;
+    clear_session_index(&tx)?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![PARSER_VERSION_KEY, want],
+    )
+    .map_err(|e| db_err("set parser version", &e))?;
+    tx.commit().map_err(|e| db_err("commit", &e))?;
+    if sessions > 0 {
+        tracing::info!(
+            from = have.as_deref().unwrap_or("1"),
+            to = version,
+            sessions,
+            "session parsing rules changed: the session index is rebuilt from the session files"
+        );
+        if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            tracing::warn!(error = %e, "WAL checkpoint after clearing session data failed");
+        }
+    }
+    Ok(sessions > 0)
 }
 
 fn forget(c: &Connection, id: &str) -> Result<bool> {

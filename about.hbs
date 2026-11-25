@@ -1,0 +1,24 @@
+{{! Plain-text template for THIRD_PARTY_LICENSES (cargo-about, see about.toml). Triple braces: no HTML escaping. }}
+THIRD-PARTY LICENSES
+
+ccwm (CC Workspace Manager) includes the following third-party Rust crates.
+Their licenses are reproduced below, grouped by license text.
+
+Overview:
+{{#each overview}}
+  {{{id}}} ({{count}})
+{{/each}}
+
+{{#each licenses}}
+================================================================================
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+  {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+--------------------------------------------------------------------------------
+
+{{{text}}}
+
+{{/each}}

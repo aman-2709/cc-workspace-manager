@@ -1,0 +1,99 @@
+# Release (REQUIREMENTS.md §17): on a pushed `v*` tag, build the static x86_64 musl binary, package it with
+# scripts/package-release.sh and upload the archive + SHA256SUMS as a workflow artifact. A separate job then
+# creates a **draft** GitHub release from that artifact; the owner reviews it (and adds the history-audit
+# notes) and publishes it by hand. Nothing here runs without a tag push.
+# Every action is pinned to a full commit SHA (version in the comment). No caches: a release build never
+# restores state written by other workflow runs.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTUP_TOOLCHAIN: 1.94.0
+  TARGET: x86_64-unknown-linux-musl
+  CARGO_ABOUT_VERSION: 0.9.3 # same as about.toml
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$TARGET"
+      - name: Check the tag matches the Cargo.toml version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cc-workspace-manager") | .version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      # rusqlite uses the bundled SQLite; the web assets are embedded with include_str!.
+      - name: Build
+        run: cargo build --locked --release --target "$TARGET" --bin ccwm
+      - name: Strip and check the binary
+        run: |
+          bin="$RUNNER_TEMP/ccwm"
+          strip -o "$bin" "target/$TARGET/release/ccwm"
+          file "$bin"
+          file "$bin" | grep -Eq 'static(-pie)? linked' || { echo "::error::ccwm is not statically linked"; exit 1; }
+          "$bin" --version
+          "$bin" --help
+      - name: Generate THIRD_PARTY_LICENSES (cargo-about)
+        run: |
+          cargo install --locked --root "$RUNNER_TEMP/tools" cargo-about --version "$CARGO_ABOUT_VERSION" --features cli
+          cargo fetch --locked
+          "$RUNNER_TEMP/tools/bin/cargo-about" generate --frozen --fail about.hbs > "$RUNNER_TEMP/THIRD_PARTY_LICENSES"
+      - name: Package
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            scripts/package-release.sh "$RUNNER_TEMP/ccwm" "$VERSION" "$RUNNER_TEMP/THIRD_PARTY_LICENSES" dist
+          (cd dist && sha256sum -c SHA256SUMS)
+          tar -tvzf "dist/ccwm-$VERSION-$TARGET.tar.gz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  # The only job with write access. `environment: release` lets the owner add a required reviewer in the
+  # repository settings (Environments) as a further manual gate.
+  draft-release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+      - name: Verify checksums
+        run: (cd dist && sha256sum -c SHA256SUMS)
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "ccwm $GITHUB_REF_NAME" \
+            --notes "Draft created by the release workflow. Add the release notes (including the history audit) before publishing."

@@ -32,10 +32,14 @@ accepted only by `POST /api/v1/auth/rotate`; the previous token stays valid for 
 browser sessions are live; an 11th revokes the least recently used. Expired sessions are purged
 hourly. "Sign out" and `ccwm auth revoke-all` revoke sessions.
 
-**TCP peer-UID check.** For every accepted loopback connection the daemon finds the client's end of
-the connection in `/proc/net/tcp` / `/proc/net/tcp6` and serves it only if the socket belongs to the
-daemon's effective UID. The check happens before a byte is read, applies to every endpoint (including
-`/health` and static files), is cached per connection and fails closed. Consequence: a sign-in link
+**TCP peer-UID check.** For every accepted loopback connection the daemon finds the socket of the
+client's end of the connection and serves it only if that socket belongs to the daemon's effective UID.
+It asks the kernel with one exact `sock_diag` netlink request for the client's 4-tuple (M4). The reply
+must name exactly that 4-tuple, in a state other than `LISTEN` or `TIME_WAIT`. Where `sock_diag` does not
+work, a self-test at startup falls back to the `/proc/net/tcp` / `/proc/net/tcp6` row. The method in use
+is reported as `peer_lookup` in `ccwm status` / `ccwm doctor`. The check happens before a byte is read,
+applies to every endpoint (including `/health` and static files), is cached per connection and fails
+closed: not found, ambiguous, or an error all mean "reject". Consequence: a sign-in link
 or session token that leaks to another local user (for example through a browser's command line in
 `/proc/<pid>/cmdline`) is useless to them.
 
@@ -61,6 +65,35 @@ configured port (ABI ≥ 4); abstract Unix sockets and signals scoped (ABI ≥ 6
 the startup log and `GET /api/v1/service/status` (`sandbox`), including read rules that are `/` or an
 ancestor of your home directory. Child processes (`git`, `claude`) inherit the ruleset and get an
 environment without `DBUS_*`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK` and similar IPC variables.
+
+**Seccomp socket filter (M4).** Once the TCP and Unix listeners are bound, the daemon installs a seccomp
+filter on **every** thread (TSYNC). Threads and child processes created later inherit it. From then on
+`socket()` fails with `EPERM` for every address family except `AF_NETLINK`/`NETLINK_SOCK_DIAG`, which
+the peer check needs. `io_uring` is denied too, because it can create sockets without `socket()`, and so
+are the x32 entry points of both. The daemon and its Git and `claude` children therefore cannot open UDP
+sockets or connect to path-based Unix sockets (D-Bus, agents): the two gaps Landlock ABI ≤ 8 leaves.
+Accepting connections on the existing listeners is unaffected. The filter uses `seccompiler` (rust-vmm),
+and works without Landlock.
+
+**Self-verification (M4).** The daemon checks its own confinement and claims only what it verified:
+
+- Landlock: a read outside the read set, from a runtime worker thread and a blocking-pool thread.
+- A write outside ccwm's directories: an anonymous `O_TMPFILE` in your home directory, so an
+  unconfined probe leaves nothing behind.
+- An outbound TCP connect to `127.0.0.1:1`.
+- After the filter: creating a UDP and a Unix socket, from a worker thread and a blocking-pool thread.
+
+A read or write probe that is not denied withdraws every Landlock claim. A connect that is not denied
+withdraws the TCP claim. A socket probe that is not denied withdraws the seccomp claim. A probe that
+fails for another reason (e.g. a file system without `O_TMPFILE`) proves nothing either way and is noted.
+Everything is in the `sandbox` section of `/api/v1/service/status` and in `ccwm doctor`.
+
+**systemd unit.** The user unit adds `NoNewPrivileges`, `UMask=0077`, `LockPersonality`,
+`RestrictRealtime`, `RestrictSUIDSGID`, `RestrictNamespaces` and `SystemCallArchitectures=native`. These
+directives were verified with the real daemon in a user unit. `ProtectSystem`, `ProtectHome` and
+`PrivateTmp` are not used: in a user unit they need a user namespace, in which root-owned paths appear to
+be owned by `nobody`, and ccwm's ownership checks then (correctly) refuse to start. See
+[docs/service.md](docs/service.md).
 
 **WebSocket.** `GET /api/v1/ws` requires the exact `Origin`; the first message must authenticate
 (`{"type":"auth","token":…}`) within 5 s, otherwise the socket is closed with code 4401 and nothing
@@ -180,15 +213,20 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
 
 - **Impostor UI.** Another user who binds the port while ccwm is down can serve a fake page on the same
   origin. It can read what the page stored (the session token) but cannot use it (peer-UID check),
-  and `ccwm open` never talks to it. It can still show you false information. Prefer starting ccwm
-  at login (systemd user unit, M4).
+  and `ccwm open` never talks to it. It can still show you false information. Run ccwm as the systemd
+  user service ([docs/service.md](docs/service.md)), so it holds the port from login on.
 - **Same-user forwarders and proxies.** Any forwarder or proxy running as you (`ssh -L`, `socat`,
   an IDE's port forwarding) bypasses the peer-UID check: the check sees the forwarder, which is
   you, not the client behind it, so another local user who can reach the forwarder's port can use
   a leaked sign-in link or session token through it. **Never forward the ccwm port.**
-- **Not confined by the sandbox:** UDP and other non-TCP socket families, and `connect()` to
-  path-based Unix sockets (no Landlock right for it before ABI 9; ccwm does not request it in v0.1).
-  A seccomp `socket()` filter is planned for M4.
+- **Sockets when the seccomp filter is not active.** Landlock does not confine UDP or other non-TCP
+  socket families, nor `connect()` to path-based Unix sockets (no Landlock right for it before ABI 9).
+  The seccomp filter closes both, and the report lists them as `unconfined` whenever it is
+  `not_applied`. With the filter, the daemon can still use the sockets it already has: its listeners, the
+  connections it accepted, and the journald stream systemd gave it as stdout/stderr. It can also create
+  `NETLINK_SOCK_DIAG` sockets, which tell it what `/proc/net/tcp` already does.
+- **Kernels without Landlock** (or ABI < 4 / < 6): no filesystem, TCP or scope confinement. ccwm runs
+  anyway and says so. The Git hardening and the seccomp filter still apply.
 - **XSS** could read the `localStorage` token; mitigated by the strict CSP and the rule that no data
   ever reaches HTML-parsing DOM APIs.
 - **Same-user processes** can read everything ccwm can.
@@ -211,6 +249,13 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
 - Mount `/proc` with `hidepid=invisible` (e.g. `proc /proc proc defaults,hidepid=invisible 0 0` in
   `/etc/fstab`, needs root) so other users cannot see process command lines. ccwm does not depend on
   it; it only removes the place where a sign-in link would be visible.
+
+## Manual verification
+
+The cross-user checks (another local user cannot use a leaked sign-in link or session token, cannot reach
+the Unix socket or the data, and an impostor on the port receives nothing from `ccwm open`) are simulated
+in the tests. They are also written up as a manual procedure with a real second account in
+[docs/two-user-verification.md](docs/two-user-verification.md).
 
 ## Reporting a vulnerability
 

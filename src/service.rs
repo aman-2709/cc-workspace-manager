@@ -133,6 +133,8 @@ pub struct ServiceStatus {
     pub uptime_s: i64,
     pub port: u16,
     pub sandbox: SandboxReport,
+    /// How the TCP peer check finds a connection's owner (`sock_diag` or `procfs`).
+    pub peer_lookup: &'static str,
     pub discovery: DiscoveryBrief,
     pub monitoring: MonitorStatus,
     /// `null` when the tracker is not running (tests).
@@ -281,6 +283,8 @@ pub struct Deps {
     /// The discovery roots in use.
     pub roots: Vec<PathBuf>,
     pub claude: Option<Arc<Verifier>>,
+    /// How the TCP peer check finds a connection's owner (`sock_diag` or `procfs`).
+    pub peer_lookup: &'static str,
 }
 
 pub struct Service {
@@ -305,6 +309,7 @@ pub struct Service {
     session_dir: PathBuf,
     roots: Vec<PathBuf>,
     claude: Option<Arc<Verifier>>,
+    peer_lookup: &'static str,
     /// Bumped whenever sessions are revoked; open WebSockets revalidate their token at once.
     auth_epoch: watch::Sender<u64>,
     port: u16,
@@ -346,6 +351,7 @@ impl Service {
             session_dir: d.session_dir,
             roots: d.roots,
             claude: d.claude,
+            peer_lookup: d.peer_lookup,
             auth_epoch: watch::channel(0).0,
             port: d.port,
             started_at,
@@ -985,6 +991,7 @@ impl Service {
             uptime_s: (self.clock.now() - self.started_at).max(0),
             port: self.port,
             sandbox: self.sandbox.clone(),
+            peer_lookup: self.peer_lookup,
             discovery: DiscoveryBrief {
                 phase: d.phase,
                 last_success_at: d.last_success_at,

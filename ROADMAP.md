@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **M3.1 (M3 review fixes, real-home defects) complete — waiting for the maintainer's review and go-ahead for M4.** The "Claude running" indicator approved for M3.1 was deferred to v0.2 (Landlock blocks `/proc/<pid>/cwd`; ARCHITECTURE §14).
+Current position: **M4 (release readiness) complete locally — waiting for the maintainer's review, the "M4, needs approval" spec changes and the owner actions (push/CI, fresh-account install, two-user check, release).** The "Claude running" indicator is v0.2 (ARCHITECTURE §14).
 
 ---
 
@@ -134,22 +134,48 @@ Accept: a fresh user account installs from the release archive; service starts a
 lingering); projects appear; all tests including the full security acceptance suite pass; CI (gitleaks +
 cargo-deny bans) green; benchmarks documented.
 
-- [ ] CLI `start/stop/restart/doctor/service/auth` (`status` and `scan` exist since M2; `status` gains the systemd state); dedicated exit codes (port in use, lock held) in `RestartPreventExitStatus=`
-- [ ] TCP peer-UID lookup via `sock_diag` (netlink) as an alternative to `/proc/net/tcp*` (§11.2), with the same fail-closed tests
-- [ ] Daemon-level write/connect probes: the running daemon attempts (and must be denied) a write outside its directories and an outbound TCP connect, reported in `service.status` (today only the read probe runs in the daemon; write/connect are tested in `tests/sandbox.rs`)
-- [ ] Manual two-user check (second local account): peer-UID rejection of TCP and Unix-socket connections, leaked link/token useless; documented procedure and result
-- [ ] `THIRD_PARTY_LICENSES` in release archives via `cargo-about` with a committed, pinned `about.toml`
-- [ ] systemd unit (+ optional `ProtectSystem`/`ProtectHome` only after testing the real daemon); `scripts/install.sh`/`uninstall.sh`
-- [ ] Seccomp filter denying `socket()` after the TCP and Unix listeners are bound (deferred from M1.1; needs a dependency justified in ARCHITECTURE §4 first) — closes UDP and path-based Unix-socket connect
-- [x] Security acceptance test 5 fallback where `unshare -rn` is unavailable (done before M2: strace variant)
-- [ ] Test 5 in CI on a runner with unprivileged user namespaces (network-namespace variant has not run anywhere yet)
-- [ ] `ccwm doctor`: the `claude` check and the session directory (built in M3, reported in `ccwm status`)
-- [ ] Security acceptance tests 2 and 10 extended to `ccwm service uninstall --purge`
-- [ ] If approved (O1): live reconfiguration of roots/exclusions/budget (in-process tracker + monitor restart)
-- [ ] Security + performance pass with measured numbers; docs (README, SECURITY, CONTRIBUTING, CHANGELOG, LICENSE, config reference, discovery semantics, inotify troubleshooting, retention, service mgmt)
-- [ ] CI (fmt, clippy, test, cargo-deny, gitleaks, hygiene; SHA-pinned; least privilege) + release workflow (musl)
-- [ ] History/secret audit before first publication; naming-conflict check (needs maintainer OK)
-- [ ] Validate release binary on build host; report tested environments only
+Pre-M4 maintainer decisions (2026-11-24): O1 and O7 approved (O1 permanent: no in-process reconfiguration, Landlock
+cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
+
+- [x] CLI `start/stop/restart` (`systemctl --user`, wait for the socket / the lock), `doctor` (Landlock/seccomp from
+  the daemon, inotify limits and usage of all the user's processes, Git, `claude` from the daemon's sandboxed check,
+  session dir, permissions, port, systemd, lingering; suggests, never applies), `service install|uninstall [--purge]`,
+  `auth revoke-all`; `status` gains the systemd line; exit codes 10 (port in use) / 11 (lock held) in
+  `RestartPreventExitStatus=`
+- [x] systemd user unit (directives verified with the real daemon in transient user units; `ProtectSystem`/
+  `ProtectHome`/`PrivateTmp` tested and rejected: their user namespace breaks the ownership checks);
+  `scripts/install.sh` / `uninstall.sh` (idempotent, no root, data kept unless `--purge`); lingering documented, never run
+- [x] TCP peer lookup via `sock_diag` (exact 4-tuple request), procfs fallback chosen by a startup self-test,
+  `peer_lookup` reported; fail-closed reply tests + a real-connection comparison with procfs
+- [x] Seccomp filter after the listeners are bound (TSYNC; `socket()` denied except `NETLINK_SOCK_DIAG`, `io_uring` and
+  x32 entry points denied; `seccompiler`, justified in ARCHITECTURE §4) — closes UDP and path-based Unix connect
+- [x] Daemon-level probes: write outside (`O_TMPFILE`), outbound connect, socket creation on a worker and a blocking
+  thread; claims withdrawn on a non-denial; asserted in the process tests and the harness-less sandbox test
+- [x] Parser version: `PARSER_VERSION` vs `meta.session_parser_version`, the session index cleared at database open
+  when they differ (M3 databases included)
+- [x] Tests: test 8 canaries in malformed, oversized (9 MiB), appended-malformed lines and an unreadable session file
+  (counters prove the paths ran); `/service/status?privacy=1` in the process privacy loop (+ a control); tests 2 and
+  10 with `uninstall --purge` (`tests/service.rs`); `CCWM_REQUIRE_NETNS` for test 5; process tests use a stub
+  `systemctl` (never the real user manager); a racy Git assertion in the M3 acceptance test now waits for the Git queue
+- [x] Benchmarks (`scripts/bench.py`, synthetic, release build): idle CPU, RSS, discovery time, watches, 500
+  projects, 10k-file burst, watch exhaustion/recovery, ~500 MiB of sessions — [docs/benchmarks.md](docs/benchmarks.md).
+  Found and fixed: the reader parked one blocking thread per waiting caller (517 threads at 500 projects → 25)
+- [x] CI (`.github/workflows/ci.yml`: fmt, clippy, test with runner capability report + `CCWM_REQUIRE_*` gating +
+  NOTICE summary, cargo-deny, gitleaks over the full history; SHA-pinned; `contents: read`) and release workflow
+  (`release.yml`: musl, strip, static check, cargo-about, `package-release.sh`, draft release) — **prepared, not run**
+- [x] `about.toml` + `about.hbs` (cargo-about 0.9.3, pinned licenses = deny.toml); `.gitleaksignore` + `.gitleaks.toml`
+- [x] Docs: README (install from release, screenshots from the synthetic env, privacy summary, notices), SECURITY
+  (seccomp, probes, sock_diag, unit, residual risks, manual verification), docs/{configuration, discovery, service,
+  troubleshooting, data-retention, benchmarks, two-user-verification, release-checklist}.md, CHANGELOG (0.1.0)
+- [x] musl release binary built, stripped, static, smoke-tested in a synthetic env; package + `sha256sum -c` locally
+- [ ] Test 5 network-namespace variant: CI is prepared to run it (`CCWM_REQUIRE_NETNS`); it has not run anywhere
+- [ ] CI and the release workflow on GitHub (needs a push: owner action)
+- [ ] Fresh-account install from the archive, start at login / at boot with lingering (owner, release checklist)
+- [ ] Manual two-user check (owner; procedure in docs/two-user-verification.md)
+- [ ] History/secret audit sign-off, repository recreation, naming-conflict check (O3), tag + release (owner;
+  docs/release-checklist.md)
+- [ ] Spec changes "M4, needs approval" (REQUIREMENTS.md Appendix A)
+- ~~Live reconfiguration of roots/exclusions/budget~~ — dropped (O1 approved as permanent)
 
 ---
 

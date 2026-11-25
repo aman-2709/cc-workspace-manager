@@ -784,3 +784,106 @@ async fn move_sources_match_on_git_head_and_remote_or_marker_hash() {
         "same marker hash, no Git"
     );
 }
+
+/// REQUIREMENTS.md §7.2 (M4): rows built by older parsing rules never survive an upgrade. When
+/// the stored parser version differs from `PARSER_VERSION`, opening the database clears the
+/// derived session index (sessions and checkpoints; projects stay, their counts recomputed), so
+/// the next ingest parses every file from byte 0. The same version leaves the index alone.
+#[tokio::test]
+async fn a_parser_version_change_clears_the_session_index_once() {
+    use cc_workspace_manager::claude::parse::PARSER_VERSION;
+    use cc_workspace_manager::db::writer::PARSER_VERSION_KEY;
+    let t = tempfile::tempdir().unwrap();
+    let db = t.path().join("t.db");
+    let meta = || {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [PARSER_VERSION_KEY],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    };
+    let counts = || {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let n = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        (
+            n("SELECT count(*) FROM sessions"),
+            n("SELECT count(*) FROM session_file_checkpoints"),
+            n("SELECT count(*) FROM projects"),
+            n("SELECT coalesce(sum(session_count), 0) FROM projects"),
+        )
+    };
+    // A fresh database records the current version.
+    let w = Writer::spawn(&db).unwrap();
+    assert_eq!(meta(), Some(PARSER_VERSION.to_string()));
+    let id = w
+        .upsert_projects(vec![up("/h/a", Source::Session)], 100)
+        .await
+        .unwrap()
+        .rows[0]
+        .id
+        .clone();
+    store_stale_session(&w, id.clone()).await;
+    w.shutdown().await.unwrap();
+    assert_eq!(counts(), (1, 1, 1, 1));
+
+    // Same version: the index is kept.
+    let w = Writer::spawn(&db).unwrap();
+    w.shutdown().await.unwrap();
+    assert_eq!(
+        counts(),
+        (1, 1, 1, 1),
+        "an unchanged parser keeps the index"
+    );
+
+    // An index built by older rules (an M3 database has no version entry at all).
+    for older in [Some("1"), None] {
+        {
+            let c = rusqlite::Connection::open(&db).unwrap();
+            match older {
+                Some(v) => c
+                    .execute(
+                        "UPDATE meta SET value = ?2 WHERE key = ?1",
+                        [PARSER_VERSION_KEY, v],
+                    )
+                    .unwrap(),
+                None => c
+                    .execute("DELETE FROM meta WHERE key = ?1", [PARSER_VERSION_KEY])
+                    .unwrap(),
+            };
+        }
+        let w = Writer::spawn(&db).unwrap();
+        assert_eq!(
+            counts(),
+            (0, 0, 1, 0),
+            "sessions and checkpoints cleared, the project kept ({older:?})"
+        );
+        assert_eq!(meta(), Some(PARSER_VERSION.to_string()));
+        store_stale_session(&w, id.clone()).await;
+        w.shutdown().await.unwrap();
+    }
+}
+
+async fn store_stale_session(w: &Writer, project: String) {
+    use cc_workspace_manager::claude::parse::{Aggregate, Checkpoint};
+    use cc_workspace_manager::db::writer::SessionStore;
+    w.store_sessions(vec![SessionStore {
+        id: "aaaaaaaa-1111-4111-8111-111111111111".into(),
+        file_path: "/h/.claude/projects/-h-a/aaaaaaaa-1111-4111-8111-111111111111.jsonl".into(),
+        project_id: Some(project),
+        unassigned: None,
+        aggregate: Aggregate {
+            first_cwd: Some("/h/a".into()),
+            git_branch: Some("stale branch from older rules".into()),
+            ..Aggregate::default()
+        },
+        checkpoint: Checkpoint {
+            size: 10,
+            offset: 10,
+            ..Checkpoint::default()
+        },
+    }])
+    .await
+    .unwrap();
+}
