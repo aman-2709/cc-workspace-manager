@@ -106,9 +106,35 @@ async fn a_connection_from_another_uid_is_dropped_without_a_response() {
     let e = env().await;
     // Pretend the daemon runs as a different user: our (real) uid is then "someone else".
     let srv = start(e.service.clone(), my_uid() + 1).await;
+    const REQUEST: &[u8] = b"{\"op\":\"auth.bootstrap\"}\n";
+
+    // The daemon drops the connection as soon as it has seen the peer's uid, which may be
+    // before, while or after the client writes (on a busy machine: before, and the write then
+    // fails with EPIPE). Whichever it is, not one byte comes back.
+    let stream = tokio::net::UnixStream::connect(&srv.socket).await.unwrap();
+    let received = common::response_to_a_dropped_connection(stream, REQUEST).await;
+    assert!(received.is_empty(), "the rejected peer got {received:?}");
+
+    // The order that made the write fail, forced: wait until the daemon has closed (EOF with
+    // nothing received), then send. Still nothing comes back.
+    let mut closed = tokio::net::UnixStream::connect(&srv.socket).await.unwrap();
+    let mut before = Vec::new();
+    let eof = tokio::io::AsyncReadExt::read_to_end(&mut closed, &mut before);
+    tokio::time::timeout(Duration::from_secs(5), eof)
+        .await
+        .expect("the daemon closes a rejected connection on its own")
+        .unwrap();
+    assert!(before.is_empty(), "sent before any request: {before:?}");
+    let received = common::response_to_a_dropped_connection(closed, REQUEST).await;
+    assert!(received.is_empty(), "the rejected peer got {received:?}");
+
+    // The CLI client reports a failure, however the drop shows up for it: the request cannot
+    // be sent, the read is reset, or the "response" is empty.
     let err = srv.call("auth.bootstrap").await.unwrap_err();
     assert!(
-        err.contains("invalid response") || err.contains("cannot read"),
+        err.contains("cannot send the request")
+            || err.contains("cannot read")
+            || err.contains("invalid response"),
         "{err}"
     );
     assert_eq!(

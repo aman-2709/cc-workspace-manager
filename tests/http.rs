@@ -1168,19 +1168,48 @@ mod sockets {
         }
     }
 
-    /// Send a request (Host is the service's port, which the Host check expects) and read it all.
-    async fn get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+    /// A raw request with extra headers (Host is the service's port, which the Host check
+    /// expects).
+    fn request_text(path: &str, headers: &[(&str, String)]) -> String {
+        let mut req =
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nConnection: close\r\n");
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        req
+    }
+
+    /// Send a request that the server is expected to answer and read the whole response.
+    async fn request(
+        addr: SocketAddr,
+        path: &str,
+        headers: &[(&str, String)],
+    ) -> std::io::Result<String> {
         let mut s = TcpStream::connect(addr).await?;
-        s.write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .await?;
+        s.write_all(request_text(path, headers).as_bytes()).await?;
         let mut out = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
             .await
             .map_err(|_| std::io::Error::other("timed out"))??;
         Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
+        request(addr, path, &[]).await
+    }
+
+    /// Everything a connection that the server must drop got back for this request (nothing, if
+    /// the server behaves): see [`common::response_to_a_dropped_connection`].
+    async fn received_when_rejected(
+        addr: SocketAddr,
+        path: &str,
+        headers: &[(&str, String)],
+    ) -> String {
+        let s = TcpStream::connect(addr).await.unwrap();
+        let request = request_text(path, headers);
+        let received = common::response_to_a_dropped_connection(s, request.as_bytes()).await;
+        String::from_utf8_lossy(&received).into_owned()
     }
 
     #[tokio::test]
@@ -1204,49 +1233,10 @@ mod sockets {
         for lookup in lookups {
             let srv = serve(lookup, 8, Duration::from_secs(5)).await;
             for path in ["/api/v1/health", "/", "/api/v1/projects"] {
-                match get(srv.addr, path).await {
-                    Ok(resp) => assert!(resp.is_empty(), "{path}: got {resp:?}"),
-                    Err(e) => assert!(
-                        matches!(
-                            e.kind(),
-                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-                        ),
-                        "{path}: {e}"
-                    ),
-                }
+                let received = received_when_rejected(srv.addr, path, &[]).await;
+                assert!(received.is_empty(), "{path}: got {received:?}");
             }
             srv.stop().await;
-        }
-    }
-
-    /// A raw request with extra headers; the whole response (empty if the server closed).
-    async fn request(
-        addr: SocketAddr,
-        path: &str,
-        headers: &[(&str, String)],
-    ) -> std::io::Result<String> {
-        let mut s = TcpStream::connect(addr).await?;
-        let mut req =
-            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nConnection: close\r\n");
-        for (k, v) in headers {
-            req.push_str(&format!("{k}: {v}\r\n"));
-        }
-        req.push_str("\r\n");
-        s.write_all(req.as_bytes()).await?;
-        let mut out = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
-            .await
-            .map_err(|_| std::io::Error::other("timed out"))??;
-        Ok(String::from_utf8_lossy(&out).into_owned())
-    }
-
-    fn closed_unanswered(r: std::io::Result<String>) -> bool {
-        match r {
-            Ok(resp) => resp.is_empty(),
-            Err(e) => matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-            ),
         }
     }
 
@@ -1271,7 +1261,7 @@ mod sockets {
             "/api/v1/service/status",
             "/api/v1/ws",
         ] {
-            let r = request(
+            let received = received_when_rejected(
                 srv.addr,
                 path,
                 &[
@@ -1283,7 +1273,10 @@ mod sockets {
                 ],
             )
             .await;
-            assert!(closed_unanswered(r), "{path} answered a foreign connection");
+            assert!(
+                received.is_empty(),
+                "{path} answered a foreign connection: {received:?}"
+            );
         }
         // Control: with our own UID the same request is served.
         let ok = serve(http::peer::procfs_lookup(), 8, Duration::from_secs(5)).await;

@@ -50,6 +50,42 @@ pub fn write_executable(path: &Path, content: &str) {
     assert!(sh.wait().unwrap().success(), "writing {}", path.display());
 }
 
+/// Send `request` on a connection the server is expected to **drop without answering**, and
+/// return every byte that came back (the caller asserts that there is none).
+///
+/// The server closes a rejected connection on its own schedule, so the client cannot know
+/// whether its request is still accepted: the write fails with `EPIPE`/`ECONNRESET` when the
+/// server closed first, or it succeeds and the read then ends with EOF, or with `ECONNRESET`
+/// when the server closed with the request unread. All of these are "dropped". Whatever the
+/// write did, the connection is read to its end afterwards, so "nothing was sent back" is
+/// checked in every case and never inferred from an error. Any other error panics, and so does
+/// a connection that is still open after five seconds (it was not dropped).
+pub async fn response_to_a_dropped_connection<S>(mut stream: S, request: &[u8]) -> Vec<u8>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if let Err(e) = stream.write_all(request).await {
+        assert!(
+            matches!(e.kind(), BrokenPipe | ConnectionReset),
+            "writing to a connection that should be dropped: {e}"
+        );
+    }
+    let mut received = Vec::new();
+    let read = stream.read_to_end(&mut received);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), read).await {
+        Ok(Ok(_)) => {}
+        // Bytes read before the reset stay in `received`.
+        Ok(Err(e)) => assert!(
+            e.kind() == ConnectionReset,
+            "reading from a connection that should be dropped: {e}"
+        ),
+        Err(_) => panic!("the connection was not closed: got {received:?} so far"),
+    }
+    received
+}
+
 /// An executable `<dir>/<name>.sh` that creates `<dir>/<name>.ran`, then runs `body`.
 /// Returns `(script, sentinel)`.
 pub fn sentinel_script(
