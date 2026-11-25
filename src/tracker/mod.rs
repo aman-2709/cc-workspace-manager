@@ -37,6 +37,8 @@ pub enum Control {
 #[derive(Clone)]
 pub struct Settings {
     pub scan: ScanOptions,
+    /// The daemon's user: only a `.git` it owns makes a Git work tree (as for Git itself).
+    pub uid: u32,
     /// Initial values of the settings that can change while running ([`Live`]).
     pub interval: Duration,
     pub retention_secs: i64,
@@ -636,6 +638,7 @@ impl Tracker {
                 .map(|t| PathBuf::from(&t.path))
                 .collect(),
             home: s.home.clone(),
+            uid: self.settings.uid,
             max_depth: s.max_depth,
             same_file_system: s.same_file_system,
         }
@@ -941,6 +944,8 @@ struct WalkContext {
     roots: Vec<(PathBuf, Exclusions)>,
     others: HashSet<PathBuf>,
     home: PathBuf,
+    /// The user whose `.git` directories count as work trees (the daemon's).
+    uid: u32,
     max_depth: usize,
     same_file_system: bool,
 }
@@ -959,14 +964,14 @@ impl WalkContext {
         base: &tree::GitIgnore,
         now: i64,
     ) -> Option<Tree> {
-        let (_, ex) = self
+        let (discovery_root, ex) = self
             .roots
             .iter()
             .filter(|(r, _)| root.starts_with(r))
             .max_by_key(|(r, _)| r.as_os_str().len())?;
         let mut others = self.others.clone();
         others.remove(root);
-        let repo = tree::git_worktree_root(root, &self.home);
+        let repo = tree::git_worktree_root(root, discovery_root, &self.home, self.uid);
         let opts = TreeOptions {
             exclusions: ex,
             other_projects: &others,

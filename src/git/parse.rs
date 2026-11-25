@@ -119,28 +119,33 @@ pub fn parse_status(raw: &[u8]) -> Option<Status> {
 }
 
 /// `git config -z --get-regexp ^filter\..*\.(clean|smudge|process)$`: each entry is
-/// `key\nvalue\0` (or `key\0` without a value). Returns the driver names (deduplicated, in order).
-pub fn filter_driver_names(raw: &[u8]) -> Vec<String> {
+/// `key\nvalue\0` (or `key\0` without a value). Returns the driver names (deduplicated, in
+/// order), or `None` when any entry is not a `filter.<name>.<var>` key whose name
+/// `-c filter.<name>.<var>=` carries back **byte for byte** (§6; v0.1.0 review H1). A lossy decode
+/// would build the override for another name and leave the real driver active, so the caller
+/// then does not run `status`: when a name cannot be represented exactly, refuse; never
+/// approximate.
+pub fn filter_driver_names(raw: &[u8]) -> Option<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
-    for entry in raw.split(|b| *b == 0) {
-        if entry.is_empty() {
-            continue;
-        }
+    for entry in raw.split(|b| *b == 0).filter(|e| !e.is_empty()) {
         let key = entry.split(|b| *b == b'\n').next().unwrap_or(entry);
-        let key = String::from_utf8_lossy(key);
-        let Some(rest) = key.strip_prefix("filter.") else {
-            continue;
-        };
-        let name = ["clean", "smudge", "process"]
-            .iter()
-            .find_map(|v| rest.strip_suffix(&format!(".{v}")));
-        if let Some(name) = name {
-            if !out.iter().any(|n| n == name) {
-                out.push(name.to_string());
-            }
+        let name = std::str::from_utf8(key).ok().and_then(driver_name)?;
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
         }
     }
-    out
+    Some(out)
+}
+
+/// The `<name>` of `filter.<name>.(clean|smudge|process)`, if `-c` cannot misparse it: Git splits
+/// `-c` at the first `=` (a name containing `=` would set a different key) and rejects a newline;
+/// every control character is refused with it.
+fn driver_name(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("filter.")?;
+    let name = ["clean", "smudge", "process"]
+        .iter()
+        .find_map(|var| rest.strip_suffix(var)?.strip_suffix('.'))?;
+    (!name.is_empty() && !name.contains('=') && !name.chars().any(char::is_control)).then_some(name)
 }
 
 /// `git config -z --get-regexp ^(extensions\.partialclone|remote\..*\.promisor)$`: whether the
@@ -164,12 +169,6 @@ pub fn any_promisor(raw: &[u8]) -> bool {
                     .any(|t| v.eq_ignore_ascii_case(t))
             })
     })
-}
-
-/// A driver name can be neutralized with `-c filter.<name>.<var>=` only if `-c` cannot misparse
-/// it: Git splits `-c` at the first `=`, so a name containing `=` would set a different key.
-pub fn neutralizable(name: &str) -> bool {
-    !name.is_empty() && !name.contains('=') && !name.chars().any(char::is_control)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -208,25 +207,33 @@ pub fn clean(s: &str, max_chars: usize) -> String {
 }
 
 /// Remove credentials from a remote URL before it is stored or shown (§6): userinfo in
-/// `scheme://user:pass@host/…`, the user in scp-like `user@host:path`, and any query or fragment.
+/// `scheme://user:pass@host/…` and in scp-like `user[:pass]@host:path`, and any query or
+/// fragment of a `scheme://` URL.
+///
+/// Userinfo normally ends at the last `@` before the first `/`. A password with an unescaped
+/// `/` puts that `@` behind the slash: Git would not read a credential there, but a person
+/// wrote one, so such an `@` ends the userinfo too when what precedes it can hold a password
+/// (a `:` in a `scheme://` URL; another `host:path` after it in the scp-like form). When in
+/// doubt the text before the `@` is dropped: a mangled display string is better than a shown
+/// secret (v0.1.0 review L1).
 pub fn sanitize_remote_url(url: &str) -> String {
     let url = clean(url.trim(), 1024);
+    // `[user@]host:path` is scp-like only if no '/' comes before the first ':'.
+    let scp_like = |s: &str| s.find(':').is_some_and(|colon| !s[..colon].contains('/'));
+    // The later of the two ends (`None` is smaller than any position).
+    let userinfo_end = |s: &str, behind_slash: &dyn Fn(usize) -> bool| {
+        let slash = s.find('/').unwrap_or(s.len());
+        let in_authority = s[..slash].rfind('@');
+        in_authority.max(s.rfind('@').filter(|at| behind_slash(*at)))
+    };
     if let Some((scheme, rest)) = url.split_once("://") {
-        let (authority, path) = match rest.find('/') {
-            Some(i) => rest.split_at(i),
-            None => (rest, ""),
-        };
-        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        let path = path.split(['?', '#']).next().unwrap_or("");
-        return format!("{scheme}://{host}{path}");
+        let rest = rest.split(['?', '#']).next().unwrap_or("");
+        let end = userinfo_end(rest, &|at| rest[..at].contains(':'));
+        return format!("{scheme}://{}", end.map_or(rest, |at| &rest[at + 1..]));
     }
-    // scp-like syntax: [user@]host:path, where no '/' comes before the first ':'.
-    if let Some(colon) = url.find(':') {
-        if !url[..colon].contains('/') {
-            let (head, path) = url.split_at(colon);
-            let host = head.rsplit_once('@').map_or(head, |(_, h)| h);
-            return format!("{host}{path}");
-        }
+    if scp_like(&url) {
+        let end = userinfo_end(&url, &|at| scp_like(&url[at + 1..]));
+        return end.map_or(url.as_str(), |at| &url[at + 1..]).to_string();
     }
     url // a local path
 }
@@ -303,11 +310,42 @@ u UU N... 100644 100644 100644 100644 a b c conflict.txt\0\
 
     #[test]
     fn filter_driver_names_from_config_output() {
-        let raw = b"filter.lfs.clean\ngit-lfs clean -- %f\0filter.lfs.smudge\ngit-lfs smudge\0filter.a.b.process\nx\0filter.novalue.clean\0filter.x=y.clean\nz\0other.key\nv\0";
-        assert_eq!(filter_driver_names(raw), ["lfs", "a.b", "novalue", "x=y"]);
-        assert!(filter_driver_names(b"").is_empty());
-        assert!(neutralizable("lfs") && neutralizable("a.b"));
-        assert!(!neutralizable("x=y") && !neutralizable("") && !neutralizable("a\nb"));
+        let raw = b"filter.lfs.clean\ngit-lfs clean -- %f\0filter.lfs.smudge\ngit-lfs smudge\0filter.a.b.process\nx\0filter.novalue.clean\0filter.x.clean.smudge\nz\0";
+        let names = filter_driver_names(raw).unwrap();
+        assert_eq!(names, ["lfs", "a.b", "novalue", "x.clean"]);
+        assert_eq!(filter_driver_names(b""), Some(Vec::new()));
+        // Valid UTF-8 is carried exactly, U+FFFD included (it is a character like any other).
+        let raw = "filter.caf\u{e9} \u{fffd}\"'.smudge\nx\0".as_bytes();
+        let names = filter_driver_names(raw).unwrap();
+        assert_eq!(names, ["caf\u{e9} \u{fffd}\"'"]);
+    }
+
+    /// v0.1.0 review H1: one name that `-c` cannot carry exactly refuses the whole list, however
+    /// many good names surround it.
+    #[test]
+    fn a_filter_driver_name_that_cannot_be_passed_back_exactly_refuses_the_list() {
+        let cases: [(&str, &[u8]); 10] = [
+            ("invalid UTF-8", b"filter.ev\xffil.clean\nx\0"),
+            ("Latin-1", b"filter.caf\xe9.clean\nx\0"),
+            ("truncated UTF-8 sequence", b"filter.a\xc3.process\nx\0"),
+            ("'=' in the name", b"filter.x=y.clean\nz\0"),
+            ("empty name", b"filter..clean\nz\0"),
+            ("control character", b"filter.a\x1bb.smudge\nz\0"),
+            (
+                "C1 control character",
+                "filter.a\u{85}b.clean\nz\0".as_bytes(),
+            ),
+            ("DEL", b"filter.a\x7fb.clean\nz\0"),
+            ("another key", b"other.key\nv\0"),
+            ("no variable", b"filter.name\nv\0"),
+        ];
+        for (what, bad) in cases {
+            assert_eq!(filter_driver_names(bad), None, "{what}");
+            let mut raw = b"filter.lfs.clean\nok\0".to_vec();
+            raw.extend_from_slice(bad);
+            raw.extend_from_slice(b"filter.other.smudge\nok\0");
+            assert_eq!(filter_driver_names(&raw), None, "{what}, among good names");
+        }
     }
 
     #[test]
@@ -342,9 +380,40 @@ u UU N... 100644 100644 100644 100644 a b c conflict.txt\0\
             ("./rel/path:with-colon", "./rel/path:with-colon"),
             ("https://host", "https://host"),
             ("  https://u:p@h/x\n", "https://h/x"),
+            ("ssh://git@[::1]:22/r.git", "ssh://[::1]:22/r.git"),
+            // v0.1.0 review L1: a password in the scp-like form, and a '/' in a password.
+            (
+                "user:s3cr3tpw@host.example:team/repo.git",
+                "host.example:team/repo.git",
+            ),
+            ("https://user:pa/ss@host/x", "https://host/x"),
+            ("https://user/name:pw@host/x", "https://host/x"),
+            (
+                "user:pa/ss@host.example:team/repo.git",
+                "host.example:team/repo.git",
+            ),
+            ("https://user:p@ss/w@rd@host/x?t=1", "https://host/x"),
+            ("user:p@ss/w@rd@host:team/r.git", "host:team/r.git"),
+            // An '@' in a path, with nothing before it that could be a password, stays.
+            ("https://host/@scope/pkg.git", "https://host/@scope/pkg.git"),
+            ("https://git@host/o/r@v2", "https://host/o/r@v2"),
+            ("host:o/r@v2.git", "host:o/r@v2.git"),
+            ("git@host:o/r@v2.git", "host:o/r@v2.git"),
+            // In doubt (a ':' before an '@' in the path), the text before the '@' goes.
+            ("https://host:8443/@scope/pkg", "https://scope/pkg"),
         ];
         for (raw, want) in cases {
             assert_eq!(sanitize_remote_url(raw), want, "{raw}");
+        }
+        // Whatever the shape, a password before an '@' never survives.
+        for raw in [
+            "https://u:SECRETpw@h/x",
+            "u:SECRETpw@h:x/y",
+            "https://u:SECRET/pw@h/x",
+            "u:SECRET/pw@h:x/y",
+            "ssh://u:SECRETpw@h:22/x#SECRETpw",
+        ] {
+            assert!(!sanitize_remote_url(raw).contains("SECRET"), "{raw}");
         }
     }
 

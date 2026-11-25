@@ -67,7 +67,8 @@ with Landlock. Other results:
 | `not_enforced`, "Landlock is unavailable or disabled on this kernel" | the kernel lacks Landlock (before Linux 5.13), or it is not in the active LSM list |
 | `partially_enforced`, `network none` | Landlock ABI < 4 (before Linux 6.7): no TCP confinement |
 | `abstract_unix_socket false`, `signal false` | ABI < 6 (before Linux 6.12): no scoping |
-| `not_enforced` with a note about threads or probes | the sandbox could not be verified; ccwm claims nothing |
+| `not_enforced` with a note about threads or probes | a check showed that the sandbox does not hold; ccwm claims nothing |
+| `unverified` (as the status, or for `filesystem`, `network`, `seccomp`), plus a `! unverified …` line | a self-check failed for an unexpected reason, so that protection is neither confirmed nor disproved. Example: a home directory on a file system without `O_TMPFILE` (some network file systems) makes the write check inconclusive. The reason is in `sandbox.notes` of `GET /api/v1/service/status` and in the daemon's log; `ccwm doctor` warns |
 
 ccwm runs anyway and reports exactly what is active. To get it:
 
@@ -80,7 +81,8 @@ Without Landlock, the Git hardening (REQUIREMENTS.md §6) and the seccomp socket
 `claude --version`/`--help` check then runs **unconfined**, with your rights.
 
 The seccomp filter (`seccomp: socket_denied`) needs a kernel with `CONFIG_SECCOMP_FILTER`, which every
-mainstream distribution kernel has. If it is reported as `not_applied`, UDP and path-based Unix sockets
+mainstream distribution kernel has. With it, the daemon and its `git` and `claude` children can create no
+socket and no socket pair after startup. If it is reported as `not_applied`, UDP and path-based Unix sockets
 are listed as unconfined.
 
 ## `claude` not found or unverified

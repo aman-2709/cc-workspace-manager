@@ -12,8 +12,11 @@
 //! The `seccomp` child mode (M4) installs the real socket filter ([`sandbox::deny_new_sockets`])
 //! after the Landlock ruleset, like `ccwm serve` does once its listeners are bound, and checks
 //! that a thread created *before* the filter (TSYNC), threads created after it and grandchildren
-//! cannot create sockets, that the peer check's `NETLINK_SOCK_DIAG` socket still works, and that
-//! the daemon-level write and connect probes are denied.
+//! cannot create sockets or socket pairs of any family (v0.1.0 review M1: a datagram socket pair
+//! reaches a path-based datagram socket, with a control run before the filter), nor use
+//! `io_uring` or the x32 entry points; that the peer check's `NETLINK_SOCK_DIAG` socket, opened
+//! before the filter, still answers while a new one is refused; that ccwm's Git inspection still
+//! starts its processes; and that the daemon-level write and connect probes are denied.
 //!
 //! The real daemon's own confinement (its worker and blocking-pool thread probes) is checked in
 //! `tests/process.rs`. Set `CCWM_REQUIRE_LANDLOCK=1` to fail instead of skip when Landlock is
@@ -27,7 +30,7 @@ use std::fs;
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::os::linux::net::SocketAddrExt;
-use std::os::unix::net::{SocketAddr as UnixAddr, UnixListener, UnixStream};
+use std::os::unix::net::{SocketAddr as UnixAddr, UnixDatagram, UnixListener, UnixStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -115,6 +118,7 @@ fn child_op(args: &[String]) {
         ))),
         "udp" => outcome(std::net::UdpSocket::bind(("127.0.0.1", 0))),
         "unix_connect" => outcome(UnixStream::connect(arg)),
+        "socketpair_send" => outcome(socketpair_send(Path::new(arg))),
         _ => "bad-op".into(),
     };
     println!("{result}");
@@ -249,13 +253,67 @@ fn child_main(mode: &str) {
     );
 }
 
+/// v0.1.0 review M1: a datagram socket pair needs no `socket()`, and one end can be pointed at a
+/// path-based datagram socket outside the sandbox (Landlock ABI ≤ 8 does not confine that).
+fn socketpair_send(to: &Path) -> io::Result<usize> {
+    let (a, _b) = UnixDatagram::pair()?;
+    a.send_to(b"ccwm-test-datagram", to)
+}
+
+/// System calls without a safe wrapper (`io_uring_setup`, the x32 entry points), made by a
+/// `python3` child through ctypes (this crate forbids `unsafe`; the child inherits the filter).
+/// Prints one `PROBE <prefix><name>=<ok|errno name>` line per call.
+fn raw_syscall_probes(prefix: &str) {
+    use nix::libc;
+    const X32: i64 = 0x4000_0000;
+    // The system interpreter: inside the sandbox's read set, whatever `PATH` holds.
+    let system = std::ffi::OsStr::new("/usr/bin:/bin");
+    let Some(python) = cc_workspace_manager::paths::find_executable("python3", Some(system)) else {
+        probe("python3", "missing");
+        return;
+    };
+    // (name, number, arguments): AF_UNIX = 1, SOCK_DGRAM = 2; a null parameter block.
+    let calls = [
+        ("io_uring_setup", libc::SYS_io_uring_setup, "1, 0"),
+        ("x32_socket", X32 | libc::SYS_socket, "1, 2, 0"),
+        ("x32_socketpair", X32 | libc::SYS_socketpair, "1, 2, 0, 0"),
+        ("x32_io_uring_setup", X32 | libc::SYS_io_uring_setup, "1, 0"),
+    ];
+    let mut script = String::from(
+        "import ctypes, errno\nlibc = ctypes.CDLL(None, use_errno=True)\nL = ctypes.c_long\n",
+    );
+    for (name, nr, args) in calls {
+        script.push_str(&format!(
+            "ctypes.set_errno(0)\nr = libc.syscall(L({nr}), *[L(a) for a in ({args},)])\n\
+             print('PROBE {prefix}{name}=' + ('ok' if r >= 0 else errno.errorcode.get(ctypes.get_errno(), 'errno')))\n"
+        ));
+    }
+    match sandbox::child_command(&python)
+        .args(["-c", &script])
+        .output()
+    {
+        Ok(out) if out.status.success() => print!("{}", String::from_utf8_lossy(&out.stdout)),
+        other => probe("python3", format!("failed:{other:?}").replace('\n', " ")),
+    }
+}
+
 /// After the Landlock ruleset (the daemon's order): the seccomp socket filter and what it denies.
 fn seccomp_probes(l: &Layout, (server, client): &(TcpListener, TcpStream)) {
+    use cc_workspace_manager::http::peer::SockDiag;
     // Daemon-level probes before the filter (they need socket()).
     probe("daemon_write_outside", sandbox::probe_write(&l.outside));
     probe("daemon_write_readonly_root", sandbox::probe_write(&l.ro));
     probe("daemon_write_inside", sandbox::probe_write(&l.dirs().data));
     probe("daemon_connect", sandbox::probe_connect());
+    // Control (M1): under Landlock alone the datagram reaches the socket outside the sandbox.
+    probe(
+        "control_socketpair_send_before_filter",
+        outcome(socketpair_send(&l.outside.join("d.sock"))),
+    );
+    // Control: what the kernel itself answers to these calls without the filter.
+    raw_syscall_probes("control_");
+    // The peer check's netlink socket is opened before the filter, as `select_lookup` does.
+    let diag = SockDiag::open();
     // A thread that exists before the filter is installed (TSYNC must cover it).
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
@@ -282,6 +340,18 @@ fn seccomp_probes(l: &Layout, (server, client): &(TcpListener, TcpStream)) {
     );
     probe("socketpair", outcome(UnixStream::pair()));
     probe(
+        "socketpair_send",
+        outcome(socketpair_send(&l.outside.join("d.sock"))),
+    );
+    probe(
+        "grandchild_socketpair_send",
+        in_grandchild(
+            "socketpair_send",
+            l.outside.join("d.sock").to_str().unwrap(),
+        ),
+    );
+    raw_syscall_probes("");
+    probe(
         "netlink_route",
         outcome(
             nix::sys::socket::socket(
@@ -293,13 +363,14 @@ fn seccomp_probes(l: &Layout, (server, client): &(TcpListener, TcpStream)) {
             .map_err(io::Error::from),
         ),
     );
+    // No exception for the peer check any more: a new sock_diag socket is refused, the one
+    // opened before the filter still answers.
+    probe("netlink_sock_diag_new", outcome(SockDiag::open()));
     let me = nix::unistd::geteuid().as_raw();
     probe(
         "netlink_sock_diag",
-        match cc_workspace_manager::http::peer::sock_diag_query(
-            client.local_addr().unwrap(),
-            server.local_addr().unwrap(),
-        ) {
+        match diag.and_then(|d| d.query(client.local_addr().unwrap(), server.local_addr().unwrap()))
+        {
             Ok(Some(uid)) if uid == me => "ok".to_string(),
             other => format!("{other:?}"),
         },
@@ -322,6 +393,18 @@ fn seccomp_probes(l: &Layout, (server, client): &(TcpListener, TcpStream)) {
                 }),
         ),
     );
+    // ccwm's own Git inspection (several processes, pipes, a process group) under the filter:
+    // std starts them with posix_spawn, which needs no socket pair (its fork/exec path does).
+    match cc_workspace_manager::git::find_on_path(std::env::var_os("PATH").as_deref()) {
+        Some(git) => {
+            let g = cc_workspace_manager::git::Git::detect(Some(git), &l.ro, false);
+            probe(
+                "git_inspect_after_filter",
+                g.inspect(&l.ro.join("repo")).state.as_str(),
+            );
+        }
+        None => probe("git", "missing"),
+    }
 }
 
 /// Test 11, Git-subprocess variant: Git started by the confined process cannot connect out or
@@ -387,6 +470,8 @@ struct Setup {
     layout: Layout,
     listener: TcpListener,
     _unix: UnixListener,
+    /// A path-based datagram socket outside the sandbox (what `/dev/log` is to a real daemon).
+    datagram: UnixDatagram,
     _abstract: UnixListener,
     abstract_name: String,
     allowed_port: u16,
@@ -430,6 +515,8 @@ fn setup() -> Setup {
     }
     fs::write(layout.outside.join("f"), b"data").unwrap();
     let unix = UnixListener::bind(layout.outside.join("u.sock")).unwrap();
+    let datagram = UnixDatagram::bind(layout.outside.join("d.sock")).unwrap();
+    datagram.set_nonblocking(true).unwrap();
     let abstract_name = format!("ccwm-sandbox-test-{}", std::process::id());
     let abstract_listener =
         UnixListener::bind_addr(&UnixAddr::from_abstract_name(abstract_name.as_bytes()).unwrap())
@@ -445,6 +532,7 @@ fn setup() -> Setup {
         layout,
         listener,
         _unix: unix,
+        datagram,
         _abstract: abstract_listener,
         abstract_name,
         allowed_port,
@@ -594,10 +682,13 @@ fn a_second_thread_at_apply_time_makes_the_report_claim_nothing() {
     assert!(r["threads_at_apply"].as_u64().unwrap() >= 2, "{r}");
 }
 
-/// M4: the seccomp socket filter (installed after Landlock, on every thread) closes the two
-/// residuals Landlock leaves open, keeps the peer check's netlink lookup working, and the
-/// daemon-level write/connect probes are denied by Landlock.
-fn the_seccomp_filter_denies_new_sockets_everywhere_but_the_peer_check() {
+/// M4 + the v0.1.0 fix pass: the seccomp socket filter (installed after Landlock, on every
+/// thread) denies every new socket and socket pair, with no exception: the peer check's netlink
+/// socket is opened before it and keeps working. It closes the two residuals Landlock leaves
+/// open, including the datagram socket-pair route to path-based sockets (review M1, with a
+/// control run), `io_uring` and the x32 entry points; the daemon-level write/connect probes are
+/// denied by Landlock.
+fn the_seccomp_filter_denies_every_new_socket_and_socket_pair() {
     let s = setup();
     let p = run_child("seccomp", &s);
     let want =
@@ -614,9 +705,50 @@ fn the_seccomp_filter_denies_new_sockets_everywhere_but_the_peer_check() {
     want("netlink_route", "EPERM");
     want("grandchild_udp", "EPERM");
     want("grandchild_unix_connect", "EPERM");
-    want("socketpair", "ok");
+    // M1: before the filter the datagram left the sandbox (the control), after it nothing does.
+    want("control_socketpair_send_before_filter", "ok");
+    let mut buf = [0u8; 64];
+    let n = s.datagram.recv(&mut buf).expect("the control datagram");
+    assert_eq!(&buf[..n], b"ccwm-test-datagram");
+    want("socketpair", "EPERM");
+    want("socketpair_send", "EPERM");
+    want("grandchild_socketpair_send", "EPERM");
+    assert_eq!(
+        s.datagram.recv(&mut buf).map_err(|e| e.kind()),
+        Err(io::ErrorKind::WouldBlock),
+        "a datagram left the sandbox after the filter"
+    );
+    if p.contains_key("python3") {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "python3 is required in CI for the raw system call probes: {p:#?}"
+        );
+        eprintln!("NOTICE: python3 unavailable; skipping the io_uring and x32 assertions");
+    } else {
+        for k in [
+            "io_uring_setup",
+            "x32_socket",
+            "x32_socketpair",
+            "x32_io_uring_setup",
+        ] {
+            want(k, "EPERM");
+            // The control shows the denial is the filter's (a kernel with io_uring disabled
+            // answers EPERM on its own: then only the socket controls can tell).
+            let control = p[&format!("control_{k}")].as_str();
+            assert!(
+                control != "EPERM" || k.contains("io_uring"),
+                "control_{k} was already denied without the filter: {p:#?}"
+            );
+        }
+    }
     want("exec_after_filter", "ok");
+    want("netlink_sock_diag_new", "EPERM");
     want("netlink_sock_diag", "ok");
+    if p.get("git").map(String::as_str) == Some("missing") {
+        eprintln!("NOTICE: git is not installed; skipping the Git-under-seccomp assertion");
+    } else {
+        want("git_inspect_after_filter", "ok");
+    }
     if !enforced(&p) {
         return;
     }
@@ -628,8 +760,8 @@ fn the_seccomp_filter_denies_new_sockets_everywhere_but_the_peer_check() {
     }
     assert_eq!(
         fs::read_dir(&s.layout.outside).unwrap().count(),
-        2,
-        "nothing created outside (only the fixture file and socket)"
+        3,
+        "nothing created outside (only the fixture file and the two sockets)"
     );
 }
 
@@ -687,8 +819,8 @@ fn main() {
             a_second_thread_at_apply_time_makes_the_report_claim_nothing,
         ),
         (
-            "the_seccomp_filter_denies_new_sockets_everywhere_but_the_peer_check",
-            the_seccomp_filter_denies_new_sockets_everywhere_but_the_peer_check,
+            "the_seccomp_filter_denies_every_new_socket_and_socket_pair",
+            the_seccomp_filter_denies_every_new_socket_and_socket_pair,
         ),
         (
             "child_processes_do_not_inherit_session_ipc_variables",

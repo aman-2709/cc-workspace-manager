@@ -169,6 +169,9 @@ pub struct MonitorStatus {
     pub pending_projects: usize,
     /// Session directories watched (live session updates; otherwise found at each scan).
     pub session_watches: usize,
+    /// `.gitignore` / `.git/info/exclude` files not read because of a size limit, over all
+    /// projects (their rules do not apply; see [`tree::MAX_GITIGNORE_BYTES`]).
+    pub ignore_files_skipped: u64,
     /// Real failures only: no inotify instance, a queue overflow being recovered, or projects
     /// without any watch (polled). Partly watched projects are normal operation (§5.1).
     pub degraded: bool,
@@ -302,6 +305,8 @@ struct ProjectState {
     polled: Option<PollReason>,
     /// The walk stopped at the entry limit: unknown parts, so the whole project is polled.
     truncated: bool,
+    /// Ignore files of the project's last full walk that a size limit skipped.
+    ignore_files_skipped: u64,
     /// Roots of the subtrees that got no watch because of a limit (the root itself when it has
     /// none). Only subtree roots: nothing below a refused directory is listed or watched.
     refused: HashSet<PathBuf>,
@@ -552,6 +557,7 @@ impl Monitor {
                     git_aware,
                     polled: p.tree.truncated.then_some(PollReason::Truncated),
                     truncated: p.tree.truncated,
+                    ignore_files_skipped: p.tree.ignore_files_skipped,
                     refused: HashSet::new(),
                 },
             );
@@ -1210,8 +1216,18 @@ impl Monitor {
         }
         if reasons.contains(&PollReason::Truncated) {
             advice.push(
-                "Some project trees are too large to walk completely: they are polled.".to_string(),
+                "Some project trees are too large to walk completely: they are partly watched (the part that was walked is watched live; the whole tree is checked at each scan).".to_string(),
             );
+        }
+        let ignore_files_skipped: u64 =
+            self.projects.values().map(|p| p.ignore_files_skipped).sum();
+        if ignore_files_skipped > 0 {
+            advice.push(format!(
+                "{ignore_files_skipped} .gitignore or .git/info/exclude file(s) were skipped: larger than {} KiB, or the project has more than {} KiB or {} rules of ignore files. Their rules do not apply, so files they would ignore count as activity.",
+                tree::MAX_GITIGNORE_BYTES / 1024,
+                tree::MAX_GITIGNORE_TOTAL_BYTES / 1024,
+                tree::MAX_GITIGNORE_PATTERNS
+            ));
         }
         if self.recovering {
             advice.push(
@@ -1253,6 +1269,7 @@ impl Monitor {
                 .values()
                 .filter(|o| **o == Owner::Sessions)
                 .count(),
+            ignore_files_skipped,
             degraded: !has_backend || polled > 0 || self.recovering,
             advice,
             projects,

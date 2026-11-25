@@ -10,7 +10,9 @@
 //! - **`sock_diag`** (preferred): one exact `SOCK_DIAG_BY_FAMILY` request over a `NETLINK_SOCK_DIAG`
 //!   socket for the client's 4-tuple; the kernel answers with that one socket (or `ENOENT`). No
 //!   table is scanned. The reply must describe exactly the requested 4-tuple in a state other than
-//!   `LISTEN`/`TIME_WAIT`, else "not found".
+//!   `LISTEN`/`TIME_WAIT`, else "not found". The netlink socket ([`SockDiag`]) is opened **once**,
+//!   before the seccomp filter, and reused for every lookup, so the filter needs no exception for
+//!   it (v0.1.0 fix pass).
 //! - **procfs** (fallback when `sock_diag` is unusable, decided once at startup by
 //!   [`select_lookup`]): the matching row of `/proc/net/tcp` (and `/proc/net/tcp6` for
 //!   dual-stack clients). No row or several rows with different owners mean "not found".
@@ -19,7 +21,8 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::{Arc, Mutex};
 
 /// The kernel's TCP socket tables for the daemon's network namespace.
 pub const PROC_NET_TCP: [&str; 2] = ["/proc/net/tcp", "/proc/net/tcp6"];
@@ -51,29 +54,15 @@ pub const METHOD_PROCFS: &str = "procfs";
 
 /// The production lookup: `sock_diag` if a self-test over a real loopback connection finds this
 /// process's own socket, else procfs. Must run before the seccomp filter and the Landlock rules
-/// exist (it binds an ephemeral loopback port), i.e. single-threaded at the start of `serve`.
+/// exist (it opens the netlink socket every later lookup reuses, and binds an ephemeral loopback
+/// port), i.e. single-threaded at the start of `serve`.
 pub fn select_lookup() -> (PeerUidLookup, &'static str) {
-    if sock_diag_self_test().is_ok() {
-        (Arc::new(sock_diag_query), METHOD_SOCK_DIAG)
-    } else {
-        (procfs_lookup(), METHOD_PROCFS)
-    }
-}
-
-/// Look up our own connection to our own listener through `sock_diag`; `Ok` only if it names
-/// our effective UID.
-pub fn sock_diag_self_test() -> io::Result<()> {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let server = listener.local_addr()?;
-    let client = std::net::TcpStream::connect(server)?;
-    let (_accepted, remote) = listener.accept()?;
-    let me = nix::unistd::geteuid().as_raw();
-    debug_assert_eq!(remote, client.local_addr()?);
-    match sock_diag_query(remote, server)? {
-        Some(uid) if uid == me => Ok(()),
-        other => Err(io::Error::other(format!(
-            "sock_diag self-test returned {other:?}"
-        ))),
+    match SockDiag::open().and_then(|diag| diag.self_test().map(|()| diag)) {
+        Ok(diag) => (
+            Arc::new(move |client, server| diag.query(client, server)),
+            METHOD_SOCK_DIAG,
+        ),
+        Err(_) => (procfs_lookup(), METHOD_PROCFS),
     }
 }
 
@@ -94,40 +83,86 @@ const REQ_LEN: usize = 8 + SOCKID_LEN;
 /// `inet_diag_msg`: family, state, timer, retrans, sockid, expires, rqueue, wqueue, uid, inode.
 const MSG_LEN: usize = 4 + SOCKID_LEN + 20;
 const MSG_UID_OFFSET: usize = 4 + SOCKID_LEN + 12;
-const REQUEST_SEQ: u32 = 1;
+/// How long one lookup waits for the kernel's reply (it normally arrives during the send).
+const REPLY_TIMEOUT_SECS: i64 = 2;
+/// Datagrams answering earlier requests that one lookup skips before it gives up.
+const MAX_STALE_REPLIES: usize = 8;
 
-/// One exact `sock_diag` lookup of the socket whose local end is `client` and remote end is
-/// `server`: its owner, `None` if the kernel has no such socket.
-pub fn sock_diag_query(client: SocketAddr, server: SocketAddr) -> io::Result<Option<u32>> {
-    use nix::sys::socket::{self, AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol};
-    use std::os::fd::AsRawFd;
-    let (client, server) = (canonical(client), canonical(server));
-    let Some(request) = diag_request(client, server) else {
-        return Ok(None);
-    };
-    let fd = socket::socket(
-        AddressFamily::Netlink,
-        socket::SockType::Datagram,
-        SockFlag::SOCK_CLOEXEC,
-        SockProtocol::NetlinkSockDiag,
-    )
-    .map_err(io::Error::from)?;
-    socket::setsockopt(
-        &fd,
-        socket::sockopt::ReceiveTimeout,
-        &nix::sys::time::TimeVal::new(2, 0),
-    )
-    .map_err(io::Error::from)?;
-    socket::sendto(
-        fd.as_raw_fd(),
-        &request,
-        &NetlinkAddr::new(0, 0),
-        MsgFlags::empty(),
-    )
-    .map_err(io::Error::from)?;
-    let mut buf = vec![0u8; 8192];
-    let n = socket::recv(fd.as_raw_fd(), &mut buf, MsgFlags::empty()).map_err(io::Error::from)?;
-    parse_diag_reply(&buf[..n], client, server)
+/// The one `NETLINK_SOCK_DIAG` socket of the process. The daemon opens it before the seccomp
+/// filter ([`crate::sandbox::deny_new_sockets`]) and keeps it: the filter then denies `socket()`
+/// for every family, netlink included. Lookups are serialized (one short request/reply exchange
+/// with the kernel each) and numbered, so a reply left behind by a lookup that failed between
+/// its send and its receive is never taken for the answer to a later one.
+pub struct SockDiag {
+    /// The socket and the sequence number of the last request.
+    state: Mutex<(OwnedFd, u32)>,
+}
+
+impl SockDiag {
+    pub fn open() -> io::Result<Self> {
+        use nix::sys::socket::{self, AddressFamily, SockFlag, SockProtocol, SockType};
+        let fd = socket::socket(
+            AddressFamily::Netlink,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            SockProtocol::NetlinkSockDiag,
+        )?;
+        socket::setsockopt(
+            &fd,
+            socket::sockopt::ReceiveTimeout,
+            &nix::sys::time::TimeVal::new(REPLY_TIMEOUT_SECS, 0),
+        )?;
+        Ok(Self {
+            state: Mutex::new((fd, 0)),
+        })
+    }
+
+    /// One exact lookup of the socket whose local end is `client` and remote end is `server`:
+    /// its owner, `None` if the kernel has no such socket.
+    pub fn query(&self, client: SocketAddr, server: SocketAddr) -> io::Result<Option<u32>> {
+        use nix::sys::socket::{self, MsgFlags, NetlinkAddr};
+        let (client, server) = (canonical(client), canonical(server));
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("the sock_diag socket's lock is poisoned"))?;
+        let (fd, last_seq) = &mut *state;
+        let seq = last_seq.wrapping_add(1);
+        *last_seq = seq;
+        let Some(request) = diag_request(seq, client, server) else {
+            return Ok(None);
+        };
+        socket::sendto(
+            fd.as_raw_fd(),
+            &request,
+            &NetlinkAddr::new(0, 0),
+            MsgFlags::empty(),
+        )?;
+        let mut buf = vec![0u8; 8192];
+        for _ in 0..=MAX_STALE_REPLIES {
+            let n = socket::recv(fd.as_raw_fd(), &mut buf, MsgFlags::empty())?;
+            if let DiagReply::Answer(owner) = parse_diag_reply(&buf[..n], seq, client, server)? {
+                return Ok(owner);
+            }
+        }
+        Err(io::Error::other("sock_diag: no reply to this request"))
+    }
+
+    /// Look up our own connection to our own listener; `Ok` only if it names our effective UID.
+    pub fn self_test(&self) -> io::Result<()> {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let server = listener.local_addr()?;
+        let client = std::net::TcpStream::connect(server)?;
+        let (_accepted, remote) = listener.accept()?;
+        let me = nix::unistd::geteuid().as_raw();
+        debug_assert_eq!(remote, client.local_addr()?);
+        match self.query(remote, server)? {
+            Some(uid) if uid == me => Ok(()),
+            other => Err(io::Error::other(format!(
+                "sock_diag self-test returned {other:?}"
+            ))),
+        }
+    }
 }
 
 /// The address bytes of a `sockid` field (IPv4 in the first 4 bytes).
@@ -159,9 +194,9 @@ fn sockid(local: SocketAddr, remote: SocketAddr) -> [u8; SOCKID_LEN] {
     id
 }
 
-/// The netlink request for the socket `client -> server` (`None` if the families differ, which
-/// no loopback connection to our IPv4 listener can produce).
-pub fn diag_request(client: SocketAddr, server: SocketAddr) -> Option<Vec<u8>> {
+/// The netlink request number `seq` for the socket `client -> server` (`None` if the families
+/// differ, which no loopback connection to our IPv4 listener can produce).
+pub fn diag_request(seq: u32, client: SocketAddr, server: SocketAddr) -> Option<Vec<u8>> {
     if family(client) != family(server) {
         return None;
     }
@@ -170,7 +205,7 @@ pub fn diag_request(client: SocketAddr, server: SocketAddr) -> Option<Vec<u8>> {
     m.extend_from_slice(&len.to_ne_bytes());
     m.extend_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
     m.extend_from_slice(&NLM_F_REQUEST.to_ne_bytes());
-    m.extend_from_slice(&REQUEST_SEQ.to_ne_bytes());
+    m.extend_from_slice(&seq.to_ne_bytes());
     m.extend_from_slice(&0u32.to_ne_bytes()); // port id: the kernel fills it in
     m.extend_from_slice(&[family(client), IPPROTO_TCP, 0, 0]);
     m.extend_from_slice(&u32::MAX.to_ne_bytes()); // every state; checked in the reply
@@ -190,35 +225,51 @@ fn malformed() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed sock_diag reply")
 }
 
-/// The owner of the socket in a `sock_diag` reply, if it describes exactly `client -> server`
-/// in an established-like state; `ENOENT` means not found; other errors are errors.
+/// What one datagram read from the `sock_diag` socket says about request `seq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagReply {
+    /// The kernel's answer: the owner of the socket, or `None` (no such socket, not exactly the
+    /// socket asked for, or several owners).
+    Answer(Option<u32>),
+    /// Nothing in it belongs to this request (the reply to an earlier one): read the next.
+    Stale,
+}
+
+/// The owner of the socket in a `sock_diag` reply to request `seq`, if it describes exactly
+/// `client -> server` in an established-like state; `ENOENT` means not found; other errors are
+/// errors. Messages of other requests are ignored.
 pub fn parse_diag_reply(
     buf: &[u8],
+    seq: u32,
     client: SocketAddr,
     server: SocketAddr,
-) -> io::Result<Option<u32>> {
+) -> io::Result<DiagReply> {
     let want = sockid(client, server);
     let mut found: Vec<u32> = Vec::new();
+    let mut answered = false;
     let mut at = 0;
     while at + NLMSG_HDR <= buf.len() {
         let len = u32_at(buf, at).ok_or_else(malformed)? as usize;
         let kind = u16_at(buf, at + 4).ok_or_else(malformed)?;
-        let seq = u32_at(buf, at + 8).ok_or_else(malformed)?;
+        let msg_seq = u32_at(buf, at + 8).ok_or_else(malformed)?;
         if len < NLMSG_HDR || at + len > buf.len() {
             return Err(malformed());
         }
         let body = &buf[at + NLMSG_HDR..at + len];
         match kind {
+            _ if msg_seq != seq => {}
             NLMSG_ERROR => {
+                answered = true;
                 let code = u32_at(body, 0).ok_or_else(malformed)? as i32;
                 match -code {
                     0 => {}
-                    e if e == nix::libc::ENOENT => return Ok(None),
+                    e if e == nix::libc::ENOENT => return Ok(DiagReply::Answer(None)),
                     e => return Err(io::Error::from_raw_os_error(e)),
                 }
             }
             NLMSG_DONE => break,
-            SOCK_DIAG_BY_FAMILY if seq == REQUEST_SEQ => {
+            SOCK_DIAG_BY_FAMILY => {
+                answered = true;
                 if body.len() < MSG_LEN {
                     return Err(malformed());
                 }
@@ -234,7 +285,11 @@ pub fn parse_diag_reply(
         // Messages are aligned to 4 bytes.
         at += (len + 3) & !3;
     }
-    Ok(single_uid(found))
+    Ok(if answered {
+        DiagReply::Answer(single_uid(found))
+    } else {
+        DiagReply::Stale
+    })
 }
 
 /// Why a connection is or is not served.
@@ -472,17 +527,25 @@ mod tests {
         m
     }
 
-    fn nl_error(errno: i32) -> Vec<u8> {
+    /// The sequence number of the request the hand-built replies below answer.
+    const SEQ: u32 = 7;
+
+    fn nl_error(errno: i32, seq: u32) -> Vec<u8> {
         let mut body = (-errno).to_ne_bytes().to_vec();
         body.extend_from_slice(&[0u8; 16]); // the echoed request header
-        nl(NLMSG_ERROR, REQUEST_SEQ, &body)
+        nl(NLMSG_ERROR, seq, &body)
     }
 
     #[test]
     fn the_diag_request_describes_the_client_end_of_the_connection() {
         let (client, server) = (addr("127.0.0.1:50000"), addr("127.0.0.1:8765"));
-        let r = diag_request(client, server).unwrap();
+        let r = diag_request(SEQ, client, server).unwrap();
         assert_eq!(r.len(), 72);
+        assert_eq!(
+            u32_at(&r, 8),
+            Some(SEQ),
+            "numbered, so replies can be matched"
+        );
         assert_eq!(u32_at(&r, 0), Some(72));
         assert_eq!(u16_at(&r, 4), Some(SOCK_DIAG_BY_FAMILY));
         assert_eq!(
@@ -500,66 +563,51 @@ mod tests {
         assert_eq!(&id[40..48], &[0xff; 8], "no cookie");
         let mapped = addr("[::ffff:127.0.0.1]:50000");
         assert_eq!(
-            diag_request(canonical(mapped), server),
+            diag_request(SEQ, canonical(mapped), server),
             Some(r),
             "v4-mapped clients are looked up as IPv4"
         );
-        assert_eq!(diag_request(addr("[::1]:1"), server), None);
+        assert_eq!(diag_request(SEQ, addr("[::1]:1"), server), None);
     }
 
     #[test]
     fn the_diag_reply_must_name_exactly_the_requested_socket() {
         let (client, server) = (addr("127.0.0.1:50000"), addr("127.0.0.1:8765"));
-        let ok = diag_msg(client, server, 1, 1001, REQUEST_SEQ);
-        assert_eq!(parse_diag_reply(&ok, client, server).unwrap(), Some(1001));
-        let done = nl(NLMSG_DONE, REQUEST_SEQ, &[0; 4]);
+        let parse = |reply: &[u8]| parse_diag_reply(reply, SEQ, client, server);
+        let ok = diag_msg(client, server, 1, 1001, SEQ);
+        assert_eq!(parse(&ok).unwrap(), DiagReply::Answer(Some(1001)));
+        let done = nl(NLMSG_DONE, SEQ, &[0; 4]);
         assert_eq!(
-            parse_diag_reply(&[ok.clone(), done].concat(), client, server).unwrap(),
-            Some(1001)
+            parse(&[ok.clone(), done].concat()).unwrap(),
+            DiagReply::Answer(Some(1001))
         );
         for (what, reply) in [
             (
                 "our own accepted end",
-                diag_msg(server, client, 1, 1000, REQUEST_SEQ),
+                diag_msg(server, client, 1, 1000, SEQ),
             ),
             (
                 "another port",
-                diag_msg(addr("127.0.0.1:50001"), server, 1, 1000, REQUEST_SEQ),
+                diag_msg(addr("127.0.0.1:50001"), server, 1, 1000, SEQ),
             ),
             (
                 "TIME_WAIT",
-                diag_msg(client, server, TCP_STATE_TIME_WAIT, 0, REQUEST_SEQ),
+                diag_msg(client, server, TCP_STATE_TIME_WAIT, 0, SEQ),
             ),
             (
                 "LISTEN",
-                diag_msg(client, server, TCP_STATE_LISTEN, 1000, REQUEST_SEQ),
+                diag_msg(client, server, TCP_STATE_LISTEN, 1000, SEQ),
             ),
-            (
-                "another request",
-                diag_msg(client, server, 1, 1000, REQUEST_SEQ + 1),
-            ),
-            ("not found", nl_error(nix::libc::ENOENT)),
-            ("empty", Vec::new()),
+            ("not found", nl_error(nix::libc::ENOENT, SEQ)),
         ] {
-            assert_eq!(
-                parse_diag_reply(&reply, client, server).unwrap(),
-                None,
-                "{what}"
-            );
+            assert_eq!(parse(&reply).unwrap(), DiagReply::Answer(None), "{what}");
         }
-        let two = [ok.clone(), diag_msg(client, server, 1, 1002, REQUEST_SEQ)].concat();
-        assert_eq!(
-            parse_diag_reply(&two, client, server).unwrap(),
-            None,
-            "ambiguous"
-        );
+        let two = [ok.clone(), diag_msg(client, server, 1, 1002, SEQ)].concat();
+        assert_eq!(parse(&two).unwrap(), DiagReply::Answer(None), "ambiguous");
         let same_twice = [ok.clone(), ok.clone()].concat();
+        assert_eq!(parse(&same_twice).unwrap(), DiagReply::Answer(Some(1001)));
         assert_eq!(
-            parse_diag_reply(&same_twice, client, server).unwrap(),
-            Some(1001)
-        );
-        assert_eq!(
-            parse_diag_reply(&nl_error(nix::libc::ENOMEM), client, server)
+            parse(&nl_error(nix::libc::ENOMEM, SEQ))
                 .unwrap_err()
                 .raw_os_error(),
             Some(nix::libc::ENOMEM)
@@ -569,8 +617,40 @@ mod tests {
             b[0..4].copy_from_slice(&8u32.to_ne_bytes());
             b
         }] {
-            assert!(parse_diag_reply(&broken, client, server).is_err());
+            assert!(parse(&broken).is_err());
         }
+    }
+
+    /// The socket is reused: what an earlier request left behind is never this request's answer,
+    /// whatever it says (v0.1.0 fix pass).
+    #[test]
+    fn replies_to_other_requests_are_stale_never_an_answer() {
+        let (client, server) = (addr("127.0.0.1:50000"), addr("127.0.0.1:8765"));
+        let parse = |reply: &[u8]| parse_diag_reply(reply, SEQ, client, server);
+        for (what, reply) in [
+            (
+                "an owner for another request",
+                diag_msg(client, server, 1, 1000, SEQ - 1),
+            ),
+            (
+                "'not found' for another request",
+                nl_error(nix::libc::ENOENT, SEQ - 1),
+            ),
+            (
+                "an error for another request",
+                nl_error(nix::libc::ENOMEM, SEQ + 1),
+            ),
+            ("nothing", Vec::new()),
+        ] {
+            assert_eq!(parse(&reply).unwrap(), DiagReply::Stale, "{what}");
+        }
+        // Mixed into one datagram, only this request's message counts.
+        let mixed = [
+            diag_msg(client, server, 1, 1000, SEQ - 1),
+            diag_msg(client, server, 1, 1001, SEQ),
+        ]
+        .concat();
+        assert_eq!(parse(&mixed).unwrap(), DiagReply::Answer(Some(1001)));
     }
 
     #[test]
@@ -581,20 +661,53 @@ mod tests {
         let (_accepted, remote) = listener.accept().unwrap();
         assert_eq!(remote, client.local_addr().unwrap());
         let me = nix::unistd::geteuid().as_raw();
-        assert_eq!(sock_diag_query(remote, server).unwrap(), Some(me));
+        // One socket for every lookup, as in the daemon.
+        let diag = SockDiag::open().unwrap();
+        assert_eq!(diag.query(remote, server).unwrap(), Some(me));
         assert_eq!(
-            sock_diag_query(remote, server).unwrap(),
+            diag.query(remote, server).unwrap(),
             procfs_lookup()(remote, server).unwrap()
         );
         // The server's own end is not the client's.
-        assert_eq!(sock_diag_query(server, remote).unwrap(), Some(me));
+        assert_eq!(diag.query(server, remote).unwrap(), Some(me));
         let bogus = SocketAddr::new(remote.ip(), remote.port().wrapping_add(1).max(1));
-        assert_eq!(sock_diag_query(bogus, server).unwrap(), None);
+        assert_eq!(diag.query(bogus, server).unwrap(), None);
+        // "Not found" leaves nothing behind that the next lookup could mistake for its answer.
+        assert_eq!(diag.query(remote, server).unwrap(), Some(me));
         // A closed connection is gone (or in TIME_WAIT): never attributed.
         drop(client);
         drop(_accepted);
-        assert_ne!(sock_diag_query(remote, server).unwrap(), Some(me));
-        sock_diag_self_test().unwrap();
+        assert_ne!(diag.query(remote, server).unwrap(), Some(me));
+        diag.self_test().unwrap();
         assert_eq!(select_lookup().1, METHOD_SOCK_DIAG);
+    }
+
+    #[test]
+    fn concurrent_lookups_share_the_socket_and_each_gets_its_own_answer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(server).unwrap();
+        let (_accepted, remote) = listener.accept().unwrap();
+        let me = nix::unistd::geteuid().as_raw();
+        let bogus = SocketAddr::new(remote.ip(), remote.port().wrapping_add(1).max(1));
+        let diag = Arc::new(SockDiag::open().unwrap());
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let diag = Arc::clone(&diag);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        if i % 2 == 0 {
+                            assert_eq!(diag.query(remote, server).unwrap(), Some(me));
+                        } else {
+                            assert_eq!(diag.query(bogus, server).unwrap(), None);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        drop(client);
     }
 }

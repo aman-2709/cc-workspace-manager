@@ -13,11 +13,13 @@ use std::sync::Arc;
 
 pub const API_PREFIX: &str = "/api/";
 
-/// The CSP from §11.3, parameterised by the bound port.
+/// The CSP from §11.3, parameterised by the bound port. `worker-src 'none'` is explicit: without
+/// it, worker and service-worker scripts fall back to `script-src 'self'`, and the dashboard
+/// uses neither (v0.1.0 review M3).
 pub fn csp(port: u16) -> String {
     format!(
         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
-         connect-src 'self' ws://127.0.0.1:{port}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+         connect-src 'self' ws://127.0.0.1:{port}; worker-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     )
 }
 

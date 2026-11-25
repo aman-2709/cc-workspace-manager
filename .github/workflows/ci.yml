@@ -52,13 +52,10 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal -c rustfmt,clippy
-      - name: Install strace (security acceptance test 5, strace variant)
+      - name: Install strace (security acceptance test 5 traces every connect and execve with it)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends strace
-      # Ephemeral runner only: lets unprivileged user namespaces work for test 5's network-namespace variant.
-      - name: "Runner setup (sudo on the ephemeral runner): allow unprivileged user namespaces"
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       # Report what the runner actually provides and require only that coverage from the tests.
       - name: Probe sandbox and kernel features
         run: |
@@ -96,7 +93,6 @@ jobs:
               ("inotify", inotify),
               ("inotify max_user_instances", read("/proc/sys/fs/inotify/max_user_instances")),
               ("inotify max_user_watches", read("/proc/sys/fs/inotify/max_user_watches")),
-              ("apparmor_restrict_unprivileged_userns", read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")),
           ]
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
               s.write("## Runner capabilities (probed)\n\n| Feature | Result |\n|---|---|\n")
@@ -117,15 +113,9 @@ jobs:
               return 1
             fi
           }
+          # Test 5 has no skip in CI: without a working strace it fails (the `CI` variable).
           probe 'strace: strace -f -qq -e trace=connect,execve -o /dev/null true' \
             strace -f -qq -e trace=connect,execve -o /dev/null true || true
-          if probe 'user+net namespace: unshare --user --map-current-user --net true' \
-            unshare --user --map-current-user --net true; then
-            echo "CCWM_REQUIRE_NETNS=1" >> "$GITHUB_ENV"
-          fi
-          # Informational: test 5's wrapper also brings the loopback interface up inside the namespace.
-          probe 'test 5 namespace wrapper: unshare ... --keep-caps --net -- sh -c "ip link set lo up"' \
-            unshare --user --map-current-user --keep-caps --net -- sh -c 'ip link set lo up' || true
       - name: Report the required coverage
         run: |
           {
@@ -134,7 +124,6 @@ jobs:
             echo
             echo "- CCWM_REQUIRE_LANDLOCK=${CCWM_REQUIRE_LANDLOCK:-unset}"
             echo "- CCWM_REQUIRE_INOTIFY=${CCWM_REQUIRE_INOTIFY:-unset}"
-            echo "- CCWM_REQUIRE_NETNS=${CCWM_REQUIRE_NETNS:-unset}"
             echo
             echo "Unset means the runner lacks the feature: those tests may skip (see the notices below)."
           } >> "$GITHUB_STEP_SUMMARY"

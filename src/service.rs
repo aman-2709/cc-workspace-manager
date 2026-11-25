@@ -770,8 +770,13 @@ impl Service {
                 .map_err(ApiError::internal)?
                 .map_err(|e| {
                     tracing::warn!(error = %e, "saving the settings failed");
+                    // The reason names the configuration file: not in privacy mode (review L3).
+                    let reason = match privacy {
+                        Privacy::On => String::new(),
+                        Privacy::Off => format!(" ({e})"),
+                    };
                     ApiError::invalid(format!(
-                        "the configuration file could not be written ({e}); edit it by hand and restart"
+                        "the configuration file could not be written{reason}; edit it by hand and restart"
                     ))
                 })?;
         }
@@ -978,6 +983,14 @@ impl Service {
             }
             if let Some(o) = v.get_mut("sandbox").and_then(|s| s.as_object_mut()) {
                 o.insert("broad_read_rules".into(), serde_json::json!([]));
+                // The notes can name paths too (the broad read rules again, a rule that could
+                // not be added): only their number is kept (v0.1.0 review L3).
+                let hidden = o
+                    .get("notes")
+                    .and_then(|n| n.as_array())
+                    .map_or(0, Vec::len);
+                o.insert("notes".into(), serde_json::json!([]));
+                o.insert("notes_hidden".into(), serde_json::json!(hidden));
             }
         }
         v

@@ -754,3 +754,53 @@ async fn overflow_triggers_a_rescan_until_recovered_and_gitignore_edits_a_rewalk
     let s = f.flush();
     assert!(s.contains(&Signal::Rewalk { id: "p".into() }), "{s:?}");
 }
+
+/// A tree too large to walk completely is *partly watched* (its root and what was walked are
+/// live), not polled, and the status says so in those words; ignore files that a size limit
+/// skipped are summed over the projects and explained (v0.1.0 review M2).
+#[tokio::test]
+async fn a_truncated_tree_is_partly_watched_and_skipped_ignore_files_are_reported() {
+    let mut f = fx();
+    let a = f.project("a", &["src/x"]);
+    let b = f.project("b", &["src/x"]);
+    let mut big = f.tree(&a, std::slice::from_ref(&b));
+    big.truncated = true;
+    big.ignore_files_skipped = 2;
+    let mut other = f.tree(&b, std::slice::from_ref(&a));
+    other.ignore_files_skipped = 3;
+    f.monitor.on_cmd(Cmd::Plan(vec![
+        WatchProject {
+            id: "a".into(),
+            tree: big,
+        },
+        WatchProject {
+            id: "b".into(),
+            tree: other,
+        },
+    ]));
+    assert_eq!(
+        f.mode("a"),
+        (Monitoring::Partial, Some(PollReason::Truncated))
+    );
+    assert_eq!(f.mode("b"), (Monitoring::Watched, None));
+    let st = f.shared.snapshot();
+    assert_eq!((st.partial_projects, st.polled_projects), (1, 0));
+    assert!(!st.degraded, "partly watched is not degraded");
+    let too_large = st
+        .advice
+        .iter()
+        .find(|a| a.contains("too large to walk"))
+        .expect("the note about the truncated tree");
+    assert!(
+        too_large.contains("partly watched") && !too_large.contains("polled"),
+        "{too_large}"
+    );
+    assert_eq!(st.ignore_files_skipped, 5);
+    assert!(
+        st.advice
+            .iter()
+            .any(|a| a.starts_with("5 .gitignore or .git/info/exclude file(s) were skipped")),
+        "{:?}",
+        st.advice
+    );
+}

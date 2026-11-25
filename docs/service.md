@@ -36,7 +36,7 @@ The same steps without the scripts:
 install -D -m 0755 ./ccwm ~/.local/bin/ccwm
 ccwm service install
 ccwm service uninstall            # keeps your data
-ccwm service uninstall --purge    # asks, then deletes ccwm's data
+ccwm service uninstall --purge    # removes the service, then asks before deleting ccwm's data
 ```
 
 ## Everyday commands

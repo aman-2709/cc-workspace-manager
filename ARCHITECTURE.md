@@ -17,7 +17,7 @@ has run it (see `ROADMAP.md`).
 | claude | 2.1.331; `claude --help` lists `--resume <session-id>` |
 | systemd | 255 (`systemctl --user` works); `Linger=no` |
 | Landlock | `landlock` in `/sys/kernel/security/lsm`; ABI **8** (queried via `landlock_create_ruleset`) ⇒ filesystem + TCP rules available |
-| `unshare -rn` | **fails** (`apparmor_restrict_unprivileged_userns=1`), as does `unshare --user --map-current-user --net` ⇒ test 5 runs its **strace** variant here |
+| `unshare -rn` | **fails** (`apparmor_restrict_unprivileged_userns=1`), as does `unshare --user --map-current-user --net` ⇒ test 5 is traced with **strace** (it has no namespace variant since the v0.1.0 fix pass, §13h) |
 | strace / node | strace 6.8 (traces children; `kernel.yama.ptrace_scope=1` allows tracing our own children); node v22.22.0 (UI helper tests) |
 | inotify | `max_user_watches=65536` ⇒ default budget 25 % = 16 384 (M2.1; was `min(8192, 25 %)`); `max_user_instances=128` with ≥109 already used by other processes ⇒ ccwm uses exactly one instance |
 | Env | uid 1000; `XDG_RUNTIME_DIR=/run/user/1000`; other XDG vars unset; `CLAUDE_CONFIG_DIR` unset |
@@ -132,10 +132,10 @@ The CLI never uses TCP and never reads a token file; the browser never reaches t
 ### Start sequence (`ccwm serve`)
 1. Refuse if `geteuid()==0`. `umask(0o077)`. Parse args/config path.
 2. Resolve dirs (`paths.rs`); every **ancestor** must be trusted (`Owner::verify_trusted`: owned by the user or root, not writable by others except a root-owned sticky dir or the user's private group); create each `0700`; any existing dir must be owned by the euid and not group/world accessible, else fail (never silently `chmod` something we did not create).
-3. Load `config.toml` (absent ⇒ defaults; present ⇒ the file and its ancestors must be trusted too); compute discovery roots (config or home) and the session dir (`CLAUDE_CONFIG_DIR` if absolute, else `~/.claude`).
+3. Load `config.toml` (absent ⇒ defaults; present ⇒ the file and its ancestors must be trusted too); compute discovery roots (config or home) and the session dir (`CLAUDE_CONFIG_DIR` if absolute, else `~/.claude`). From here on the home directory is **canonical**, and the hard boundaries (ccwm's four directories, the session dir) are kept under their configured **and** canonical paths for discovery, the tracker and the watcher alike (v0.1.0 review L2).
 4. **Apply Landlock now, on the main thread, before the Tokio runtime or any other thread exists** (`landlock_restrict_self` confines only the calling thread and its future children; threads created earlier would stay unconfined). `apply` counts `/proc/self/task` first: ≠ 1 ⇒ the report claims nothing. Flag broad read rules.
 5. Build the Tokio runtime; probe a worker and a blocking-pool thread (read of `/` must fail with `EACCES`); log the `SandboxReport`. Take the `flock` (lock file in the runtime dir). Open SQLite (`temp_store=MEMORY` so no temp files are needed under the sandbox), migrate, spawn writer + reader pool.
-6. Bind TCP `127.0.0.1:port` (failure ⇒ clear message naming the port, exit code 10; a held lock in step 5 ⇒ exit 11) and the Unix socket (remove a stale socket only if it is a socket we own; the lock proves no live daemon). **M4:** then, from the blocking pool, the write probe (`O_TMPFILE` in home) and the connect probe (`127.0.0.1:1`); then `sandbox::deny_new_sockets()` (seccomp, TSYNC: every existing thread, inherited by later ones and children); then socket probes on a worker and a blocking thread; then the report is logged. Before step 4 (still single-threaded, before Landlock limits binds), `http::peer::select_lookup()` self-tests `sock_diag` on an ephemeral loopback connection.
+6. Bind TCP `127.0.0.1:port` (failure ⇒ clear message naming the port, exit code 10; a held lock in step 5 ⇒ exit 11) and the Unix socket (remove a stale socket only if it is a socket we own; the lock proves no live daemon). **M4:** then, from the blocking pool, the write probe (`O_TMPFILE` in home) and the connect probe (`127.0.0.1:1`); then `sandbox::deny_new_sockets()` (seccomp, TSYNC: every existing thread, inherited by later ones and children); then socket probes on a worker and a blocking thread; then the report is logged (with a warning for anything `unverified`). **Everything that needs a socket or a socket pair exists before the filter:** before step 4 (still single-threaded, before Landlock limits binds), `http::peer::select_lookup()` opens the one `NETLINK_SOCK_DIAG` socket (`peer::SockDiag`, reused for every lookup, serialized, sequence-numbered) and self-tests it on an ephemeral loopback connection; the Tokio runtime creates its signal socket pair when it is built (step 5), and the SIGTERM/SIGINT handlers are registered right before the filter. After it, child processes are started only through `posix_spawn` (absolute program path, no `pre_exec`): the standard library's fork/exec fallback needs a `socketpair`.
 7. Write `instance.json` (pid, port, version, started_at; atomic rename).
 8. Detect `git` on `PATH` (version, hardened?); create the single inotify instance (failure ⇒ every project polled, reported); build Tracker, Monitor, Service; spawn the monitor, the reconciler (first scan immediately), the signal handler, the WebSocket publisher, the hourly session purge, and serve. Cached projects are readable immediately.
 9. SIGTERM/SIGINT: stop accepting → cancel discovery → stop monitor/tracker/publisher → writer `Flush` + join → remove socket and `instance.json` → exit 0.
@@ -423,10 +423,10 @@ Shutdown: stop accepting, `graceful_shutdown` every connection, wait at most 5 s
 2. **Host check**: exactly `127.0.0.1:<bound port>`, `localhost:<port>`, `[::1]:<port>` (case-insensitive) else `421 host_not_allowed`.
 3. **Origin check** (`/api`): any `Origin` other than `http://127.0.0.1:<bound port>` ⇒ `403 origin_not_allowed`; POST/PUT/DELETE without `Origin` ⇒ 403 too. No CORS headers, ever; `OPTIONS` ⇒ 405.
 4. **Auth** by route: `Public` (health, assets, `auth/exchange`) or `Session` (everything else). Tokens: SHA-256 → DB lookup → `subtle` compare of digests → expiry via `Clock`.
-5. Bodies ≤ 16 KiB (`413 payload_too_large`); unknown query keys or bad values ⇒ `400 invalid_argument`.
+5. Bodies ≤ 16 KiB (`413 payload_too_large`) and complete within 10 s of the request head (`408 request_timeout`, then the connection is closed; v0.1.0 review L5); unknown query keys or bad values ⇒ `400 invalid_argument`.
 
 Errors: `{"error":{"code":"…","message":"…"}}` — codes `invalid_argument 400`, `unauthorized 401`,
-`origin_not_allowed 403`, `not_found 404`, `method_not_allowed 405`, `payload_too_large 413`,
+`origin_not_allowed 403`, `not_found 404`, `method_not_allowed 405`, `request_timeout 408`, `payload_too_large 413`,
 `host_not_allowed 421`, `internal 500` (generic message; details only in logs, never content).
 
 ### Browser endpoints (M1)
@@ -443,7 +443,7 @@ Errors: `{"error":{"code":"…","message":"…"}}` — codes `invalid_argument 4
 | `GET /ws` | Origin required; auth by first message | see below |
 | `GET /stats` | Session | `{"total_projects","modified_today","modified_this_week","inactive","dormant","unknown_activity","uncommitted_changes","missing"}` over present, non-ignored projects (missing counted separately); `total_sessions` arrives in M3 |
 | `GET /discovery/status` | Session | `{"phase","dirs_visited","projects_found","skipped":{…},"roots":[{"path","state"}],"last_success_at","next_scan_at"}` |
-| `GET /service/status` | Session | M1 subset: `version`, `uptime_s`, `port`, `sandbox{abi,status,filesystem,network:"tcp_only"\|"none",abstract_unix_socket,signal,no_new_privs,threads_at_apply,thread_probes{worker,blocking},broad_read_rules[],unconfined[],notes[]}`, `discovery{phase,last_success_at}` |
+| `GET /service/status` | Session | M1 subset: `version`, `uptime_s`, `port`, `sandbox{abi,status,filesystem,network:"tcp_only"\|"none",abstract_unix_socket,signal,no_new_privs,threads_at_apply,thread_probes{worker,blocking},broad_read_rules[],unconfined[],unverified[],notes[]}` (`status`, `network` and `seccomp` can also be `"unverified"`; with `privacy=1`: `broad_read_rules: []`, `notes: []` and `notes_hidden: <count>`), `discovery{phase,last_success_at}` |
 
 "Session" = a valid token whose rotation is not overdue (rotated within 24 h + 60 s).
 
@@ -457,7 +457,7 @@ UI's "N days ago" uses it). Git states: `ok`, `not_git`, `git_missing`, `unsafe_
 `/discovery/status` adds `scans_finished` and (M2.1) `unreadable[{path ("~/…"),reason}]` (first 50 folders counted
 in `skipped.permission|vanished|changed|other`); `/service/status` adds `commit`, `discovery.next_scan_at`,
 `monitoring{watcher,watches,budget,max_user_watches,watched_projects,partial_projects,polled_projects,overflows,
-recovering_overflow,pending_projects,degraded,advice[]}`, `git{program,version,hardened_status,
+recovering_overflow,pending_projects,session_watches,ignore_files_skipped,degraded,advice[]}`, `git{program,version,hardened_status,
 unhardened_status_allowed}`, `queues{git_in_flight,websocket_clients}`.
 
 **WebSocket** (`/api/v1/ws`): exact Origin on upgrade (403 otherwise); client messages ≤ 4 KiB; first message
@@ -540,15 +540,19 @@ active (never what was requested).
 | network (ABI ≥ 4) | all TCP `connect` denied; `bind` allowed only on the configured port — reported as `network: "tcp_only"` |
 | scopes (ABI ≥ 6) | abstract Unix sockets and signals cannot reach processes outside the domain |
 | **not confined by Landlock** | UDP and other non-TCP families; `connect()` on path-based Unix sockets (`ResolveUnix` exists only from ABI 9, not requested in v0.1); listed in `unconfined[]` **unless the seccomp filter is active**. `sandbox::child_command` drops `DBUS_*`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK`, display/agent/systemd IPC variables from every child's environment |
-| seccomp (M4, after the listeners are bound, all threads) | `socket()` ⇒ `EPERM` unless `AF_NETLINK` + `NETLINK_SOCK_DIAG`; `io_uring_setup/enter/register` and x32 `socket`/`io_uring_setup` ⇒ `EPERM`; foreign architecture ⇒ kill. Reported as `seccomp: "socket_denied"` only if both socket probes saw `EPERM` |
+| seccomp (M4, after the listeners are bound, all threads) | `socket()` and `socketpair()` ⇒ `EPERM` for every family, no exception (the peer check's netlink socket is opened before the filter; v0.1.0 fix pass); `io_uring_setup/enter/register` and x32 `socket`/`socketpair`/`io_uring_setup` ⇒ `EPERM`; foreign architecture ⇒ kill. Reported as `seccomp: "socket_denied"` only if both socket probes (UDP, Unix, socket pair) saw `EPERM`; `"unverified"` if a probe failed otherwise without creating a socket |
 
 `SandboxReport {abi, status, filesystem, network, abstract_unix_socket, signal, no_new_privs, threads_at_apply,
 thread_probes{worker,blocking}, seccomp, daemon_probes{write,connect,socket_worker,socket_blocking},
-broad_read_rules[], unconfined[], notes[]}` goes to the startup log and `service.status` (which also carries
-`peer_lookup`: `sock_diag` | `procfs`). `record_daemon_probes`: write `allowed` ⇒ every claim withdrawn,
-connect `allowed` ⇒ `network: none`, other errors ⇒ a note only. `record_seccomp`: claimed only with both
-socket probes `eperm`. If `/proc/self/task` ≠ 1 entry at `apply`, or a thread probe is not `eacces`, every claim
-is withdrawn (`not_enforced`). Child processes inherit the ruleset. Known consequences: roots added at
+broad_read_rules[], unconfined[], unverified[], notes[]}` goes to the startup log and `service.status` (which also carries
+`peer_lookup`: `sock_diag` | `procfs`). Every protection is in exactly one of three places: claimed (its field),
+`unconfined[]` (withdrawn or never applied) or `unverified[]` (applied, but its probe failed for an unexpected
+reason: neither claimed nor withdrawn; the field then says `false` or `"unverified"`). `record_daemon_probes`:
+write `allowed` ⇒ every claim withdrawn, connect `allowed` ⇒ `network: none`, any other outcome ⇒ `filesystem` /
+`tcp` unverified. `record_seccomp`: claimed only with both socket probes `eperm`; a created socket ⇒
+`not_applied`; otherwise unverified. If `/proc/self/task` ≠ 1 entry at `apply`, or a thread probe is `allowed`,
+every claim is withdrawn (`not_enforced`); a thread probe that fails otherwise leaves every Landlock claim
+unverified (`status: "unverified"`). A later disproof moves an unverified protection to `unconfined[]`. Child processes inherit the ruleset. Known consequences: roots added at
 runtime (M3 settings) outside the startup read set cannot be read until restart — reported as "requires
 restart" (**Open**, M3); `claude` located outside the allowed system paths cannot be executed (M3).
 **Verified in tests (M1.1):** `tests/sandbox.rs` has its own `main` (`harness = false`, because libtest runs
@@ -642,6 +646,8 @@ detect execution.
 | promisor partial clone (`HEAD` object missing) + `ext::` / `file://`+`uploadpack` / `ssh://`+`core.sshCommand`, per-protocol `allow=always` in repo config (M2 review H1) | **executed** by `status` and `log -1` (lazy `git fetch` → transport) | executed |
 | same, with `GIT_ALLOW_PROTOCOL=` only / `-c protocol.<name>.allow=never` only / `GIT_NO_LAZY_FETCH=1` only (M2.1) | not executed (each alone, all three vectors) | — |
 | hooks | `status` runs none (maintainer decision: no hook test) | — |
+| `filter.<n>.clean` under a driver name that is not valid UTF-8 (`ev\xFFil`, Latin-1 `caf\xE9`), selected by `.git/info/attributes` (v0.1.0 review H1) | with the §6 filter rules of M2–M4: **executed** (the lossy name got the override, the real driver ran) | executed |
+| same, and 150 generated names of arbitrary bytes, with the fail-closed rule (v0.1.0 fix pass) | not executed: exact names are neutralized (`ok`), every other name disables status | executed where an attribute can select the name |
 
 Verified mitigation (now §6 of the spec): `--attr-source=<empty tree>` stops worktree `.gitattributes` filters;
 nulling every `filter.<name>.{clean,smudge,process}` (+ `required=false`) from **all scopes** stops
@@ -781,6 +787,54 @@ codes go in `RestartPreventExitStatus=`.
   (`sha256sum -c`, reproducible) run locally; gitleaks 8.30.1 over the history: no leaks after reviewing 14
   synthetic findings.
 
+## 13h. v0.1.0 fix pass verification notes (what was actually run, 2026-11-25)
+
+Fixes for the v0.1.0 pre-release security review (docs/reviews/v0.1.0-security-review.md) and the items carried
+over from M4. Host as in §1 (Linux 7.0, Landlock ABI 8, git 2.43.0, rustc 1.94.0).
+
+- **H1:** `tests/git.rs` runs 165 driver names (the review's two, hand-picked edge cases, 150 generated from
+  arbitrary bytes) through `Git::inspect`, each with a plain-`git status` control: no sentinel; exact names ⇒ `ok`,
+  all others ⇒ `status_disabled_unsafe_config`. With the old lossy decode the test fails on `ev\xFFil` ("the
+  malicious command was executed"): checked by putting the old code back once.
+- **Seccomp (M1 + carried over):** `tests/sandbox.rs` child under Landlock, then the filter: a datagram socket
+  pair sends to a path-based datagram socket outside the sandbox **before** the filter (control; the datagram
+  arrives), and `socketpair` (stream and datagram, also from a grandchild), a new `NETLINK_SOCK_DIAG` socket,
+  `io_uring_setup` and the x32 `socket`/`socketpair`/`io_uring_setup` entry points all get `EPERM` after it
+  (raw system calls through a `python3`/ctypes child, with controls before the filter); the netlink socket
+  opened before the filter still answers; `Git::inspect` still returns `ok` (posix_spawn). The whole
+  `tests/process.rs` suite runs under the filter: SIGTERM ⇒ exit 0 in every test that stops a daemon.
+  The static musl binary was smoke-tested in a synthetic environment: `fully_enforced`, `seccomp=socket_denied`,
+  Git states `ok`, the (fake) `claude` check `verified`, SIGTERM ⇒ clean shutdown.
+- **Unverified probes:** unit tests of every transition (`sandbox.rs`), and of the `ccwm status` / `ccwm doctor`
+  rendering. No real host here produces an unexpected probe failure, so the daemon-level path was not observed.
+- **M2:** measured with a release build (`ignore` 0.4): a rule that needs a regular expression (`*1?b[c-d]*.x`)
+  costs about 15 KiB of resident memory and 0.25 ms to compile, linearly (1,000 rules: 15 MiB, 0.2 s; 5,000:
+  73 MiB, 1.2 s; 20,000: 315 MiB, 5 s; 1 MiB of such rules: 920 MiB, 15.5 s); literal rules cost almost
+  nothing. Hence the rule limit next to the byte limits. `tests/process.rs` starts the real daemon on the
+  review's repository shape (12 hard-linked 1 MiB `.gitignore` files, the same file as `info/exclude`, and a
+  root `.gitignore` of 5,001 rules): 14 files skipped and reported, resident memory under 200 MiB (debug build),
+  SIGTERM ⇒ exit 0.
+- **L2:** process test with `XDG_DATA_HOME` reached through a symlink into project `alpha`: the latest file stays
+  a fixture file and the activity `inferred`; without the canonical boundaries the same test shows
+  `observed`, `store/ccwm/ccwm.db-wal` (checked once).
+- **L5:** socket test: a complete head with `Content-Length: 100` and no body ⇒ `408` and a closed connection
+  after the timeout, for `/auth/exchange` and an authenticated `PUT /settings`.
+- **EPIPE:** `ccwm status|doctor|scan|open --print|auth revoke-all` with stdout's read end already closed: exit
+  0, nothing on stderr; before the fix: `thread 'main' panicked` from `println!`.
+- **UI:** table view and Activity column checked in Chrome against a synthetic daemon: `main` spans the window
+  (`max-width: none`), the Activity column stays 6.5rem and "Inactive" is not truncated at table widths from
+  1350 px down to 430 px. Not checked in Firefox.
+- **Test 5:** strace only (its namespace variant was removed, see REQUIREMENTS.md §16). CI workflows linted with
+  actionlint 1.7.12; **CI itself has still not run** (nothing pushed).
+- **Not done:** `Clear-Site-Data` (evaluated from MDN's compatibility data only, no browser test; SECURITY.md);
+  POSIX ACLs in the trust check (documented; needs an xattr read, i.e. a new dependency); review items I3
+  (WebSocket send timeout and `biased` select), I7 (check the `wal_checkpoint` result), I8 (session-file cap marks
+  a directory complete), the stricter `PUT /settings` checks of I6, and the review's other test-coverage gaps.
+- A flaky test was fixed on the way: a stand-in `git` script written and executed while another test thread
+  forked failed with `ETXTBSY` (seen as `GitMissing`, about one run in ten once the fuzz test added a thousand
+  process spawns to that binary); scripts in `tests/git.rs` are now written by a child shell
+  (`common::write_executable`): 80 consecutive runs of the binary passed.
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -838,8 +892,15 @@ port and session directory need a restart; Landlock cannot widen a running proce
 restart is planned); **O7** approved (`<pasted_content>` is user text; privacy also hides the status/settings paths;
 the cwd walk-up also stops at a `CLAUDE.md`); the M3.1 narrowed Basic-auth redaction rule approved.
 
+Decided for the v0.1.0 fix pass (2026-11-25, maintainer): H1 fails closed on any name that is not exact; `socketpair`
+is denied and the netlink socket pre-opened; ignore files are capped per file and per project; inconclusive probes
+report `unverified`; test 5 keeps strace only (one of the two options the maintainer offered). Chosen during the
+pass, for review: the per-project limits (1 MiB, 5,000 rules), `notes_hidden` in privacy mode, `408` for a late
+body, exit status 0 on a closed output pipe, `Clear-Site-Data` not sent, ACLs documented rather than checked.
+
 Open:
-- **O8 (M4, needs approval):** the M4 spec changes listed in REQUIREMENTS.md Appendix A ("M4, needs approval").
+- **O8 (M4, needs approval):** the M4 spec changes listed in REQUIREMENTS.md Appendix A ("M4, needs approval"); two
+  of them are superseded by the fix pass (the netlink exception, "inconclusive withdraws nothing").
 - **O2:** a `claude` binary outside the sandbox read set cannot be executed: reported as `failed` (the usual
   `~/.local/bin/claude` → `~/.local/share/claude/…` install is inside home, a root).
 - **O3 (M4):** crate/GitHub/distro naming-conflict check needs outbound requests — needs the maintainer's OK.

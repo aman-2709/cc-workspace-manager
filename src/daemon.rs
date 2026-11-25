@@ -68,6 +68,8 @@ struct Prepared {
     roots: Vec<PathBuf>,
     home: PathBuf,
     session_dir: PathBuf,
+    /// The hard boundaries of discovery and watching, in their literal and canonical spellings.
+    boundaries: Vec<PathBuf>,
     policy: Policy,
     report: SandboxReport,
     peer_lookup: crate::http::peer::PeerUidLookup,
@@ -99,12 +101,6 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         validate_port(port)?;
         config.server.port = port;
     }
-    let roots = if config.discovery.roots.is_empty() {
-        vec![home.clone()]
-    } else {
-        config.discovery.roots.clone()
-    };
-
     // Canonical directories for the sandbox and the discovery boundaries (they exist now).
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let session_dir = config
@@ -112,19 +108,40 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         .dir
         .clone()
         .unwrap_or_else(|| paths::session_dir(&env, &home));
+    // The home directory in its canonical spelling from here on: discovery, the tracker, the
+    // watcher and Git all compare it with canonical paths ("a repository at home is not a
+    // project's", `~/snap`, the session rules), and a symlinked home must not defeat them
+    // (v0.1.0 review L2).
+    let home = canon(&home);
+    let roots = if config.discovery.roots.is_empty() {
+        vec![home.clone()]
+    } else {
+        config.discovery.roots.clone()
+    };
+    let canonical_dirs = Dirs {
+        config: canon(&dirs.config),
+        data: canon(&dirs.data),
+        state: canon(&dirs.state),
+        runtime: canon(&dirs.runtime),
+    };
     let policy = sandbox::daemon_policy(
         &roots.iter().map(|r| canon(r)).collect::<Vec<_>>(),
         &canon(&session_dir),
-        &Dirs {
-            config: canon(&dirs.config),
-            data: canon(&dirs.data),
-            state: canon(&dirs.state),
-            runtime: canon(&dirs.runtime),
-        },
+        &canonical_dirs,
         config.server.port,
     );
+    // ccwm's directories and the session directory are hard boundaries under both spellings:
+    // the walks see canonical paths, so with a symlinked XDG parent that resolves into a project
+    // the literal path alone would let ccwm watch its own database (review L2).
+    let mut boundaries = dirs.hard_boundaries(&session_dir);
+    for b in canonical_dirs.hard_boundaries(&canon(&session_dir)) {
+        if !boundaries.contains(&b) {
+            boundaries.push(b);
+        }
+    }
     // The TCP peer check's lookup is chosen by a self-test over an ephemeral loopback connection,
-    // which only works before the sandbox limits binds to the configured port.
+    // which only works before the sandbox limits binds to the configured port. Its netlink socket
+    // is opened here, once, and reused: the seccomp filter later denies every new socket.
     let (peer_lookup, peer_method) = crate::http::peer::select_lookup();
     let mut report =
         sandbox::apply(&policy).unwrap_or_else(|e| SandboxReport::disabled(e.to_string()));
@@ -146,6 +163,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         roots,
         home,
         session_dir,
+        boundaries,
         policy,
         report,
         peer_lookup,
@@ -155,7 +173,8 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
 
 /// M4: once the listeners are bound, probe from the blocking pool that the daemon cannot write
 /// outside its directories or connect out, install the seccomp socket filter on every thread,
-/// and probe socket creation from a worker and a blocking-pool thread.
+/// and probe socket creation from a worker and a blocking-pool thread. Everything that needs a
+/// socket or a socket pair must exist before this runs.
 async fn deny_sockets_and_probe(home: &Path, report: &mut SandboxReport) {
     let dir = home.to_path_buf();
     let (write, connect) =
@@ -197,6 +216,7 @@ async fn run(p: Prepared) -> Result<()> {
         roots,
         home,
         session_dir,
+        boundaries,
         policy,
         mut report,
         peer_lookup,
@@ -233,9 +253,21 @@ async fn run(p: Prepared) -> Result<()> {
         .map_err(|e| Error::io("cannot read the bound port", &e))?
         .port();
     let socket = crate::ipc::server::bind(&dirs.socket_path(), uid)?;
+    // The signal handlers are registered before the filter: the runtime delivers signals through
+    // a socket pair, and the filter denies socketpair() too (v0.1.0 review M1).
+    let mut sigterm = signal(SignalKind::terminate())
+        .map_err(|e| Error::io("cannot install SIGTERM handler", &e))?;
+    let mut sigint = signal(SignalKind::interrupt())
+        .map_err(|e| Error::io("cannot install SIGINT handler", &e))?;
     // Both listeners exist: from now on the daemon creates no socket (seccomp, M4).
     deny_sockets_and_probe(&home, &mut report).await;
     tracing::info!("{}", report.summary());
+    if !report.unverified.is_empty() {
+        tracing::warn!(
+            protections = %report.unverified.join(","),
+            "a sandbox probe failed for an unexpected reason: these protections are unverified (neither claimed nor withdrawn); see the notes above and `ccwm doctor`"
+        );
+    }
     tracing::info!(method = peer_method, "tcp peer check");
 
     // ---- tracking: Git, the single inotify instance, the monitor and the tracker (M2) ----
@@ -269,10 +301,6 @@ async fn run(p: Prepared) -> Result<()> {
     };
     let canonical_session_dir =
         std::fs::canonicalize(&session_dir).unwrap_or_else(|_| session_dir.clone());
-    let mut boundaries = dirs.hard_boundaries(&session_dir);
-    if !boundaries.contains(&canonical_session_dir) {
-        boundaries.push(canonical_session_dir.clone());
-    }
     let claude = Arc::new(crate::claude::cli::Verifier::new(std::env::var_os("PATH")));
     let fuse_mounts = current_fuse_mount_points();
     let max_user_watches = watch_engine::read_max_user_watches();
@@ -304,6 +332,7 @@ async fn run(p: Prepared) -> Result<()> {
         monitor_state.clone(),
         TrackerSettings {
             scan: scan_opts,
+            uid,
             interval: Duration::from_secs(config.discovery.scan_interval_secs),
             retention_secs: i64::from(config.discovery.missing_retention_days) * 86_400,
             events_per_project: config.activity.events_per_project,
@@ -409,10 +438,6 @@ async fn run(p: Prepared) -> Result<()> {
         })
     };
 
-    let mut sigterm = signal(SignalKind::terminate())
-        .map_err(|e| Error::io("cannot install SIGTERM handler", &e))?;
-    let mut sigint = signal(SignalKind::interrupt())
-        .map_err(|e| Error::io("cannot install SIGINT handler", &e))?;
     let shutdown = async move {
         tokio::select! { _ = sigterm.recv() => {}, _ = sigint.recv() => {} }
         tracing::info!("shutting down");

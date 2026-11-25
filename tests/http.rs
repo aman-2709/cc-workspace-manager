@@ -51,7 +51,7 @@ async fn security_headers_are_on_every_response_class() {
     let e = env().await;
     let token = e.login().await;
     let expected_csp = format!(
-        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws://127.0.0.1:{PORT}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws://127.0.0.1:{PORT}; worker-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     );
     let h = host();
     let responses = vec![
@@ -1535,6 +1535,55 @@ mod sockets {
             let text = String::from_utf8_lossy(&buf);
             assert!(!text.contains("200"), "{text}");
         }
+        srv.stop().await;
+    }
+
+    /// v0.1.0 review L5: a complete head whose body never arrives does not pin its connection
+    /// slot: the request is answered with 408 after the timeout and the connection is closed.
+    /// Both the unauthenticated exchange and an authenticated settings save are covered; a body
+    /// that does arrive is the control.
+    #[tokio::test]
+    async fn a_request_body_that_never_arrives_times_out_and_frees_the_connection() {
+        let srv = serve(http::peer::procfs_lookup(), 8, Duration::from_millis(500)).await;
+        let token = srv._env.login().await;
+        let origin = format!("http://127.0.0.1:{PORT}");
+        let head = |method: &str, path: &str, length: usize| {
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nOrigin: {origin}\r\n\
+                 Authorization: Bearer {token}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {length}\r\n\r\n"
+            )
+        };
+        for (method, path) in [
+            ("POST", "/api/v1/auth/exchange"),
+            ("PUT", "/api/v1/settings"),
+        ] {
+            let mut s = TcpStream::connect(srv.addr).await.unwrap();
+            s.write_all(head(method, path, 100).as_bytes())
+                .await
+                .unwrap();
+            let started = Instant::now();
+            let mut buf = Vec::new();
+            let r = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+            assert!(r.is_ok(), "{path}: a stalled body kept its connection open");
+            assert!(
+                started.elapsed() >= Duration::from_millis(400),
+                "{path}: closed too early"
+            );
+            let text = String::from_utf8_lossy(&buf);
+            assert!(
+                text.starts_with("HTTP/1.1 408") && text.contains("request_timeout"),
+                "{path}: {text}"
+            );
+        }
+        // Control: the same request with its body is served.
+        let body = r#"{"ui":{"default_view":"table"}}"#;
+        let mut s = TcpStream::connect(srv.addr).await.unwrap();
+        let request = format!("{}{body}", head("PUT", "/api/v1/settings", body.len()));
+        s.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 12];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, b"HTTP/1.1 200");
         srv.stop().await;
     }
 

@@ -382,15 +382,15 @@ impl Git {
                 r"^filter\..*\.(clean|smudge|process)$",
             ],
         ) {
-            Ok(o) if o.success() => parse::filter_driver_names(&o.stdout),
+            Ok(o) if o.success() => match parse::filter_driver_names(&o.stdout) {
+                Some(drivers) => drivers,
+                None => return Ok(None),
+            },
             Ok(o) if o.code == Some(1) => Vec::new(), // no matching keys
             Ok(o) => return Err(classify_failure(&o.stderr_text())),
             Err(RunError::Timeout) => return Err(State::Timeout),
             Err(_) => return Err(State::Error),
         };
-        if !drivers.iter().all(|n| parse::neutralizable(n)) {
-            return Ok(None);
-        }
         let args = status_args(&drivers, self.hardened());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = self.checked(dir, &refs)?;

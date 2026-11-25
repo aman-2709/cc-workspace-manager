@@ -40,6 +40,8 @@ body { margin: 0; background: var(--bg); color: var(--fg); min-height: 100vh; di
 .bar h1 { font-size: 1.1rem; margin: 0; }
 .spacer { flex: 1; }
 main { flex: 1; padding: 1rem 1.5rem 1.5rem; max-width: 80rem; width: 100%; margin: 0 auto; }
+/* The table view uses the whole window; cards and the other pages keep the 80rem column. */
+main:has(.table-wrap), body:has(main .table-wrap) #banners { max-width: none; }
 .muted { color: var(--muted); }
 .small { font-size: 0.85rem; }
 code { background: var(--card); border: 1px solid var(--border); border-radius: 4px; padding: 0.1rem 0.35rem; }
@@ -108,10 +110,13 @@ th button { background: none; border: none; padding: 0; font-weight: 600; }
 th button[aria-current="true"] { color: var(--accent); }
 tbody tr:last-child td { border-bottom: none; }
 td .line { max-width: 100%; }
-/* The data columns share what the fixed-width actions column leaves (their percentages sum to
-   less than 100 %, so a fixed table spreads the rest over them). */
-.col-name { width: 10%; } .col-path { width: 14%; } .col-mod { width: 8.5%; } .col-status { width: 6%; }
+/* The data columns share what the fixed-width columns leave (their percentages sum to less than
+   100 %, so a fixed table spreads the rest over them). */
+.col-name { width: 10%; } .col-path { width: 14%; } .col-mod { width: 8.5%; }
 .col-git { width: 10%; } .col-commit { width: 9%; } .col-session { width: 8.5%; }
+/* Activity: a fixed width that holds the dot and the longest label ("Inactive") at any table
+   width; as a percentage it shrank to "Ina…" in a narrow window. */
+.col-status { width: 6.5rem; white-space: nowrap; }
 /* Actions: a fixed width that holds "Details", "Copy resume" and "Un-ignore"/"Confirm forget" on
    one line, whatever the table width. */
 .col-act { width: 17rem; white-space: nowrap; }

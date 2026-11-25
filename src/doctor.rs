@@ -404,23 +404,28 @@ pub fn sandbox(report: Option<&Value>, lsm: Option<&str>) -> Check {
         };
     };
     let abi = n(r, "/abi").map_or_else(|| "none".to_string(), |a| a.to_string());
+    let claim = |kind| crate::cli::sandbox_claim(r, kind);
+    let unverified = crate::cli::string_list(r, "unverified");
     let detail = format!(
-        "Landlock {} (ABI {abi}; filesystem {}, network {}, abstract sockets {}, signals {}); seccomp {}; daemon probes: write {}, connect {}, socket {}/{}; unconfined: [{}]",
+        "Landlock {} (ABI {abi}; filesystem {}, network {}, abstract sockets {}, signals {}); seccomp {}; daemon probes: write {}, connect {}, socket {}/{}; unconfined: [{}]; unverified: [{}]",
         s(r, "/status"),
-        r.get("filesystem").and_then(Value::as_bool).unwrap_or(false),
+        claim("filesystem"),
         s(r, "/network"),
-        r.get("abstract_unix_socket").and_then(Value::as_bool).unwrap_or(false),
-        r.get("signal").and_then(Value::as_bool).unwrap_or(false),
+        claim("abstract_unix_socket"),
+        claim("signal"),
         s(r, "/seccomp"),
         s(r, "/daemon_probes/write"),
         s(r, "/daemon_probes/connect"),
         s(r, "/daemon_probes/socket_worker"),
         s(r, "/daemon_probes/socket_blocking"),
-        r.get("unconfined")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
-            .unwrap_or_default()
+        crate::cli::string_list(r, "unconfined").join(", "),
+        unverified.join(", ")
     );
+    if !unverified.is_empty() {
+        return check("sandbox", Level::Warn, detail).fix(
+            "a probe failed for an unexpected reason, so these protections are neither confirmed nor disproved; the reason is in the daemon's log and in `GET /api/v1/service/status` (sandbox.notes); see docs/troubleshooting.md",
+        );
+    }
     let full = s(r, "/status") == "fully_enforced"
         && s(r, "/network") == "tcp_only"
         && s(r, "/seccomp") == "socket_denied";
@@ -624,7 +629,7 @@ pub fn checks() -> Result<Vec<Check>> {
 
 pub fn run() -> Result<()> {
     let checks = checks()?;
-    print!("{}", format(&checks));
+    crate::cli::out!("{}", format(&checks));
     let failed = checks.iter().filter(|c| c.level == Level::Fail).count();
     if failed > 0 {
         return Err(Error::new(format!(
@@ -834,6 +839,23 @@ mod tests {
         let mut partial = full.clone();
         partial["seccomp"] = json!("not_applied");
         assert_eq!(sandbox(Some(&partial), None).level, Level::Warn);
+        // A probe that failed for an unexpected reason: shown as unverified, with its own advice,
+        // never as enforced and never as withdrawn.
+        let mut odd = full.clone();
+        odd["filesystem"] = json!(false);
+        odd["unverified"] = json!(["filesystem"]);
+        odd["daemon_probes"]["write"] = json!("error:Unsupported");
+        let c = sandbox(Some(&odd), None);
+        assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.detail.contains("filesystem unverified, network tcp_only")
+                && c.detail.contains("write error:Unsupported")
+                && c.detail
+                    .contains("unconfined: []; unverified: [filesystem]"),
+            "{}",
+            c.detail
+        );
+        assert!(c.fix.unwrap().contains("neither confirmed nor disproved"));
         assert_eq!(
             sandbox(None, Some("lockdown,capability,landlock,yama,apparmor")).level,
             Level::Info

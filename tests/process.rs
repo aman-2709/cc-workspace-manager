@@ -47,7 +47,7 @@ struct Daemon {
     log: Arc<Mutex<String>>,
     port: u16,
     /// The daemon's own pid (from `instance.json`): differs from `child` when it runs under a
-    /// wrapper (strace, unshare).
+    /// wrapper (strace).
     daemon_pid: i32,
 }
 
@@ -1429,20 +1429,12 @@ fn the_exec_allowlist_admits_only_the_daemon_and_allowlisted_git_commands() {
     assert_eq!(bad, [7, 8, 9, 10, 11, 13, 16, 17], "{found:#?}");
 }
 
-/// Which isolation security acceptance test 5 can use on this host: a network namespace
-/// (`unshare`, mapping the current user: ccwm refuses to run as root) and/or `strace`. Each is
-/// probed with the exact wrapper it would run.
-fn test5_wrapper(log: &Path) -> Option<(Vec<String>, &'static str)> {
-    let works = |argv: &[&str]| {
-        Command::new(argv[0])
-            .args(&argv[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    };
-    let log = log.to_str().unwrap();
+/// The wrapper of security acceptance test 5: `strace`, following every child, logging each
+/// `connect()` and `execve()` to `log`; `None` when `strace` cannot trace here (probed with the
+/// exact wrapper). There is no network-namespace variant: an unprivileged network namespace
+/// needs a user namespace, in which root-owned paths (`/`, `/tmp`) appear owned by `nobody` and
+/// the daemon's ownership checks rightly refuse to start (v0.1.0 review; REQUIREMENTS.md §16).
+fn test5_wrapper(log: &Path) -> Option<Vec<String>> {
     let strace = [
         "strace",
         "-f",
@@ -1453,32 +1445,17 @@ fn test5_wrapper(log: &Path) -> Option<(Vec<String>, &'static str)> {
         "-e",
         "trace=connect,execve",
         "-o",
-        log,
+        log.to_str().unwrap(),
     ];
-    let netns = [
-        "unshare",
-        "--user",
-        "--map-current-user",
-        "--keep-caps",
-        "--net",
-        "--",
-        "sh",
-        "-c",
-        "ip link set lo up && exec \"$@\"",
-        "sh",
-    ];
-    let has_strace = works(&[&strace[..], &["true"]].concat());
-    let has_netns = works(&[&netns[..], &["true"]].concat());
-    let own = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
-    match (has_netns, has_strace) {
-        (true, true) => Some((
-            [own(&netns), own(&strace)].concat(),
-            "network namespace + strace",
-        )),
-        (false, true) => Some((own(&strace), "strace (no network namespace on this host)")),
-        (true, false) => Some((own(&netns), "network namespace (no strace)")),
-        (false, false) => None,
-    }
+    Command::new(strace[0])
+        .args(&strace[1..])
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+        .then(|| strace.iter().map(ToString::to_string).collect())
 }
 
 /// Plain Git for fixtures (author set, no ccwm hardening); panics on failure.
@@ -1505,13 +1482,15 @@ fn fixture_git(dir: &Path, home: &Path, args: &[&str]) -> String {
 }
 
 /// Security acceptance test 5: through a discovery, live-watch, Git and reconciliation cycle, the
-/// daemon and its Git subprocesses attempt no non-loopback connect (strace), and/or run in a
-/// network namespace with only loopback. With strace, every `execve` must also be allowlisted:
-/// the daemon itself or `git` running a §6 subcommand; a `fetch`, `remote-*` helper, `sh` or `ssh`
-/// fails the test. Promisor partial clones (one per transport, `HEAD` object missing) must cause
-/// zero fetch children and run no helper (M2 review H1/L3). The session cycle (ingest, a live
-/// session, on-demand prompt reads) and the `claude --version/--help` check (a fake `claude` on
-/// `PATH`) run too. Skipped with a notice when neither isolation is available.
+/// daemon and its Git subprocesses attempt no non-loopback connect, traced with `strace`. Every
+/// `execve` must also be allowlisted: the daemon itself or `git` running a §6 subcommand; a
+/// `fetch`, `remote-*` helper, `sh` or `ssh` fails the test. Promisor partial clones (one per
+/// transport, `HEAD` object missing) must cause zero fetch children and run no helper (M2 review
+/// H1/L3). The session cycle (ingest, a live session, on-demand prompt reads) and the
+/// `claude --version/--help` check (a fake `claude` on `PATH`) run too. Skipped with a notice
+/// when `strace` is not usable (a failure in CI). What `connect()` tracing cannot see (datagrams
+/// on sockets that need no connect) is closed by the seccomp filter: no socket can be created
+/// after startup (`tests/sandbox.rs`).
 #[test]
 fn acceptance_5_no_external_network_connections() {
     let t = common::tempdir();
@@ -1550,23 +1529,14 @@ fn acceptance_5_no_external_network_connections() {
         }
     }
     let log_path = t.path().join("connect.log");
-    let Some((wrapper, variant)) = test5_wrapper(&log_path) else {
+    let Some(wrapper) = test5_wrapper(&log_path) else {
         assert!(
             std::env::var_os("CI").is_none(),
-            "test 5 needs strace or unprivileged network namespaces in CI"
+            "test 5 needs strace in CI"
         );
-        eprintln!("NOTICE: security acceptance test 5 skipped: neither unshare (network namespace) nor strace is usable here");
+        eprintln!("NOTICE: security acceptance test 5 skipped: strace is not usable here");
         return;
     };
-    eprintln!("NOTICE: security acceptance test 5 variant: {variant}");
-    // CI sets this where its probe found unprivileged user namespaces (REQUIREMENTS.md §16:
-    // both variants run when both are available; the network-namespace one has not run here).
-    if std::env::var("CCWM_REQUIRE_NETNS").as_deref() == Ok("1") {
-        assert!(
-            variant.starts_with("network namespace"),
-            "CCWM_REQUIRE_NETNS=1 but test 5 ran without a network namespace ({variant})"
-        );
-    }
     let d = Daemon::start_wrapped(&env, &[], &[("PATH", &path_env)], &wrapper);
     wait_scans_finished(&env, 1);
     // Sessions: a live session file, then the detail panel's on-demand prompt reads.
@@ -1617,48 +1587,46 @@ fn acceptance_5_no_external_network_connections() {
             "{name}: the promisor transport helper ran"
         );
     }
-    if variant.contains("strace") {
-        let log = std::fs::read_to_string(&log_path).unwrap();
-        let bad = non_loopback_connects(&log);
-        assert!(
-            bad.is_empty(),
-            "non-loopback connect attempts:\n{}",
-            bad.join("\n")
-        );
-        let all = execs(&log);
-        let violations: Vec<String> = all
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let bad = non_loopback_connects(&log);
+    assert!(
+        bad.is_empty(),
+        "non-loopback connect attempts:\n{}",
+        bad.join("\n")
+    );
+    let all = execs(&log);
+    let violations: Vec<String> = all
+        .iter()
+        .filter_map(|(path, argv)| exec_violation(path, argv, BIN))
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "the daemon or its children executed something outside the allowlist:\n{}",
+        violations.join("\n")
+    );
+    let fetches = all
+        .iter()
+        .filter(|(_, argv)| argv.iter().any(|a| a == "fetch"))
+        .count();
+    assert_eq!(fetches, 0, "promisor repositories started fetch children");
+    let claude_runs = all.iter().filter(|(p, _)| p.ends_with("/claude")).count();
+    assert_eq!(claude_runs, 2, "claude --version and --help, once each");
+    if real_git {
+        let git_runs = all
             .iter()
-            .filter_map(|(path, argv)| exec_violation(path, argv, BIN))
-            .collect();
-        assert!(
-            violations.is_empty(),
-            "the daemon or its children executed something outside the allowlist:\n{}",
-            violations.join("\n")
-        );
-        let fetches = all
-            .iter()
-            .filter(|(_, argv)| argv.iter().any(|a| a == "fetch"))
+            .filter(|(p, _)| Path::new(p).file_name().is_some_and(|n| n == "git"))
             .count();
-        assert_eq!(fetches, 0, "promisor repositories started fetch children");
-        let claude_runs = all.iter().filter(|(p, _)| p.ends_with("/claude")).count();
-        assert_eq!(claude_runs, 2, "claude --version and --help, once each");
-        if real_git {
-            let git_runs = all
-                .iter()
-                .filter(|(p, _)| Path::new(p).file_name().is_some_and(|n| n == "git"))
-                .count();
-            assert!(
-                git_runs >= 3,
-                "Git subprocesses were not traced ({git_runs} execs)"
-            );
-        }
-        let connects = log.lines().filter(|l| l.contains("connect(")).count();
-        eprintln!(
-            "NOTICE: test 5: {connects} connect() calls and {} execs traced; connects all loopback or Unix sockets, execs all allowlisted, {} promisor repositories without a fetch",
-            all.len(),
-            promisors.len()
+        assert!(
+            git_runs >= 3,
+            "Git subprocesses were not traced ({git_runs} execs)"
         );
     }
+    let connects = log.lines().filter(|l| l.contains("connect(")).count();
+    eprintln!(
+        "NOTICE: test 5: {connects} connect() calls and {} execs traced; connects all loopback or Unix sockets, execs all allowlisted, {} promisor repositories without a fetch",
+        all.len(),
+        promisors.len()
+    );
 }
 
 // ---- M3: sessions, resume, privacy; security acceptance tests 2, 8 and 10 ----------------------
@@ -2097,4 +2065,160 @@ fn acceptance_8_canaries_in_malformed_oversized_and_unreadable_session_files_sta
         std::fs::Permissions::from_mode(0o600),
     )
     .unwrap();
+}
+
+/// Resident memory of a process in KiB (`VmRSS` of `/proc/<pid>/status`).
+fn rss_kib(pid: i32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        .expect("VmRSS")
+}
+
+/// v0.1.0 review M2 at daemon level, with the review's hostile repository: a project with a
+/// `.git` whose directories each hold a hard link to one 1 MiB `.gitignore` (tiny on disk) of
+/// rules that need a regular expression. Ten such files took the daemon from 26 MB to 860 MB
+/// before the limits. Now every oversized file is skipped and counted, the daemon stays small,
+/// keeps answering, says what it skipped, and stops on SIGTERM.
+#[test]
+fn a_hostile_repository_cannot_grow_the_daemon_through_gitignore_files() {
+    use cc_workspace_manager::watch::tree::{MAX_GITIGNORE_BYTES, MAX_GITIGNORE_PATTERNS};
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("s"), 0).unwrap();
+    let hostile = env.home.join("dev/hostile");
+    std::fs::create_dir_all(hostile.join(".git/info")).unwrap();
+    std::fs::write(hostile.join("CLAUDE.md"), "# hostile\n").unwrap();
+    let mut big = String::new();
+    for i in 0.. {
+        if big.len() >= 1024 * 1024 {
+            break;
+        }
+        big.push_str(&format!("*{i}?b[c-d]*.x\n"));
+    }
+    assert!(big.len() as u64 > MAX_GITIGNORE_BYTES);
+    std::fs::write(hostile.join("big"), &big).unwrap();
+    std::fs::hard_link(hostile.join("big"), hostile.join(".git/info/exclude")).unwrap();
+    let dirs = 12;
+    for i in 0..dirs {
+        let d = hostile.join(format!("d{i:02}"));
+        std::fs::create_dir(&d).unwrap();
+        std::fs::hard_link(hostile.join("big"), d.join(".gitignore")).unwrap();
+    }
+    // Under the per-file limit but over the project's rule limit on its own: skipped as well.
+    let many: String = (0..=MAX_GITIGNORE_PATTERNS)
+        .map(|i| format!("*{i}?b[c-d]*.x\n"))
+        .collect();
+    assert!((many.len() as u64) < MAX_GITIGNORE_BYTES);
+    std::fs::write(hostile.join(".gitignore"), &many).unwrap();
+    let skipped = dirs + 2;
+
+    let d = Daemon::start(&env, &[]);
+    wait_scans_finished(&env, 1);
+    wait_until("the skipped ignore files to be reported", 30, || {
+        socket_call(&env, "service.status")["monitoring"]["ignore_files_skipped"] == skipped
+    });
+    let status = socket_call(&env, "service.status");
+    let advice = status["monitoring"]["advice"].to_string();
+    assert!(
+        advice.contains(&format!(
+            "{skipped} .gitignore or .git/info/exclude file(s) were skipped"
+        )),
+        "{advice}"
+    );
+    assert_eq!(status["monitoring"]["degraded"], false, "{status}");
+    let token = d.login(&env);
+    let page = d.get_json(&token, "/api/v1/projects?limit=200");
+    let listed = project_by_name(&page, "hostile");
+    assert!(listed["missing_since"].is_null(), "{listed}");
+
+    // Another reconciliation walks the tree again: still nothing is kept.
+    refresh_and_wait(&env);
+    let rss = rss_kib(d.pid());
+    assert!(
+        rss < 200 * 1024,
+        "the daemon grew to {rss} KiB with a hostile repository (it took 860 MB before the limits)"
+    );
+    let started = Instant::now();
+    let (code, log) = d.stop();
+    assert_eq!(code, Some(0), "{log}");
+    assert!(started.elapsed() < Duration::from_secs(5), "slow shutdown");
+}
+
+/// v0.1.0 review L2: `XDG_DATA_HOME` reached through a symlink that resolves **inside a
+/// project**. ccwm's directories are hard boundaries under their canonical spelling too, so the
+/// daemon neither walks nor watches its own database there, and its own writes never become
+/// the project's activity (§5.1).
+#[test]
+fn a_symlinked_xdg_directory_inside_a_project_is_never_walked_or_watched() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("s"), 0).unwrap();
+    let store = env.home.join("dev/alpha/store");
+    std::fs::create_dir(&store).unwrap();
+    let link = env.root.join("data-link");
+    std::os::unix::fs::symlink(&store, &link).unwrap();
+    let d = Daemon::start_with_env(&env, &[], &[("XDG_DATA_HOME", link.to_str().unwrap())]);
+    assert!(
+        store.join("ccwm/ccwm.db").exists(),
+        "the database lives inside the project"
+    );
+    let token = d.login(&env);
+    d.wait_scan_done(&token);
+    // Keep the database busy while the watcher runs, past the debounce window.
+    for _ in 0..3 {
+        refresh_and_wait(&env);
+        d.login(&env);
+        std::thread::sleep(Duration::from_millis(900));
+    }
+    let page = d.get_json(&token, "/api/v1/projects?limit=200");
+    let alpha = project_by_name(&page, "alpha");
+    let latest = alpha["activity"]["path"].as_str().unwrap_or_default();
+    assert!(
+        !latest.starts_with("store"),
+        "ccwm's own files are the project's latest file: {alpha}"
+    );
+    assert_eq!(
+        alpha["activity"]["kind"], "inferred",
+        "nothing but ccwm wrote below the project: {alpha}"
+    );
+    assert_eq!(d.stop().0, Some(0));
+}
+
+/// `ccwm status | head` and friends: when the reader of a command's output has gone, the command
+/// ends quietly with status 0 instead of panicking on the broken pipe (Rust ignores `SIGPIPE`,
+/// and `println!` panics on a failed write). The read end is closed **before** the command
+/// starts, so its first write already fails.
+#[test]
+fn commands_end_quietly_when_their_output_pipe_is_closed() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("s"), 0).unwrap();
+    let d = Daemon::start(&env, &[]);
+    wait_scans_finished(&env, 1);
+    for args in [
+        &["status"][..],
+        &["doctor"],
+        &["scan"],
+        &["open", "--print"],
+        &["auth", "revoke-all"],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = command(&env)
+            .args(args)
+            .stdout(writer)
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("panicked") && !stderr.contains("Broken pipe"),
+            "ccwm {args:?} was not quiet: {stderr}"
+        );
+        assert_eq!(out.status.code(), Some(0), "ccwm {args:?}: {stderr}");
+    }
+    // Control: with a reader, the same command prints its report.
+    let out = command(&env).arg("status").output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("ccwm daemon"));
+    assert_eq!(d.stop().0, Some(0));
 }

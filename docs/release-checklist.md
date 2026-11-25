@@ -37,7 +37,7 @@ date and the result.
 - [ ] Locally green: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_INOTIFY=1 cargo test`, `cargo deny check`.
 - [ ] CI green on the commit to be tagged: fmt, clippy, test, deny, gitleaks. 👤 Read the test job's
-  summary: which of Landlock / inotify / strace / network namespaces the runner had, and every `NOTICE:`
+  summary: which of Landlock / inotify / strace the runner had, and every `NOTICE:`
   (skipped coverage). Do not claim coverage that did not run.
 - [ ] Release build on the build host:
   ```bash

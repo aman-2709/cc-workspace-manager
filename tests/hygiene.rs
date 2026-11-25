@@ -232,3 +232,42 @@ fn nothing_sensitive_is_tracked_or_staged() {
         assert!(!bad, "{f} must not be tracked");
     }
 }
+
+/// Every `ccwm` command prints through `cli::out!`/`outln!`/`err!`/`errln!`. The standard print
+/// macros panic when the reader of the output has gone (`ccwm status | head`), so none may come
+/// back outside tests and the synthetic-environment tool.
+#[test]
+fn no_command_prints_with_the_standard_print_macros() {
+    fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    assert!(files.len() > 40, "the source tree was not found");
+    let mut checked = 0;
+    for file in files {
+        let rel = file.strip_prefix(&src).unwrap();
+        if rel.starts_with("bin") || rel == Path::new("synth.rs") {
+            continue; // ccwm-synth, a development tool
+        }
+        let source = std::fs::read_to_string(&file).unwrap();
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        for banned in ["println!(", "print!(", "eprintln!(", "eprint!(", "dbg!("] {
+            assert!(
+                !code.contains(banned),
+                "{} uses {banned}…): print with cli::out!/outln!/err!/errln!",
+                rel.display()
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 40);
+}

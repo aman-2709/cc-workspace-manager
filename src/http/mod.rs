@@ -35,7 +35,8 @@ use tokio::task::JoinSet;
 
 /// Concurrent TCP connections being served (each holds one file descriptor).
 pub const MAX_CONNECTIONS: usize = 64;
-/// A client must send a complete request head within this time (also bounds idle keep-alive).
+/// A client must send a complete request head within this time (also bounds idle keep-alive),
+/// and then the request body within the same time again.
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// On shutdown, in-flight connections get this long to finish.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -47,15 +48,18 @@ pub struct AppState {
     pub(crate) hosts: [String; 3],
     pub(crate) origin: String,
     pub(crate) csp: String,
+    /// How long a request body may take to arrive once its head is complete.
+    pub(crate) body_read_timeout: Duration,
 }
 
 impl AppState {
-    pub fn new(service: Arc<Service>) -> Arc<Self> {
+    pub fn new(service: Arc<Service>, body_read_timeout: Duration) -> Arc<Self> {
         let port = service.port();
         Arc::new(Self {
             hosts: middleware::allowed_hosts(port),
             origin: middleware::allowed_origin(port),
             csp: middleware::csp(port),
+            body_read_timeout,
             service,
         })
     }
@@ -69,8 +73,14 @@ async fn method_not_allowed() -> ApiError {
     ApiError::new(Code::MethodNotAllowed, "method not allowed")
 }
 
+/// The router with the production body-read timeout ([`HEADER_READ_TIMEOUT`]).
 pub fn router(service: Arc<Service>) -> Router {
-    let state = AppState::new(service);
+    router_with(service, HEADER_READ_TIMEOUT)
+}
+
+/// The router; a request body must arrive within `body_read_timeout` of its head.
+pub fn router_with(service: Arc<Service>, body_read_timeout: Duration) -> Router {
+    let state = AppState::new(service, body_read_timeout);
     let api = Router::new()
         .route("/health", get(routes::health))
         .route("/auth/exchange", post(routes::exchange))
@@ -126,6 +136,7 @@ pub struct ServeOptions {
     pub daemon_uid: u32,
     pub peer_uid: PeerUidLookup,
     pub max_connections: usize,
+    /// For the request head, and again for the request body.
     pub header_read_timeout: Duration,
 }
 
@@ -174,7 +185,7 @@ pub async fn serve(
     opts: ServeOptions,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let app = router(service);
+    let app = router_with(service, opts.header_read_timeout);
     let slots = Arc::new(Semaphore::new(opts.max_connections));
     let (stop_tx, stop_rx) = watch::channel(false);
     let rejects = Arc::new(RejectLog::default());

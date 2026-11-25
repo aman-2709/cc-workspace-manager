@@ -13,10 +13,10 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
 pub struct ApiJson<T>(pub T);
 
-impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for ApiJson<T> {
+impl<T: DeserializeOwned> FromRequest<Arc<AppState>> for ApiJson<T> {
     type Rejection = ApiError;
 
-    async fn from_request(req: Request, _state: &S) -> Result<Self, ApiError> {
+    async fn from_request(req: Request, state: &Arc<AppState>) -> Result<Self, ApiError> {
         let is_json = req
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -29,8 +29,18 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for ApiJson<T> {
         if !is_json {
             return Err(ApiError::invalid("content-type must be application/json"));
         }
-        let bytes = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+        // A body that never arrives must not hold its connection slot for ever (the head has
+        // its own timeout in the server loop; v0.1.0 review L5). The connection is closed after
+        // the 408, because the body was not read.
+        let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES);
+        let bytes = tokio::time::timeout(state.body_read_timeout, body)
             .await
+            .map_err(|_| {
+                ApiError::new(
+                    Code::RequestTimeout,
+                    "the request body did not arrive in time",
+                )
+            })?
             .map_err(|_| ApiError::new(Code::PayloadTooLarge, "request body too large"))?;
         serde_json::from_slice(&bytes)
             .map(ApiJson)

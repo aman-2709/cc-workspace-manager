@@ -10,10 +10,9 @@
 
 mod common;
 
-use cc_workspace_manager::git::{find_on_path, Git, State};
+use cc_workspace_manager::git::{find_on_path, parse, Git, Info, State};
 use common::{snapshot, Promisor, PROMISORS};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -265,12 +264,10 @@ fn upstream_ahead_behind_and_sanitized_remote_of_the_upstream_remote() {
 /// A stand-in `git` (a shell script) for states we cannot produce for real as one user.
 fn fake_git(f: &Fx, name: &str, body: &str) -> PathBuf {
     let p = f.root.join(name);
-    fs::write(
+    common::write_executable(
         &p,
-        format!("#!/bin/sh\ncase \"$*\" in *--version*) echo 'git version 2.43.0'; exit 0;; esac\n{body}\n"),
-    )
-    .unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("#!/bin/sh\ncase \"$*\" in *--version*) echo 'git version 2.43.0'; exit 0;; esac\n{body}\n"),
+    );
     p
 }
 
@@ -309,15 +306,13 @@ fn git_older_than_2_41_disables_worktree_status_unless_allowed() {
     fs::write(r.join("new.txt"), "n\n").unwrap();
     let real = real_git().unwrap();
     let old = f.root.join("git-old");
-    fs::write(
+    common::write_executable(
         &old,
-        format!(
+        &format!(
             "#!/bin/sh\ncase \"$*\" in *--version*) echo 'git version 2.40.1'; exit 0;; esac\nexec '{}' \"$@\"\n",
             real.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let g = Git::detect(Some(old.clone()), &f.home, false);
     assert!(!g.summary().hardened_status);
@@ -395,7 +390,7 @@ fn acceptance_3_git_metadata_is_unchanged_by_every_operation() {
 // ---- security acceptance test 4 -----------------------------------------------------------------
 
 /// Run ccwm's inspection, then assert the sentinel never appeared and nothing in `.git` changed.
-fn assert_not_executed(f: &Fx, dir: &Path, sentinel: &Path, what: &str) {
+fn assert_not_executed(f: &Fx, dir: &Path, sentinel: &Path, what: &str) -> Info {
     let before = git_dir_snapshot(dir);
     let info = f.ccwm_git().inspect(dir);
     assert!(
@@ -404,6 +399,7 @@ fn assert_not_executed(f: &Fx, dir: &Path, sentinel: &Path, what: &str) {
     );
     assert_eq!(git_dir_snapshot(dir), before, "{what}: .git changed");
     assert_ne!(info.state, State::GitMissing);
+    info
 }
 
 #[test]
@@ -787,9 +783,178 @@ fn acceptance_4_a_filter_name_that_cannot_be_neutralized_disables_status() {
     assert!(sentinel.exists(), "control: plain git status runs it");
     fs::remove_file(&sentinel).unwrap();
     f.stat_dirty(&r);
-    assert_not_executed(&f, &r, &sentinel, "filter name containing '='");
-    let info = f.ccwm_git().inspect(&r);
+    let info = assert_not_executed(&f, &r, &sentinel, "filter name containing '='");
     assert_eq!(info.state, State::StatusDisabledUnsafeConfig);
     assert!(info.worktree.is_none());
     assert_eq!(info.branch.as_deref(), Some("main"));
+}
+
+// ---- v0.1.0 review H1: arbitrary bytes in filter-driver names ------------------------------------
+
+/// A small deterministic generator (xorshift64*): the fuzz-style tests need arbitrary bytes that
+/// are the same on every run, not a dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    /// A driver name of 1 to 8 pieces: printable ASCII, a multi-byte character, or any byte a
+    /// config file can hold in a subsection name (everything but NUL and newline).
+    fn driver_name(&mut self) -> Vec<u8> {
+        let mut name = Vec::new();
+        for _ in 0..=self.below(8) {
+            match self.below(4) {
+                0 | 1 => name.push(0x21 + self.below(0x5e) as u8),
+                2 => {
+                    let chars = ['\u{e9}', '\u{65e5}', '\u{fffd}', '\u{1f600}', '\u{85}'];
+                    let c = chars[self.below(chars.len() as u64) as usize];
+                    name.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+                _ => {
+                    let b = 1 + self.below(255) as u8;
+                    name.push(if b == b'\n' { 0xff } else { b });
+                }
+            }
+        }
+        name
+    }
+}
+
+/// What §6 allows as a `-c filter.<name>.<var>=` override: the name exactly, or nothing.
+fn exactly_representable(name: &[u8]) -> bool {
+    std::str::from_utf8(name)
+        .is_ok_and(|n| !n.is_empty() && !n.contains('=') && !n.chars().any(char::is_control))
+}
+
+/// The parser on raw `git config -z` output: a list is returned only when every name survives the
+/// round trip unchanged; one name that does not refuses the whole list.
+#[test]
+fn filter_driver_names_are_exact_or_refused_for_arbitrary_bytes() {
+    let mut rng = Rng(0x00c0_ffee_5eed_0001);
+    let (mut exact, mut refused) = (0, 0);
+    for _ in 0..20_000 {
+        let name = rng.driver_name();
+        let var = ["clean", "smudge", "process"][rng.below(3) as usize];
+        let mut raw = b"filter.lfs.clean\ngit-lfs clean\0filter.".to_vec();
+        raw.extend_from_slice(&name);
+        raw.extend_from_slice(format!(".{var}\nprogram\0").as_bytes());
+        match parse::filter_driver_names(&raw) {
+            Some(names) => {
+                assert!(exactly_representable(&name), "accepted {name:?}");
+                let bytes: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+                assert_eq!(bytes, [b"lfs".as_slice(), name.as_slice()]);
+                exact += 1;
+            }
+            None => {
+                assert!(!exactly_representable(&name), "refused {name:?}");
+                refused += 1;
+            }
+        }
+    }
+    assert!(
+        exact > 1_000 && refused > 1_000,
+        "{exact} exact, {refused} refused"
+    );
+}
+
+/// One driver `name` in the repository's own config, selected by `.git/info/attributes` (which
+/// `--attr-source` does not neutralize). `base` is the config `git init` wrote.
+fn install_named_filter(r: &Path, base: &[u8], name: &[u8], script: &Path) {
+    let mut config = base.to_vec();
+    config.extend_from_slice(b"[filter \"");
+    for b in name {
+        if matches!(b, b'"' | b'\\') {
+            config.push(b'\\');
+        }
+        config.push(*b);
+    }
+    config.extend_from_slice(format!("\"]\n\tclean = {}\n", script.display()).as_bytes());
+    fs::write(r.join(".git/config"), config).unwrap();
+    let mut attributes = b"* filter=".to_vec();
+    attributes.extend_from_slice(name);
+    attributes.push(b'\n');
+    fs::write(r.join(".git/info/attributes"), attributes).unwrap();
+}
+
+/// Security acceptance test 4, fuzz-style (v0.1.0 review H1): a clean filter under a driver name
+/// of arbitrary bytes never runs. A name `-c` carries exactly is neutralized (`Ok`); any other
+/// name disables worktree status (`status_disabled_unsafe_config`), never an approximated
+/// override. Every name has a **control** run with plain `git status`; the counters prove both
+/// outcomes were exercised with a vector that is live without the mitigation.
+#[test]
+fn acceptance_4_filter_driver_names_of_arbitrary_bytes_never_run() {
+    let Some(f) = fx() else { return };
+    let r = f.repo("r");
+    fs::create_dir_all(r.join(".git/info")).unwrap();
+    let base = fs::read(r.join(".git/config")).unwrap();
+    let (script, sentinel) = f.sentinel_script("fuzzname");
+
+    let mut names: Vec<Vec<u8>> = [
+        b"evil".as_slice(),
+        b"ev\xffil",               // the review's demonstration: invalid UTF-8
+        b"caf\xe9",                // the review's demonstration: Latin-1
+        "caf\u{e9}".as_bytes(),    // the same word in UTF-8: representable
+        "ev\u{fffd}il".as_bytes(), // what a lossy decode of `ev\xffil` would have named
+        b"x=y",
+        b"a\x1bb",
+        b"a\x7fb",
+        b"\xc3",
+        b"\xf0\x9f\x98",
+        b"with\"quote",
+        b"back\\slash",
+        b"a.b.clean",
+        b"-c",
+        b"'$(touch x)'",
+    ]
+    .iter()
+    .map(|n| n.to_vec())
+    .collect();
+    let mut rng = Rng(0x00c0_ffee_5eed_0002);
+    names.extend((0..150).map(|_| rng.driver_name()));
+
+    // Live controls per outcome: [neutralized, refused as not UTF-8, refused for another reason].
+    let mut live = [0usize; 3];
+    for name in &names {
+        let what = format!("filter driver named {:?}", String::from_utf8_lossy(name));
+        install_named_filter(&r, &base, name, &script);
+
+        // Control: does plain Git run this driver? (Not for every name: an attribute value ends
+        // at white space, so such a name cannot be selected.)
+        f.stat_dirty(&r);
+        let control = f.git_cmd(&r, &["status", "--porcelain"]);
+        assert!(control.status.success(), "control for the {what} failed");
+        let is_live = sentinel.exists();
+        let _ = fs::remove_file(&sentinel);
+
+        f.stat_dirty(&r);
+        let info = assert_not_executed(&f, &r, &sentinel, &what);
+        let class = if exactly_representable(name) {
+            assert_eq!(info.state, State::Ok, "{what}");
+            assert!(info.worktree.is_some(), "{what}");
+            0
+        } else {
+            assert_eq!(info.state, State::StatusDisabledUnsafeConfig, "{what}");
+            assert!(info.worktree.is_none(), "{what}");
+            assert_eq!(info.branch.as_deref(), Some("main"), "{what}");
+            if std::str::from_utf8(name).is_err() {
+                1
+            } else {
+                2
+            }
+        };
+        live[class] += usize::from(is_live);
+    }
+    assert!(
+        live.iter().all(|n| *n >= 5),
+        "too few live controls (neutralized, not UTF-8, otherwise refused): {live:?}"
+    );
 }

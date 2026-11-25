@@ -257,8 +257,7 @@ pub fn purge_dirs(dirs: &Dirs, uid: u32) -> Result<Vec<PathBuf>> {
 
 /// Ask on the terminal; only the answer `yes` confirms.
 pub fn confirm(prompt: &str, input: &mut dyn std::io::BufRead) -> bool {
-    eprint!("{prompt} Type 'yes' to continue: ");
-    let _ = std::io::stderr().flush();
+    crate::cli::err!("{prompt} Type 'yes' to continue: ");
     let mut answer = String::new();
     input.read_line(&mut answer).is_ok() && answer.trim() == "yes"
 }

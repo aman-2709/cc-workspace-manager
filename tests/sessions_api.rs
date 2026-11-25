@@ -1190,3 +1190,64 @@ async fn missing_projects_can_be_listed_alone_and_forgotten() {
         .await;
     assert_eq!(resp.status(), 404, "already forgotten");
 }
+
+/// v0.1.0 review L3: in privacy mode the service status keeps no sandbox note (they repeat the
+/// broad read rules, and a rule that could not be added names its path), only their number;
+/// and a failed settings save does not name the configuration file. Both are there without
+/// privacy mode (the control).
+#[tokio::test]
+async fn privacy_mode_hides_sandbox_notes_and_the_path_in_a_failed_settings_save() {
+    use cc_workspace_manager::sandbox::SandboxReport;
+    use std::path::PathBuf;
+    let mut report = SandboxReport::disabled("landlock: allow /srv/CANARY-RULE: refused");
+    report.flag_broad_reads(
+        &[PathBuf::from("/home/CANARY-BROAD"), PathBuf::from("/usr")],
+        Path::new("/home/CANARY-BROAD/u"),
+    );
+    let e = common::env_with_sandbox(report).await;
+    let token = e.login().await;
+    let status = |query: &'static str| {
+        let (e, token) = (&e, token.clone());
+        async move {
+            let path = format!("/api/v1/service/status{query}");
+            let (s, v) = json(e.get(&path, Some(&token)).await).await;
+            assert_eq!(s, 200, "{v}");
+            v
+        }
+    };
+    let private = status("?privacy=1").await;
+    assert!(!private.to_string().contains("CANARY"), "{private}");
+    assert_eq!(private["sandbox"]["notes"], serde_json::json!([]));
+    assert_eq!(private["sandbox"]["notes_hidden"], 2);
+    assert_eq!(
+        private["sandbox"]["broad_read_rules"],
+        serde_json::json!([])
+    );
+    let full = status("").await;
+    let notes = full["sandbox"]["notes"].to_string();
+    assert!(
+        notes.contains("/srv/CANARY-RULE") && notes.contains("/home/CANARY-BROAD"),
+        "{full}"
+    );
+    assert_eq!(
+        full["sandbox"]["broad_read_rules"],
+        serde_json::json!(["/home/CANARY-BROAD"])
+    );
+    assert!(full["sandbox"].get("notes_hidden").is_none(), "{full}");
+
+    // A save that fails: the temporary file's name is taken by a directory.
+    let mut blocked = e.config_path.clone().into_os_string();
+    blocked.push(".tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    let dir = e.config_path.parent().unwrap().to_str().unwrap();
+    let body = r#"{"ui":{"default_view":"table"}}"#;
+    let (s, private) = put_settings(&e, &token, "?privacy=1", body).await;
+    assert_eq!(s, 400, "{private}");
+    assert!(
+        private.to_string().contains("could not be written;") && !private.to_string().contains(dir),
+        "{private}"
+    );
+    let (s, full) = put_settings(&e, &token, "", body).await;
+    assert_eq!(s, 400, "{full}");
+    assert!(full.to_string().contains(dir), "{full}");
+}

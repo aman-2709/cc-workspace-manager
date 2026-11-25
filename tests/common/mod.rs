@@ -30,6 +30,26 @@ pub fn tempdir() -> tempfile::TempDir {
     t
 }
 
+/// Write an executable script **without this process ever holding it open for writing**. A
+/// child that another test thread forks inherits every open descriptor until it execs, and
+/// executing a file that any process still has open for writing fails with `ETXTBSY` ("text file
+/// busy"): a script written with `fs::write` and run right away then fails now and then (seen as
+/// `GitMissing` for a stand-in `git`). A shell writes the file instead and has exited when this
+/// returns.
+pub fn write_executable(path: &Path, content: &str) {
+    use std::io::Write;
+    let mut sh = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = sh.stdin.take().unwrap();
+    stdin.write_all(content.as_bytes()).unwrap();
+    drop(stdin);
+    assert!(sh.wait().unwrap().success(), "writing {}", path.display());
+}
+
 /// An executable `<dir>/<name>.sh` that creates `<dir>/<name>.ran`, then runs `body`.
 /// Returns `(script, sentinel)`.
 pub fn sentinel_script(
@@ -37,15 +57,12 @@ pub fn sentinel_script(
     name: &str,
     body: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
     let sentinel = dir.join(format!("{name}.ran"));
     let script = dir.join(format!("{name}.sh"));
-    fs::write(
+    write_executable(
         &script,
-        format!("#!/bin/sh\ntouch '{}'\n{body}\n", sentinel.display()),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("#!/bin/sh\ntouch '{}'\n{body}\n", sentinel.display()),
+    );
     (script, sentinel)
 }
 
@@ -121,6 +138,11 @@ pub struct Env {
 }
 
 pub async fn env() -> Env {
+    env_with_sandbox(SandboxReport::disabled("test")).await
+}
+
+/// [`env`] with a given sandbox report (what the service status shows).
+pub async fn env_with_sandbox(sandbox: SandboxReport) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.db");
     let clock = Arc::new(FakeClock::new(START));
@@ -132,7 +154,7 @@ pub async fn env() -> Env {
         writer: writer.clone(),
         reader,
         discovery: SharedStatus::default(),
-        sandbox: SandboxReport::disabled("test"),
+        sandbox,
         port: PORT,
         home: std::path::PathBuf::from(HOME),
         classifier: Classifier::new(jiff::tz::TimeZone::UTC, &ActivityConfig::default()),

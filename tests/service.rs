@@ -391,7 +391,9 @@ fn install_start_stop_restart_status_doctor_uninstall_and_purge_acceptance_2_and
     let (code, out) = w.script("uninstall.sh", &["--purge"], "no\n");
     assert_eq!(code, Some(1), "{out}");
     assert!(
-        out.contains("Type 'yes'") && out.contains("nothing was deleted"),
+        out.contains("Type 'yes'")
+            && out.contains("none of your ccwm data was deleted")
+            && out.contains("the service itself is uninstalled"),
         "{out}"
     );
     assert!(w.env.data_home.join("ccwm/ccwm.db").exists());

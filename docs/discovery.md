@@ -88,6 +88,15 @@ projects. Folders without a watch are checked by modification time at each recon
 - **DEGRADED** means a real failure: no inotify instance, a queue overflow being recovered, or polled
   projects. See [troubleshooting.md](troubleshooting.md#inotify-limits) for raising the limits.
 
+A project tree with more than 100,000 entries is not walked completely: it is partly watched (what was
+walked is watched live) and the whole tree is checked at each scan.
+
+**Limits on ignore files.** ccwm reads `.gitignore` files and `.git/info/exclude` to decide what counts as
+activity. A file larger than 256 KiB is skipped, and so is every further file once a project's ignore files
+reach 1 MiB or 5,000 rules together. A skipped file's rules do not apply, so files it would ignore count as
+activity; `ccwm status` says how many files were skipped. The rules of a repository apply only if its `.git`
+is yours and lies inside the project's discovery root.
+
 ## Git
 
 Branch, upstream, ahead/behind, staged/modified/untracked counts and the latest commit are read with an

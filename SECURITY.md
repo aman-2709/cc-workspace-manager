@@ -45,17 +45,23 @@ or session token that leaks to another local user (for example through a browser
 
 **HTTP hardening.** Bound to `127.0.0.1` only; `Host` must be `127.0.0.1`, `localhost` or `[::1]` with
 the port; any `/api` request with a foreign `Origin` is rejected, and state-changing requests need
-the exact `http://127.0.0.1:<port>` origin; strict CSP, `nosniff`, `no-referrer`, COOP,
-`Cache-Control: no-store`. At most 64 concurrent connections (excess clients wait in the kernel
-backlog), 10 s header-read timeout; the Unix socket stays usable under TCP load.
+the exact `http://127.0.0.1:<port>` origin; strict CSP (no inline script or style, no `eval`,
+`worker-src 'none'`), `nosniff`, `no-referrer`, COOP, `Cache-Control: no-store`. These headers are on
+every response the router produces; the bare `400` that the HTTP library itself sends for an unparsable
+request line has no body and no headers. At most 64 concurrent connections (excess clients wait in the
+kernel backlog); a client has 10 s to send a request head and 10 s more to send the body (`408`
+otherwise, and the connection is closed); the Unix socket stays usable under TCP load.
 
 **Files.** ccwm's directories are `0700`, files `0600`, umask `0077`. ccwm refuses to start if any
 ancestor of its directories, or the config file, could be modified by another user (allowed: owned
 by you or root; root-owned sticky directories such as `/tmp`; group write only by your private
-group). Discovery opens every directory by descriptor relative to its parent and checks its
+group). This check reads owner and mode bits only: see "POSIX ACLs" under the residual risks.
+Discovery opens every directory by descriptor relative to its parent and checks its
 `(device, inode)`, so a directory swapped for a symlink mid-walk is skipped, never followed; a
 symlinked `CLAUDE.md` must resolve beneath its directory (`openat2(RESOLVE_BENEATH)`). ccwm's own
-directories and Claude Code's config directory are never walked.
+directories and Claude Code's config directory are never walked or watched, under their configured
+and their canonical paths (so not through a symlinked XDG directory that resolves into a project
+either); the home directory is used in its canonical form everywhere.
 
 **Landlock (best effort, reported).** Applied on the main thread while the process is single-threaded
 (verified via `/proc/self/task`, else reported `not_enforced`), then verified from a runtime worker
@@ -68,12 +74,15 @@ environment without `DBUS_*`, `XDG_RUNTIME_DIR`, `SSH_AUTH_SOCK` and similar IPC
 
 **Seccomp socket filter (M4).** Once the TCP and Unix listeners are bound, the daemon installs a seccomp
 filter on **every** thread (TSYNC). Threads and child processes created later inherit it. From then on
-`socket()` fails with `EPERM` for every address family except `AF_NETLINK`/`NETLINK_SOCK_DIAG`, which
-the peer check needs. `io_uring` is denied too, because it can create sockets without `socket()`, and so
-are the x32 entry points of both. The daemon and its Git and `claude` children therefore cannot open UDP
-sockets or connect to path-based Unix sockets (D-Bus, agents): the two gaps Landlock ABI ≤ 8 leaves.
-Accepting connections on the existing listeners is unaffected. The filter uses `seccompiler` (rust-vmm),
-and works without Landlock.
+`socket()` and `socketpair()` fail with `EPERM` for **every** address family, with no exception: the one
+`NETLINK_SOCK_DIAG` socket the peer check needs is opened before the filter and reused, and so is the
+runtime's signal pipe. `io_uring` is denied too, because it can create sockets without `socket()`, and
+so are the x32 entry points of `socket`, `socketpair` and `io_uring_setup`. The daemon and its Git and
+`claude` children therefore cannot open UDP sockets, nor connect or send to path-based Unix sockets
+(D-Bus, agents, the syslog socket): the two gaps Landlock ABI ≤ 8 leaves. A datagram socket pair, which
+needs no `socket()`, was such a way out until it was closed (v0.1.0 review M1; tested with a control
+run). Accepting connections on the existing listeners is unaffected. The filter uses `seccompiler`
+(rust-vmm), and works without Landlock.
 
 **Self-verification (M4).** The daemon checks its own confinement and claims only what it verified:
 
@@ -81,11 +90,15 @@ and works without Landlock.
 - A write outside ccwm's directories: an anonymous `O_TMPFILE` in your home directory, so an
   unconfined probe leaves nothing behind.
 - An outbound TCP connect to `127.0.0.1:1`.
-- After the filter: creating a UDP and a Unix socket, from a worker thread and a blocking-pool thread.
+- After the filter: creating a UDP socket, a Unix socket and a Unix socket pair, from a worker thread
+  and a blocking-pool thread.
 
 A read or write probe that is not denied withdraws every Landlock claim. A connect that is not denied
 withdraws the TCP claim. A socket probe that is not denied withdraws the seccomp claim. A probe that
-fails for another reason (e.g. a file system without `O_TMPFILE`) proves nothing either way and is noted.
+fails for an **unexpected** reason (e.g. a home directory on a file system without `O_TMPFILE`) proves
+nothing either way: that protection is reported as **`unverified`**, neither claimed nor withdrawn. It
+is listed under `unverified` (not under `unconfined`) in the report, shown as `unverified` by
+`ccwm status` and `ccwm doctor` (which then warns), and logged as a warning at startup.
 Everything is in the `sandbox` section of `/api/v1/service/status` and in `ccwm doctor`.
 
 **systemd unit.** The user unit adds `NoNewPrivileges`, `UMask=0077`, `LockPersonality`,
@@ -121,7 +134,7 @@ vector executes without the mitigation):
 |---|---|---|
 | `core.fsmonitor` | yes (`status`) | `-c core.fsmonitor=false` |
 | clean/smudge/process filters via `.gitattributes`, `.git/info/attributes`, global attributes | yes (`status` re-hashing stat-dirty files) | `--attr-source=<empty tree>` **and** nulling every filter driver of every scope (`-c filter.<name>.clean= …`) |
-| a filter driver whose name contains `=` (cannot be expressed with `-c`) | yes | worktree status is **not run** for that repository (`status_disabled_unsafe_config`, fail closed) |
+| a filter driver whose name `-c` cannot carry back **byte for byte**: not valid UTF-8 (v0.1.0 review H1: a lossy conversion built the override for another name and the real driver ran), containing `=` (Git splits `-c` at the first `=`) or a control character, or empty | yes | worktree status is **not run** for that repository (`status_disabled_unsafe_config`, fail closed). The rule: when a name cannot be represented exactly, refuse; never approximate. Tested with driver names of arbitrary bytes, each with a control run |
 | `include.path` / `includeIf` pulling in any of these | yes | the same overrides (`-c` wins over included files; drivers are enumerated with includes resolved) |
 | `log.showSignature` + `gpg.program` (signature verification runs a program) | yes (`log -1`) | `--no-show-signature` |
 | `core.pager`, `pager.<cmd>` | no (no terminal) | `--no-pager` anyway |
@@ -134,8 +147,10 @@ vector executes without the mitigation):
 
 With Git older than 2.41.0 (no `--attr-source`), worktree status is disabled unless you opt in with
 `git.allow_unhardened_status = true`. A repository Git refuses (`safe.directory`, dubious ownership)
-is reported, never overridden. Remote URLs are stored and shown without credentials (userinfo,
-query and fragment removed). Consequence of the filter rules: repositories whose status depends on
+is reported, never overridden. Remote URLs are stored and shown without credentials: userinfo is
+removed, also in the scp-like form (`user:password@host:path`) and when a password holds an unescaped
+`/`; a `scheme://` URL also loses its query and fragment. When it is unclear whether the text before an
+`@` is a password, it is dropped. Consequence of the filter rules: repositories whose status depends on
 filters or attributes (git-lfs, `text`/`eol` normalisation) can show a different status than your
 own `git status`.
 
@@ -143,8 +158,14 @@ own `git status`.
 symlinks are never followed (`IN_DONT_FOLLOW`). The `notify` crate asks for `IN_ONLYDIR` but, on
 `ENOTDIR`, silently retries without it; ccwm therefore checks after every watch that the path is
 still a real directory and drops the watch otherwise (tested with a regular file and a symlink). File contents read by monitoring:
-`.gitignore` files and `.git/info/exclude` (bounded, through the parent directory's descriptor), to
-evaluate ignore rules in-process; ccwm never runs `git check-ignore`. ccwm's own directories are
+`.gitignore` files and `.git/info/exclude` (through the parent directory's descriptor), to
+evaluate ignore rules in-process; ccwm never runs `git check-ignore`. These reads are bounded per file
+and per project: at most 256 KiB per file, and 1 MiB and 5,000 rules for all ignore files of one project.
+A file over a limit is skipped whole (never read in part), counted, and reported in the monitoring
+status and `ccwm status`; its rules then do not apply. The limits exist because compiled rules stay in
+memory: a hostile repository with many large `.gitignore` files took the daemon to hundreds of
+megabytes (v0.1.0 review M2). The repository whose rules apply is searched no higher than the project's
+discovery root, and its `.git` must be owned by you, as Git itself requires. ccwm's own directories are
 never watched, so its writes never count as activity.
 
 **Claude Code sessions (M3).** ccwm only reads Claude Code's session directory (`$CLAUDE_CONFIG_DIR` or
@@ -177,7 +198,10 @@ them.
 
 **Privacy mode** is enforced by the server: the browser never receives the hidden fields (paths, user names,
 remote URLs, session titles, prompts, cwds, resume commands, and the paths in the status and Settings payloads,
-including the responses to ignore/un-ignore and to saving the settings), for REST and WebSocket alike. It hides information from people looking at your screen; it is not access control.
+including the responses to ignore/un-ignore and to saving the settings), for REST and WebSocket alike. The
+sandbox notes of the service status can name paths too (the broad read rules, a rule that could not be added):
+in privacy mode only their number is sent, and a settings save that fails does not name the configuration file.
+It hides information from people looking at your screen; it is not access control.
 
 **Resume commands** are built from the session's first recorded cwd (POSIX single-quoted) and a strictly
 validated UUID, and are only shown for copying; ccwm never runs them. Running one starts Claude Code, which is
@@ -188,13 +212,17 @@ terminal's line editor first, which acts on control characters (Ctrl-U, newline,
 generates into an interactive `bash` and checks that nothing runs. A `continued-in` link is followed only to a
 session of the same project, so a planted session file cannot redirect the resume into another project or an
 unassigned folder. **The `claude` CLI check** runs `claude --version` and `claude --help` (5 s each, once
-per binary version) as children of the sandboxed daemon: no TCP connect, no writes outside ccwm's directories;
-UDP and path-based Unix sockets are not confined (see below). ccwm sets `DISABLE_AUTOUPDATER`,
+per binary version) as children of the sandboxed daemon: no TCP connect, no writes outside ccwm's directories,
+and, under the seccomp filter, no new socket or socket pair of any kind (so no UDP and no path-based Unix
+socket). Unlike Git, which gets an empty environment, these two calls inherit the daemon's environment without
+the session-IPC variables (they need `PATH` and `HOME`). ccwm sets `DISABLE_AUTOUPDATER`,
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` and `DISABLE_TELEMETRY` for these two calls as a best-effort request;
 their effect is Claude Code's, not verified by ccwm. Security acceptance test 5 allows exactly these two `claude`
 invocations. **Without Landlock** (an older kernel, or a report that is not `fully_enforced`) these two calls run
-the real `claude` binary **unconfined**, with your rights; the tests use a fake `claude`, so side effects of the
-real binary (for example on `~/.claude`) are not covered by them.
+the real `claude` binary without the filesystem and TCP confinement, with your rights; the tests use a fake
+`claude`, so side effects of the real binary (for example on `~/.claude`) are not covered by them, and neither is
+the real binary's behaviour under the seccomp filter: if it needs a socket or a socket pair to print its version,
+the check reports `failed` and the resume command shows a warning.
 
 **Settings.** `PUT /settings` (session token + allowed Origin) rewrites the configuration file atomically with
 mode 0600; it can change discovery roots, so it is as sensitive as the file itself. Roots added there are read only
@@ -202,6 +230,9 @@ after a restart (the sandbox's read set is fixed at startup). It accepts **only 
 (REQUIREMENTS.md §9); everything else — `git.allow_unhardened_status`, `watch.debounce_ms`,
 `activity.events_per_project` — changes only by editing `config.toml`, so a stolen browser token cannot weaken the
 hardening persistently. It also refuses port 0 and a session directory that is `/` or contains your home folder.
+It does not refuse your home folder itself as the session directory, nor a discovery root that is `/` or contains
+your home folder: both take effect only after a restart, and the sandbox report then lists such a root as a broad
+read rule.
 Saves are serialized from merge to apply, and the page sends only the fields you changed, so a stale Settings tab
 cannot revert a change made elsewhere.
 
@@ -211,20 +242,46 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
 
 ## Residual risks
 
-- **Impostor UI.** Another user who binds the port while ccwm is down can serve a fake page on the same
-  origin. It can read what the page stored (the session token) but cannot use it (peer-UID check),
-  and `ccwm open` never talks to it. It can still show you false information. Run ccwm as the systemd
-  user service ([docs/service.md](docs/service.md)), so it holds the port from login on.
+- **Impostor on the port: a persistent script in the dashboard's origin** (v0.1.0 review M3). Another
+  local user who binds the port while ccwm is not running — before the service starts, between a stop
+  and a start, after a crash, or for as long as they like (the daemon then exits with code 10 and systemd
+  does not retry) — serves whatever they want on the origin `http://127.0.0.1:<port>`. The peer-UID check
+  makes a token they obtain useless **to their own connections**, and `ccwm open` never talks to them.
+  But what they store in your browser for that origin outlives them: HTTP-cache entries with a lifetime
+  they choose (a poisoned `/` or `/app.js`), a service-worker registration, `localStorage`. Once the real
+  daemon is back, such a script runs in **your** browser, whose connections pass the peer-UID check, next
+  to your session or your next sign-in link. That is the XSS residual below — read what the dashboard
+  shows, call the state-changing API, and send it elsewhere, since the impostor's page is not bound by
+  ccwm's CSP — reached without any bug in ccwm's page, and it lasts until the site data of that origin is
+  cleared. It is more than "false information". What ccwm does: its own page can never register a worker
+  (`worker-src 'none'`), and the daemon's exit code 10 ("port … is already in use") tells you that
+  another process holds the port. What you should do:
+  run ccwm as the systemd user service ([docs/service.md](docs/service.md)) so that it holds the port
+  from login on (before login, only lingering closes the window); and if the port was ever held by a
+  process that is not yours, **clear the site data of `http://127.0.0.1:<port>` in your browser before
+  you sign in again**, or move ccwm to another port (another port is another origin).
+  **`Clear-Site-Data` was evaluated and is not sent.** `Clear-Site-Data: "cache", "storage"` on the
+  sign-in exchange would have to work in the browsers people use, in exactly the hostile case. According
+  to MDN's browser-compat data (read on 2026-11-25), Chrome's `"cache"` directive is only partial —
+  entries can still be served from the cache until the tab is reloaded, and the header can stall the
+  response for seconds — and Firefox had no `"cache"` directive from version 94 to 137. The header would
+  also arrive with the answer to a request the page itself makes: a poisoned page or service worker has
+  already run with the sign-in link by then, so the header could shorten the persistence at best, and
+  whether both browsers honour it on a response fetched by a service worker was not verified (no test
+  with real browsers was run). `"storage"` would in addition erase the dashboard's own preferences at
+  every sign-in.
 - **Same-user forwarders and proxies.** Any forwarder or proxy running as you (`ssh -L`, `socat`,
   an IDE's port forwarding) bypasses the peer-UID check: the check sees the forwarder, which is
   you, not the client behind it, so another local user who can reach the forwarder's port can use
   a leaked sign-in link or session token through it. **Never forward the ccwm port.**
 - **Sockets when the seccomp filter is not active.** Landlock does not confine UDP or other non-TCP
-  socket families, nor `connect()` to path-based Unix sockets (no Landlock right for it before ABI 9).
-  The seccomp filter closes both, and the report lists them as `unconfined` whenever it is
-  `not_applied`. With the filter, the daemon can still use the sockets it already has: its listeners, the
-  connections it accepted, and the journald stream systemd gave it as stdout/stderr. It can also create
-  `NETLINK_SOCK_DIAG` sockets, which tell it what `/proc/net/tcp` already does.
+  socket families, nor `connect()`/`sendto()` to path-based Unix sockets (no Landlock right for it before
+  ABI 9). The seccomp filter closes both (no `socket()`, no `socketpair()`), and the report lists them as
+  `unconfined` whenever it is `not_applied`, or as `unverified` when its probes were inconclusive. With
+  the filter, the daemon can still use the sockets it already has: its listeners, the connections it
+  accepted, the journald stream systemd gave it as stdout/stderr, the runtime's signal pipe, and the one
+  `NETLINK_SOCK_DIAG` socket of the peer check, which tells it what `/proc/net/tcp` already does. It
+  cannot create another.
 - **Kernels without Landlock** (or ABI < 4 / < 6): no filesystem, TCP or scope confinement. ccwm runs
   anyway and says so. The Git hardening and the seccomp filter still apply.
 - **XSS** could read the `localStorage` token; mitigated by the strict CSP and the rule that no data
@@ -240,9 +297,25 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
   project when its Git HEAD and remote (or its `CLAUDE.md` hash) match; all of these are content
   anyone who can write in a discovery root controls, so in a shared or group-writable root another
   user could make a directory inherit a missing project's id, history and ignore state.
+- **Ignore rules cost memory per project.** The `.gitignore` limits above bound one project: in the
+  worst case (5,000 rules that each need a regular expression) about 75 MiB and 1.2 s of CPU per walk,
+  measured with a release build. A repository that contains many projects, each with its own `.git` and
+  marker, gets that budget once per project, as it gets watches and database rows per project. There is
+  no limit across projects, and the systemd unit sets no `MemoryMax=`.
+- **POSIX ACLs** (v0.1.0 review L4). The check that refuses to start when an ancestor of ccwm's
+  directories, or the config file, "could be modified by another user" reads the owner and the mode bits.
+  It does not read access control lists: with an extended ACL the group bits show the ACL mask, so a
+  directory on which you granted another user write access with `setfacl` passes when its group is your
+  private group. The private-group rule looks at the group's listed members only, not at another account
+  whose primary group it is (which only an administrator can create). Do not grant ACL write access on
+  the ancestors of ccwm's directories.
 - Tests catch regressions; they cannot prove the absence of network activity. Security acceptance
-  test 5 traces every `connect()` of the daemon and its Git processes with `strace` (and runs them
-  in a network namespace where unprivileged user namespaces are allowed).
+  test 5 traces every `connect()` and `execve()` of the daemon and its children with `strace`. It has
+  no network-namespace variant: an unprivileged network namespace needs a user namespace, in which
+  root-owned paths appear to belong to `nobody` and ccwm's ownership checks (correctly) refuse to start.
+  What `connect()` tracing cannot see — datagrams sent without a connect — is covered by the seccomp
+  filter, which lets the daemon and its children create no socket at all after startup and is tested on
+  its own (`tests/sandbox.rs`).
 
 ## Optional defense in depth
 

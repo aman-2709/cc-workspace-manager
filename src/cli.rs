@@ -12,6 +12,46 @@ use std::time::Duration;
 const NOTICE: &str = "CC Workspace Manager is an independent, unofficial open-source project. \
 It is not affiliated with or endorsed by Anthropic.";
 
+/// Write to standard output like `print!`, except when the write fails. Rust ignores `SIGPIPE`
+/// and `println!` **panics** on a failed write, so `ccwm status | head` ended with a panic
+/// message. Here a closed pipe ends the command quietly with status 0 (the reader stopped
+/// reading: not an error of ccwm), any other write error with status 1.
+pub fn write_stdout(text: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = out.write_fmt(text).and_then(|()| out.flush()) {
+        std::process::exit(output_error_status(&e));
+    }
+}
+
+fn output_error_status(e: &std::io::Error) -> i32 {
+    i32::from(e.kind() != std::io::ErrorKind::BrokenPipe)
+}
+
+/// Write to standard error like `eprint!`, without panicking when it cannot be written:
+/// diagnostics that cannot be delivered are dropped and the command goes on.
+pub fn write_stderr(text: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_fmt(text).and_then(|()| err.flush());
+}
+
+/// `print!` / `println!` / `eprint!` / `eprintln!` through [`write_stdout`] and [`write_stderr`]:
+/// every command prints with these, never with the standard macros.
+macro_rules! out {
+    ($($arg:tt)*) => { $crate::cli::write_stdout(format_args!($($arg)*)) };
+}
+macro_rules! outln {
+    ($($arg:tt)*) => { $crate::cli::write_stdout(format_args!("{}\n", format_args!($($arg)*))) };
+}
+macro_rules! err {
+    ($($arg:tt)*) => { $crate::cli::write_stderr(format_args!($($arg)*)) };
+}
+macro_rules! errln {
+    ($($arg:tt)*) => { $crate::cli::write_stderr(format_args!("{}\n", format_args!($($arg)*))) };
+}
+pub(crate) use {err, out};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "ccwm",
@@ -142,7 +182,7 @@ fn first_call(op: &str) -> Result<(std::path::PathBuf, u32, serde_json::Value)> 
             if !starting {
                 return Err(e);
             }
-            eprintln!(
+            errln!(
                 "Waiting up to {} s for the ccwm daemon to start…",
                 STARTUP_WAIT.as_secs()
             );
@@ -173,18 +213,18 @@ pub fn retry_while_starting<T>(
 }
 
 fn status() -> Result<()> {
-    println!(
+    outln!(
         "{}",
         systemd::status_line(&systemd::Systemctl::find(systemd::path_var().as_deref()))
     );
     let (socket, uid, st) = first_call("service.status")?;
-    print!("{}", format_status(&st));
+    out!("{}", format_status(&st));
     if let Ok(d) = client::call(&socket, uid, "discovery.status") {
-        print!("{}", format_sessions(&d));
-        print!("{}", format_unreadable(&d));
+        out!("{}", format_sessions(&d));
+        out!("{}", format_unreadable(&d));
     }
     if let Some(warning) = commit_mismatch(st.get("commit").and_then(|v| v.as_str())) {
-        eprintln!("warning: {warning}");
+        errln!("warning: {warning}");
     }
     Ok(())
 }
@@ -279,11 +319,40 @@ pub fn format_status(v: &serde_json::Value) -> String {
         "  sandbox: {} (abi {}, filesystem {}, network {}, seccomp {})\n",
         s(v, "/sandbox/status"),
         s(v, "/sandbox/abi"),
-        s(v, "/sandbox/filesystem"),
+        sandbox_claim(&v["sandbox"], "filesystem"),
         s(v, "/sandbox/network"),
         s(v, "/sandbox/seccomp")
     ));
+    let unverified = string_list(&v["sandbox"], "unverified");
+    if !unverified.is_empty() {
+        out.push_str(&format!(
+            "    ! unverified (a probe failed for an unexpected reason; neither enforced nor withdrawn): {}\n",
+            unverified.join(", ")
+        ));
+    }
     out
+}
+
+/// The strings of the array `key` of a status object (empty when absent).
+pub fn string_list<'a>(v: &'a serde_json::Value, key: &str) -> Vec<&'a str> {
+    v.get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// A yes/no protection of the sandbox report (`filesystem`, `signal`, …) for display: `true`,
+/// `false`, or `unverified` when its probe failed for an unexpected reason (it is then listed in
+/// `unverified`, and the report claims and withdraws nothing about it).
+pub fn sandbox_claim(report: &serde_json::Value, kind: &str) -> String {
+    if string_list(report, "unverified").contains(&kind) {
+        return crate::sandbox::UNVERIFIED.to_string();
+    }
+    report
+        .get(kind)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        .to_string()
 }
 
 /// How long `ccwm scan` waits for the scan to finish.
@@ -407,7 +476,7 @@ fn scan() -> Result<()> {
         .get("done_at_scans_finished")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| Error::new("the daemon's response was incomplete"))?;
-    println!("Scan requested.");
+    outln!("Scan requested.");
     let deadline = std::time::Instant::now() + SCAN_WAIT;
     let mut last_line = String::new();
     loop {
@@ -421,11 +490,11 @@ fn scan() -> Result<()> {
             s(&st, "/projects_found")
         );
         if line != last_line {
-            println!("{line}");
+            outln!("{line}");
             last_line = line;
         }
         if finished.is_some_and(|n| n >= target) {
-            println!("Scan finished.");
+            outln!("Scan finished.");
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -463,7 +532,7 @@ fn wait_until_stopped(dirs: &Dirs, wait: Duration) -> bool {
 fn report_running(verb: &str) -> Result<()> {
     match wait_until_running(SERVICE_START_WAIT) {
         Ok(ping) => {
-            println!(
+            outln!(
                 "ccwm {} ({verb}). Open the dashboard with `ccwm open`.",
                 s(&ping, "/version")
             );
@@ -484,7 +553,7 @@ fn unit_command(verb: &str) -> Result<()> {
     if verb == "stop" {
         let (dirs, _) = daemon_dirs()?;
         if wait_until_stopped(&dirs, SERVICE_STOP_WAIT) {
-            println!("ccwm stopped.");
+            outln!("ccwm stopped.");
             return Ok(());
         }
         return Err(Error::new(
@@ -521,20 +590,20 @@ fn service_install() -> Result<()> {
     let written = systemd::write_unit(&unit_dir, &Owner::current(uid))?;
     let unit = unit_dir.join(systemd::UNIT_NAME);
     match written {
-        systemd::UnitWrite::Created => println!("Installed {}", unit.display()),
-        systemd::UnitWrite::Updated => println!("Updated {}", unit.display()),
-        systemd::UnitWrite::Unchanged => println!("{} is up to date", unit.display()),
+        systemd::UnitWrite::Created => outln!("Installed {}", unit.display()),
+        systemd::UnitWrite::Updated => outln!("Updated {}", unit.display()),
+        systemd::UnitWrite::Unchanged => outln!("{} is up to date", unit.display()),
     }
     systemctl.run(&["daemon-reload"])?;
     let was_active = systemctl.states().is_ok_and(|(a, _)| a == "active");
     systemctl.run(&["enable", "--now", systemd::UNIT_NAME])?;
     if was_active && written != systemd::UnitWrite::Unchanged {
-        println!("The service was already running: `ccwm restart` applies the new unit.");
+        outln!("The service was already running: `ccwm restart` applies the new unit.");
     }
     report_running("running")?;
     let linger = systemd::linger_enabled(systemd::user_name(uid).as_deref());
     if linger != Some(true) {
-        println!(
+        outln!(
             "It starts when you log in. To start it at boot, before you log in, enable lingering: `loginctl enable-linger {}` (may need administrator authorization).",
             systemd::user_name(uid).unwrap_or_else(|| "$USER".into())
         );
@@ -552,20 +621,20 @@ fn service_uninstall(purge: bool) -> Result<()> {
         systemctl.run(&["disable", "--now", systemd::UNIT_NAME])?;
     }
     match std::fs::remove_file(&unit) {
-        Ok(()) => println!("Removed {}", unit.display()),
+        Ok(()) => outln!("Removed {}", unit.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("{} is not installed", unit.display());
+            outln!("{} is not installed", unit.display());
         }
         Err(e) => return Err(Error::io(format!("cannot remove {}", unit.display()), &e)),
     }
     systemctl.run(&["daemon-reload"])?;
     if systemctl.installed()? {
-        println!(
+        outln!(
             "note: the user manager still knows ccwm.service from another location (not installed by ccwm); left alone"
         );
     }
     if !purge {
-        println!(
+        outln!(
             "Your ccwm data is kept ({}, {}, {}). `ccwm service uninstall --purge` deletes it.",
             dirs.config.display(),
             dirs.data.display(),
@@ -588,10 +657,12 @@ fn service_uninstall(purge: bool) -> Result<()> {
         list.join("\n")
     );
     if !systemd::confirm(&prompt, &mut std::io::stdin().lock()) {
-        return Err(Error::new("not confirmed; nothing was deleted"));
+        return Err(Error::new(
+            "not confirmed: none of your ccwm data was deleted (the service itself is uninstalled; `ccwm service install` brings it back)",
+        ));
     }
     for d in systemd::purge_dirs(&dirs, uid)? {
-        println!("Deleted {}", d.display());
+        outln!("Deleted {}", d.display());
     }
     Ok(())
 }
@@ -602,7 +673,7 @@ fn revoke_all() -> Result<()> {
         .get("revoked")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    println!(
+    outln!(
         "Signed out {n} browser session{}. Run `ccwm open` to sign in again.",
         if n == 1 { "" } else { "s" }
     );
@@ -623,7 +694,7 @@ fn open(print_only: bool) -> Result<()> {
     let has_display =
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
     if print_only || !has_display {
-        println!("{url}");
+        outln!("{url}");
         return Ok(());
     }
     // The single-use link stays out of the terminal when a browser could be launched.
@@ -635,14 +706,14 @@ fn open(print_only: bool) -> Result<()> {
         .spawn()
     {
         Ok(_) => {
-            println!(
+            outln!(
                 "Opening the dashboard in your browser (the sign-in link is single-use and expires in {} seconds).",
                 crate::auth::bootstrap::BOOTSTRAP_TTL_SECS
             );
             Ok(())
         }
         Err(_) => {
-            println!("{url}");
+            outln!("{url}");
             Ok(())
         }
     }
@@ -710,6 +781,18 @@ mod status_tests {
     }
 
     #[test]
+    fn a_closed_output_pipe_is_not_an_error_other_write_failures_are() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(output_error_status(&Error::from(ErrorKind::BrokenPipe)), 0);
+        assert_eq!(
+            output_error_status(&Error::from_raw_os_error(32)),
+            0,
+            "EPIPE"
+        );
+        assert_eq!(output_error_status(&Error::from(ErrorKind::StorageFull)), 1);
+    }
+
+    #[test]
     fn status_text_shows_the_key_facts_and_unknowns_as_unknown() {
         let v = serde_json::json!({
             "version": "0.1.0", "commit": "abc", "port": 8765, "uptime_s": 5,
@@ -728,10 +811,39 @@ mod status_tests {
             "2 watched, 4 partly watched, 1 polled",
             "! raise it",
             "2.43.0",
-            "network tcp_only, seccomp socket_denied)",
+            "filesystem true, network tcp_only, seccomp socket_denied)",
         ] {
             assert!(t.contains(want), "{want} in {t}");
         }
+        assert!(!t.contains("unverified"), "{t}");
+    }
+
+    /// A protection whose probe failed for an unexpected reason is shown as unverified, not as
+    /// `false` (withdrawn) and not as enforced.
+    #[test]
+    fn status_text_names_unverified_protections() {
+        let v = serde_json::json!({
+            "sandbox": {"status": "fully_enforced", "abi": 8, "filesystem": false,
+                        "network": "unverified", "seccomp": "unverified",
+                        "unverified": ["filesystem", "tcp", "udp", "unix_socket_connect_by_path"]}
+        });
+        let t = format_status(&v);
+        assert!(
+            t.contains("filesystem unverified, network unverified, seccomp unverified)\n"),
+            "{t}"
+        );
+        assert!(
+            t.contains("! unverified (a probe failed for an unexpected reason; neither enforced nor withdrawn): filesystem, tcp, udp, unix_socket_connect_by_path\n"),
+            "{t}"
+        );
+        let report = &v["sandbox"];
+        assert_eq!(sandbox_claim(report, "filesystem"), "unverified");
+        assert_eq!(
+            sandbox_claim(report, "signal"),
+            "false",
+            "absent: not claimed"
+        );
+        assert!(string_list(report, "notes").is_empty());
     }
 
     #[test]

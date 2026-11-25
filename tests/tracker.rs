@@ -229,6 +229,7 @@ impl Stack {
             monitor_state.clone(),
             TrackerSettings {
                 scan,
+                uid: nix::unistd::geteuid().as_raw(),
                 interval: Duration::from_secs(3600),
                 retention_secs: RETENTION,
                 events_per_project: 50,

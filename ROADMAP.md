@@ -168,13 +168,38 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
   (seccomp, probes, sock_diag, unit, residual risks, manual verification), docs/{configuration, discovery, service,
   troubleshooting, data-retention, benchmarks, two-user-verification, release-checklist}.md, CHANGELOG (0.1.0)
 - [x] musl release binary built, stripped, static, smoke-tested in a synthetic env; package + `sha256sum -c` locally
-- [ ] Test 5 network-namespace variant: CI is prepared to run it (`CCWM_REQUIRE_NETNS`); it has not run anywhere
+- ~~Test 5 network-namespace variant~~ — removed in the v0.1.0 fix pass (it cannot start the daemon without
+  weakening the ownership checks); test 5 uses strace
 - [ ] CI and the release workflow on GitHub (needs a push: owner action)
 - [ ] Fresh-account install from the archive, start at login / at boot with lingering (owner, release checklist)
 - [ ] Manual two-user check (owner; procedure in docs/two-user-verification.md)
 - [ ] History/secret audit sign-off, repository recreation, naming-conflict check (O3), tag + release (owner;
   docs/release-checklist.md)
 - [ ] Spec changes "M4, needs approval" (REQUIREMENTS.md Appendix A)
+
+### v0.1.0 fix pass (pre-release security review; local commit, not pushed)
+
+- [x] **H1** filter-driver names: exact or refused (non-UTF-8 names disable status); fuzz-style sentinel test with
+  control runs; the rule recorded in REQUIREMENTS.md §6
+- [x] **M1** seccomp denies `socketpair()` too; the peer check's netlink socket is opened before the filter and
+  reused, so `socket()` has no exception; SIGTERM shutdown and Git under the filter tested (also the musl binary)
+- [x] **M2** ignore files capped: 256 KiB per file, 1 MiB and 5,000 rules per project; skipped files counted and
+  reported; hostile-repository tests (unit and real daemon); worst-case memory measured
+- [x] **M3** residual-risk text rewritten; `worker-src 'none'`; `Clear-Site-Data` evaluated and **not** sent
+  (reasons in SECURITY.md)
+- [x] **L1** remote URL credentials (scp-like form, `/` in a password); **L2** canonical home and boundaries;
+  **L3** privacy mode hides sandbox notes and the path of a failed save; **L5** request-body timeout (`408`);
+  **L6** work-tree search bounded by the discovery root, `.git` must be the user's
+- [x] **L4** POSIX ACLs: documented as a limitation (not checked)
+- [x] Probes that fail for an unexpected reason report `unverified` (status, doctor, log)
+- [x] `ccwm … | head` ends quietly on a closed pipe; "too large to walk" says "partly watched"; table view uses
+  the window width, Activity column has a fixed width
+- [x] CI: test 5's network-namespace variant and `CCWM_REQUIRE_NETNS` removed; workflows linted (actionlint)
+- [x] Info: I1, I2, I4, I5, I6 (documentation), I9 (message)
+- [ ] Not done: I3 (WebSocket send timeout / `biased` select), I7 (`wal_checkpoint` result), I8 (session-file cap),
+  the stricter `PUT /settings` checks of I6, the review's remaining test-coverage gaps (4–8), a limit on ignore
+  rules across projects, `MemoryMax=` in the unit
+- [ ] Maintainer: review the limits and choices listed in ARCHITECTURE.md §14 ("chosen during the pass")
 - ~~Live reconfiguration of roots/exclusions/budget~~ — dropped (O1 approved as permanent)
 
 ---
