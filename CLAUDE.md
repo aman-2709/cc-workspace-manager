@@ -7,19 +7,23 @@ Independent, unofficial tool to discover, track and resume Claude Code projects.
 2. `ARCHITECTURE.md` (modules, data flow, schema, contracts, verified findings), `ROADMAP.md` (checklists + §18 backlog). Keep all three current. §18 items are **not** v0.1.
 
 ## Current status
-**M1, M1.1, M2, M2.1, M3 (development continuity): complete (local commits, not pushed).** Waiting for the maintainer's review of M3 (and the spec changes needing approval) and the go-ahead for M4. Implement only the approved milestone; after it, stop, report, and wait.
+**M1, M1.1, M2, M2.1, M3, M3.1 (M3 review fixes, real-home defects): complete (local commits, not pushed).** Waiting for the maintainer's review of M3.1 and the go-ahead for M4. Implement only the approved milestone; after it, stop, report, and wait.
 
-## Session handoff (2026-11-24, after M3)
-- **State:** M3 in one local commit: `claude/` (allowlist parser, incremental checkpoints, prompt classifier + on-demand bounded reads, redaction, resume commands, `claude` CLI check), sessions as the primary discovery source (`discovery/resolve.rs`, `tracker/sessions.rs`, dev-root marker scans after the first full scan, missing = directory gone), session-directory watches, migration 4, sessions/settings/clear-index endpoints, server-side privacy mode (REST + WebSocket), detail panel, Settings page, CLI waits only while the lock is held, `_build`, DEGRADED only for real failures, per-crate license exceptions. Fixture corpus `tests/fixtures/sessions/` (synthetic, from the maintainer's §19 output of 2026-11-24).
-- **Next:** M4, only after the maintainer's go-ahead. First the maintainer validates M3 against the real home in a browser.
+## Session handoff (2026-11-24, after M3.1)
+- **State:** M3.1 in one local commit on top of M3: every M3 security review finding (M1 terminal-unsafe cwds get no resume command + pty paste test; M2 writer-side prompt guard, serialized partial settings saves; M3 redaction rules; M4 session-only `container` rule + nested rule against on-disk markers; L1–L8), the real-home defects (test isolation, Forget, Missing only, `ccwm status` by reason and folder, early stop with partial checkpoints = migration 5, UI details, restart wording), docs. Spec changes are in REQUIREMENTS.md Appendix A ("M3.1").
+- **Deferred (maintainer decision):** the "Claude running" indicator → v0.2. Landlock blocks `/proc/<pid>/cwd` and `/exe` of processes outside the daemon's domain (verified). Preferred design (opt-in Claude Code hooks → `ccwm` subcommand → Unix socket) in ARCHITECTURE §14 and the ROADMAP backlog.
+- **Next:** M4, only after the maintainer's go-ahead. First the maintainer validates M3.1 against the real home in a browser (expect the hygiene-synth phantom projects to stay missing until forgotten: use the new Forget).
 - **Needs approval (ARCHITECTURE §14):** O1 (roots/exclusions/depth/budget/port/session dir need a restart), O7 (`<pasted_content>` is user text; privacy also hides status/settings paths; cwd walk-up also stops at a `CLAUDE.md`).
+- **Deviation to confirm:** the review's bare `(?i)\bbasic\s+[A-Za-z0-9+/=]{8,}` redaction rule would mask prose ("basic understanding"); it is narrowed to `Authorization: Basic …` or a bare `Basic <base64>` containing a digit, `+`, `/` or `=` (Appendix A).
 - **Open items:**
   - Test 5 ran as the **strace** variant only; the network-namespace variant has never run (AppArmor blocks it here) — needs a CI runner (M4).
   - `GIT_NO_LAZY_FETCH` is honored by this host's Ubuntu git (CVE-2024-32465 backport); older upstream ignores it (the other two blocks still apply).
   - Watches are still added by path (L2 residual); only a swap to a non-directory is caught.
   - axum's `ws` enables `tokio-tungstenite`'s `connect` feature (unused); documented in SECURITY.md.
   - M4: `ccwm doctor` (incl. the `claude` check and session dir), `sock_diag`, daemon-level write/connect probes, two-user check, `cargo-about`, seccomp `socket()` deny, tests 2/10 with `service uninstall --purge`.
-  - Cold-parse cost of the maintainer's ~500 MB of sessions is unmeasured (M4 benchmarks).
+  - Cold-parse cost of the maintainer's ~500 MB of sessions is unmeasured (M4 benchmarks); the early stop now skips most of the excluded observer sessions.
+  - Not done from the review's optional suggestions: test 8 canaries in malformed/oversized lines and unreadable files; `/service/status?privacy=1` in `tests/process.rs`'s privacy loop (covered in `tests/sessions_api.rs`); prompt reads still reopen the file by path (informational).
+  - Session rows written by M3 keep their uncleaned branch/version until the file is parsed again.
   - `cargo-deny` lives in `target/tools/` (reinstall after `cargo clean`, command in `deny.toml`).
 - **Build / test / run (synthetic environment only):** see **Commands** below. For a verified `claude` in a manual run, put a fake `claude` script in `<synth>/home/.local/bin` and start the daemon with `PATH=<that dir>:/usr/bin:/bin` (never let it find the real `claude`).
 
@@ -93,9 +97,14 @@ Ubuntu 24.04, rustc/cargo 1.94.0, git 2.43.0 (needs ≥2.41.0 for `--attr-source
 - The synthetic home lives under `/tmp`: the "temporary directory" rule for session cwds exempts cwds inside home.
 - `.session-aliases` is gitignored: fixtures that need it are created by `synth::install_sessions`.
 - Privacy is a server concern: never strip fields in `app.js`; add the field to `view::Privacy` / the status/settings strippers in `service.rs` and to the canary test in `tests/sessions_api.rs`.
+- Landlock scopes ptrace-class access: inside the daemon, `/proc/<pid>/cwd`, `/exe` (and `environ`, `fd`) of processes outside its domain are `EACCES`; `cmdline` and `status` stay readable. No rule relaxes it.
+- No test may create files in the working tree (a real ccwm watching the maintainer's home registers them; they become missing projects). `git check-ignore --no-index` on a path that does not exist ignores the nested `.gitignore` files it would contain: test such cases in a throwaway repository under `/tmp`.
+- A `partial` session checkpoint (early stop) must be re-read from 0 when its cwd stops qualifying **even if the file is unchanged** — check `partial` before the unchanged shortcut.
+- The settings PUT body is a diff against the saved config (`changedSettings` in `app.js`); diff against `st.config` after `Object.assign(st, response)`, not a captured copy.
+- The pty paste test drives `bash -i` through python3's `pty`; batch all pastes into one bash per mode (one bash per paste took ~40 s) and end with a liveness paste so a stuck quote cannot pass vacuously.
 
 ## Module status
-M1: `paths config clock error api_error sandbox instance db/{mod,writer,reader,queries} discovery/{walk,dirfd,exclusions,mounts,status} auth/{tokens,bootstrap,sessions} service ipc/{protocol,server} client http/{mod,peer,middleware,extract,routes,assets,error} daemon cli synth bin/ccwm-synth` + `web/*` + `scripts/inspect-session-schema.py` + `deny.toml` + `SECURITY.md`. M2: `activity git/{mod,run,parse} watch/{mod,tree} tracker events view http/ws build.rs` + migration 3 + README/CONTRIBUTING. M2.1: no new modules. M3: `claude/{locate,record,parse,prompt,redact,resume,cli}` `discovery/resolve` `tracker/{mod,sessions}` (was `tracker.rs`) + migration 4 + `tests/fixtures/sessions/` + `tests/sessions_api.rs`.
+M1: `paths config clock error api_error sandbox instance db/{mod,writer,reader,queries} discovery/{walk,dirfd,exclusions,mounts,status} auth/{tokens,bootstrap,sessions} service ipc/{protocol,server} client http/{mod,peer,middleware,extract,routes,assets,error} daemon cli synth bin/ccwm-synth` + `web/*` + `scripts/inspect-session-schema.py` + `deny.toml` + `SECURITY.md`. M2: `activity git/{mod,run,parse} watch/{mod,tree} tracker events view http/ws build.rs` + migration 3 + README/CONTRIBUTING. M2.1: no new modules. M3: `claude/{locate,record,parse,prompt,redact,resume,cli}` `discovery/resolve` `tracker/{mod,sessions}` (was `tracker.rs`) + migration 4 + `tests/fixtures/sessions/` + `tests/sessions_api.rs`. M3.1: no new modules; migration 5 (`partial` checkpoints).
 
 ## Open items
 See ARCHITECTURE.md §14 (O1, O2, O3, O4, O7).

@@ -183,7 +183,10 @@ pub struct DerivedRef {
     pub id: Option<String>,
 }
 
-/// What a `user` record is read for when its prompt text is needed (on demand only).
+/// The classification flags of a `user` record (on demand only). `message.content` is **not**
+/// part of it: it is skipped unread here and deserialized ([`UserContent`]) only for records
+/// whose flags pass (M3 security review, L8), so command output in synthetic records is never
+/// materialized.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct UserRecord {
@@ -202,14 +205,27 @@ pub struct UserRecord {
     /// Presence only: the tool result itself is skipped unread.
     #[serde(rename = "toolUseResult")]
     pub tool_use_result: Option<IgnoredAny>,
+    pub message: Option<MessageRole>,
+}
+
+/// `message.role` only.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MessageRole {
+    #[serde(deserialize_with = "lenient_string")]
+    pub role: Option<String>,
+}
+
+/// The content of a candidate prompt: read only after its [`UserRecord`] flags passed.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UserContent {
     pub message: Option<Message>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Message {
-    #[serde(deserialize_with = "lenient_string")]
-    pub role: Option<String>,
     pub content: Content,
 }
 
@@ -319,7 +335,7 @@ mod tests {
 
     #[test]
     fn content_is_a_string_or_blocks_and_tool_result_bodies_are_skipped() {
-        let u: UserRecord = serde_json::from_str(
+        let u: UserContent = serde_json::from_str(
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"text","text":"SKIPPED"}]},{"type":"text","text":"hello"},3,"x"]}}"#,
         )
         .unwrap();
@@ -333,11 +349,16 @@ mod tests {
             "the tool result's nested content is not read"
         );
         assert_eq!(b[1].text.as_deref(), Some("hello"));
-        let u: UserRecord =
+        let u: UserContent =
             serde_json::from_str(r#"{"message":{"content":"plain"},"toolUseResult":"x"}"#).unwrap();
         assert!(matches!(u.message.unwrap().content, Content::Text(ref t) if t == "plain"));
-        assert!(u.tool_use_result.is_some());
-        let u: UserRecord = serde_json::from_str(r#"{"message":{"content":{"a":1}}}"#).unwrap();
+        let f: UserRecord = serde_json::from_str(
+            r#"{"message":{"role":"user","content":"plain"},"toolUseResult":"x"}"#,
+        )
+        .unwrap();
+        assert!(f.tool_use_result.is_some());
+        assert_eq!(f.message.unwrap().role.as_deref(), Some("user"));
+        let u: UserContent = serde_json::from_str(r#"{"message":{"content":{"a":1}}}"#).unwrap();
         assert!(matches!(u.message.unwrap().content, Content::None));
     }
 

@@ -9,7 +9,7 @@
 //! `typed`, `queued` or `suggestion_accepted`. Records without `promptSource` (older versions)
 //! are accepted by the same checks plus `turnOrigin ≠ task_notification`.
 
-use super::record::{parse_timestamp, Content, Head, UserRecord};
+use super::record::{parse_timestamp, Content, Head, UserContent, UserRecord};
 use super::redact::redact;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -52,27 +52,31 @@ fn starts_with_synthetic_tag(text: &str) -> bool {
     })
 }
 
-/// The prompt text of `r` if it is a genuine user prompt.
-pub fn genuine_text(r: &UserRecord) -> Option<String> {
+/// The flags of `r` allow a genuine prompt (everything but the text checks).
+pub fn is_candidate(r: &UserRecord) -> bool {
     if r.kind.as_deref() != Some("user")
         || r.is_meta == Some(true)
         || r.is_sidechain == Some(true)
         || r.is_compact_summary == Some(true)
         || r.tool_use_result.is_some()
     {
-        return None;
+        return false;
     }
     match r.prompt_source.as_deref() {
-        Some(s) if !GENUINE_SOURCES.contains(&s) => return None,
+        Some(s) if !GENUINE_SOURCES.contains(&s) => return false,
         Some(_) => {}
-        None if r.turn_origin.as_deref() == Some("task_notification") => return None,
+        None if r.turn_origin.as_deref() == Some("task_notification") => return false,
         None => {}
     }
-    let msg = r.message.as_ref()?;
-    if msg.role.as_deref() != Some("user") {
-        return None;
-    }
-    let text = match &msg.content {
+    r.message
+        .as_ref()
+        .is_some_and(|m| m.role.as_deref() == Some("user"))
+}
+
+/// The prompt text of a candidate's content, if it is genuine (no `tool_result` block, not
+/// empty, no synthetic opening tag).
+pub fn genuine_text(c: &UserContent) -> Option<String> {
+    let text = match &c.message.as_ref()?.content {
         Content::Text(t) => t.clone(),
         Content::Blocks(blocks) => {
             if blocks
@@ -93,16 +97,21 @@ pub fn genuine_text(r: &UserRecord) -> Option<String> {
     (!text.trim().is_empty() && !starts_with_synthetic_tag(&text)).then_some(text)
 }
 
-/// The genuine prompt of one JSONL line, with its timestamp.
+/// The genuine prompt of one JSONL line, with its timestamp. Three passes, each only when the
+/// previous one passed: the record type, the flags, then the content.
 pub fn genuine_in_line(line: &[u8]) -> Option<(String, Option<i64>)> {
-    // Cheap first pass: most lines are not `user` records (or are tool results).
+    // Cheap first pass: most lines are not `user` records.
     let head: Head = serde_json::from_slice(line).ok()?;
     if head.kind.as_deref() != Some("user") {
         return None;
     }
-    let r: UserRecord = serde_json::from_slice(line).ok()?;
+    let flags: UserRecord = serde_json::from_slice(line).ok()?;
+    if !is_candidate(&flags) {
+        return None;
+    }
+    let content: UserContent = serde_json::from_slice(line).ok()?;
     let at = head.timestamp.as_deref().and_then(parse_timestamp);
-    genuine_text(&r).map(|t| (t, at))
+    genuine_text(&content).map(|t| (t, at))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -205,7 +214,7 @@ mod tests {
     use super::*;
 
     fn rec(json: &str) -> Option<String> {
-        genuine_text(&serde_json::from_str::<UserRecord>(json).unwrap())
+        genuine_in_line(json.as_bytes()).map(|(t, _)| t)
     }
 
     /// `(isMeta, isSidechain, isCompactSummary, promptSource, turnOrigin, toolUseResult, content,

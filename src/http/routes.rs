@@ -91,9 +91,10 @@ pub async fn settings(
 pub async fn update_settings(
     State(s): St,
     _auth: SessionAuth,
+    ApiQuery(q): ApiQuery<PrivacyQuery>,
     ApiJson(body): ApiJson<serde_json::Value>,
 ) -> Result<Json<SettingsView>, ApiError> {
-    Ok(Json(s.service.update_settings(body).await?))
+    Ok(Json(s.service.update_settings(body, q.privacy()?).await?))
 }
 
 pub async fn clear_session_index(
@@ -107,16 +108,28 @@ pub async fn ignore(
     State(s): St,
     _auth: SessionAuth,
     p: Id,
+    ApiQuery(q): ApiQuery<PrivacyQuery>,
 ) -> Result<Json<ProjectView>, ApiError> {
-    Ok(Json(s.service.set_ignored(&id(p)?, true).await?))
+    Ok(Json(
+        s.service.set_ignored(&id(p)?, true, q.privacy()?).await?,
+    ))
 }
 
 pub async fn unignore(
     State(s): St,
     _auth: SessionAuth,
     p: Id,
+    ApiQuery(q): ApiQuery<PrivacyQuery>,
 ) -> Result<Json<ProjectView>, ApiError> {
-    Ok(Json(s.service.set_ignored(&id(p)?, false).await?))
+    Ok(Json(
+        s.service.set_ignored(&id(p)?, false, q.privacy()?).await?,
+    ))
+}
+
+/// "Forget" a missing project (ccwm's database only) → 204.
+pub async fn forget(State(s): St, _auth: SessionAuth, p: Id) -> Result<StatusCode, ApiError> {
+    s.service.forget(&id(p)?).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn refresh(

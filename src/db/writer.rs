@@ -8,7 +8,8 @@ use super::{db_err, open_writer_connection, sort_key};
 use crate::error::{Error, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 
@@ -240,7 +241,8 @@ enum Cmd {
     ClearSessionIndex {
         reply: Reply<Vec<String>>,
     },
-    /// Cache (or with `None`, drop) the last prompt of one session (opt-in setting).
+    /// Cache (or with `None`, drop) the last prompt of one session (opt-in setting). A no-op
+    /// unless storing is enabled ([`Writer::set_store_prompts`]), checked inside the transaction.
     CachePrompt {
         session_id: String,
         prompt: Option<(String, Option<i64>)>,
@@ -248,6 +250,12 @@ enum Cmd {
     /// Drop every cached prompt ("Store prompt text" turned off); replies with the count.
     ClearPromptCache {
         reply: Reply<u64>,
+    },
+    /// "Forget" a **missing** project: delete its row (sessions become unassigned, events and
+    /// the Git cache go with it); never touches the disk. Replies whether a row was deleted.
+    Forget {
+        id: String,
+        reply: Reply<bool>,
     },
     /// Clear `missing_since` of projects whose directory is back; replies with the changed ids.
     Revive {
@@ -267,6 +275,10 @@ enum Cmd {
 pub struct Writer {
     tx: mpsc::Sender<Cmd>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    /// "Store prompt text" as the writer enforces it (M3 review, M2): the writer thread reads it
+    /// while executing `CachePrompt`, so a prompt read that was in flight when the setting turned
+    /// off can never be stored after the cache was cleared.
+    store_prompts: Arc<AtomicBool>,
 }
 
 fn random_id() -> Result<String> {
@@ -278,14 +290,23 @@ impl Writer {
     pub fn spawn(db_path: &Path) -> Result<Self> {
         let conn = open_writer_connection(db_path)?;
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let store_prompts = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&store_prompts);
         let handle = std::thread::Builder::new()
             .name("ccwm-db-writer".into())
-            .spawn(move || run(conn, rx))
+            .spawn(move || run(conn, rx, &flag))
             .map_err(|e| Error::io("cannot start the database writer thread", &e))?;
         Ok(Self {
             tx,
             handle: Mutex::new(Some(handle)),
+            store_prompts,
         })
+    }
+
+    /// Allow (or forbid) `CachePrompt`. Turning it off must happen **before** the cache is
+    /// cleared ([`Self::clear_prompt_cache`]); off by default.
+    pub fn set_store_prompts(&self, on: bool) {
+        self.store_prompts.store(on, Ordering::SeqCst);
     }
 
     async fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Cmd) -> Result<T> {
@@ -496,6 +517,11 @@ impl Writer {
         self.call(|reply| Cmd::ClearPromptCache { reply }).await
     }
 
+    pub async fn forget(&self, id: &str) -> Result<bool> {
+        let id = id.to_string();
+        self.call(|reply| Cmd::Forget { id, reply }).await
+    }
+
     pub async fn revive(&self, ids: Vec<String>, now: i64) -> Result<Vec<String>> {
         self.call(|reply| Cmd::Revive { ids, now, reply }).await
     }
@@ -515,7 +541,7 @@ impl Writer {
     }
 }
 
-fn run(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
+fn run(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>, store_prompts: &AtomicBool) {
     while let Some(first) = rx.blocking_recv() {
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
@@ -525,17 +551,28 @@ fn run(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>) {
             }
         }
         let stop = batch.iter().any(|c| matches!(c, Cmd::Shutdown { .. }));
-        apply_batch(&mut conn, batch);
+        apply_batch(&mut conn, batch, store_prompts);
         if stop {
             break;
         }
     }
 }
 
+/// Commands that delete session text: after their commit the WAL is checkpointed and truncated,
+/// so the deleted bytes do not linger in old WAL frames (M3 review, L6).
+fn deletes_session_text(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::ClearPromptCache { .. } | Cmd::ClearSessionIndex { .. }
+    )
+}
+
 type Outcome = Box<dyn FnOnce(Option<&Error>) + Send>;
 
-/// Run each command in a savepoint inside one transaction; send replies after the commit.
-fn apply_batch(conn: &mut Connection, batch: Vec<Cmd>) {
+/// Run each command in a savepoint inside one transaction; send replies after the commit (and,
+/// for a batch that deleted session text, after the WAL checkpoint).
+fn apply_batch(conn: &mut Connection, batch: Vec<Cmd>, store_prompts: &AtomicBool) {
+    let checkpoint = batch.iter().any(deletes_session_text);
     let tx = match conn.transaction() {
         Ok(tx) => tx,
         Err(e) => {
@@ -548,9 +585,16 @@ fn apply_batch(conn: &mut Connection, batch: Vec<Cmd>) {
     };
     let mut pending: Vec<Outcome> = Vec::with_capacity(batch.len());
     for cmd in batch {
-        pending.push(execute(&tx, cmd));
+        pending.push(execute(&tx, cmd, store_prompts));
     }
     let commit_err = tx.commit().err().map(|e| db_err("commit", &e));
+    if checkpoint && commit_err.is_none() {
+        // A reader holding an old snapshot can make this partial (busy_timeout waits for it);
+        // the next clear or SQLite's own checkpoints finish the job.
+        if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            tracing::warn!(error = %e, "WAL checkpoint after clearing session data failed");
+        }
+    }
     for outcome in pending {
         outcome(commit_err.as_ref());
     }
@@ -583,6 +627,7 @@ fn fail(cmd: Cmd, err: &Error) {
         | Cmd::DeleteSessions { reply, .. }
         | Cmd::ClearSessionIndex { reply }
         | Cmd::Revive { reply, .. } => drop(reply.send(Err(e()))),
+        Cmd::Forget { reply, .. } => drop(reply.send(Err(e()))),
         Cmd::ClearPromptCache { reply } => drop(reply.send(Err(e()))),
         Cmd::TouchSession { .. } | Cmd::CachePrompt { .. } => {}
     }
@@ -590,7 +635,7 @@ fn fail(cmd: Cmd, err: &Error) {
 
 /// Execute one command in a savepoint. The returned closure sends the reply once the outer
 /// transaction's commit outcome is known.
-fn execute(tx: &rusqlite::Transaction<'_>, cmd: Cmd) -> Outcome {
+fn execute(tx: &rusqlite::Transaction<'_>, cmd: Cmd, store_prompts: &AtomicBool) -> Outcome {
     macro_rules! run {
         ($reply:expr, $body:expr) => {{
             let result = savepoint(tx, $body);
@@ -707,6 +752,9 @@ fn execute(tx: &rusqlite::Transaction<'_>, cmd: Cmd) -> Outcome {
         }
         Cmd::ClearSessionIndex { reply } => run!(reply, clear_session_index),
         Cmd::CachePrompt { session_id, prompt } => {
+            if prompt.is_some() && !store_prompts.load(Ordering::SeqCst) {
+                return Box::new(|_| {});
+            }
             let _ = savepoint(tx, |c| {
                 c.execute(
                     "UPDATE sessions SET prompt_text = ?2, prompt_at = ?3 WHERE id = ?1",
@@ -730,6 +778,7 @@ fn execute(tx: &rusqlite::Transaction<'_>, cmd: Cmd) -> Outcome {
             .map_err(|e| db_err("clear prompt cache", &e))
         }),
         Cmd::Revive { ids, now, reply } => run!(reply, |c| revive(c, &ids, now)),
+        Cmd::Forget { id, reply } => run!(reply, |c| forget(c, &id)),
         Cmd::Flush { reply } | Cmd::Shutdown { reply } => run!(reply, |_c| Ok(())),
     }
 }
@@ -814,12 +863,14 @@ fn store_sessions(c: &Connection, sessions: &[SessionStore]) -> Result<Vec<Strin
         let int = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         c.execute(
             "INSERT INTO session_file_checkpoints
-               (session_id, dev, ino, size, offset, mtime_ns, lines, malformed, oversized, unknown, foreign_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+               (session_id, dev, ino, size, offset, mtime_ns, lines, malformed, oversized, unknown,
+                foreign_id, partial)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(session_id) DO UPDATE SET dev = excluded.dev, ino = excluded.ino,
                size = excluded.size, offset = excluded.offset, mtime_ns = excluded.mtime_ns,
                lines = excluded.lines, malformed = excluded.malformed, oversized = excluded.oversized,
-               unknown = excluded.unknown, foreign_id = excluded.foreign_id",
+               unknown = excluded.unknown, foreign_id = excluded.foreign_id,
+               partial = excluded.partial",
             params![
                 s.id,
                 int(k.dev),
@@ -831,7 +882,8 @@ fn store_sessions(c: &Connection, sessions: &[SessionStore]) -> Result<Vec<Strin
                 int(n.malformed),
                 int(n.oversized),
                 int(n.unknown),
-                int(n.foreign)
+                int(n.foreign),
+                k.partial
             ],
         )
         .map_err(|e| db_err("store checkpoint", &e))?;
@@ -897,6 +949,17 @@ fn clear_session_index(c: &Connection) -> Result<Vec<String>> {
         .map_err(|e| db_err("clear session index", &e))?;
     refresh_session_summary(c, &mut affected)?;
     Ok(affected)
+}
+
+fn forget(c: &Connection, id: &str) -> Result<bool> {
+    // Its sessions lose the project (ON DELETE SET NULL) and are resolved again at the next
+    // ingest; the reason stays empty until then.
+    c.execute(
+        "DELETE FROM projects WHERE id = ?1 AND missing_since IS NOT NULL",
+        params![id],
+    )
+    .map(|n| n > 0)
+    .map_err(|e| db_err("forget project", &e))
 }
 
 fn revive(c: &Connection, ids: &[String], now: i64) -> Result<Vec<String>> {

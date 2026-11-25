@@ -324,13 +324,29 @@ impl Tracker {
             .is_some())
     }
 
-    /// Present projects' canonical paths (the nested rule of scans and session resolution).
-    fn known_paths(tracked: &[Tracked]) -> HashSet<String> {
+    /// Present projects that can be the outer project of the nested rule in a marker scan:
+    /// those with a Git work tree or a `CLAUDE.md` at their root. A session-only project (e.g.
+    /// `~/dev` from an older ccwm) never makes the markers below it nested (M3 review, M4).
+    /// Metadata only (`lstat` of two names per project).
+    fn nesting_projects(tracked: &[Tracked]) -> Vec<&Tracked> {
         tracked
             .iter()
-            .filter(|t| !t.missing)
+            .filter(|t| !t.missing && crate::discovery::resolve::is_anchored(Path::new(&t.path)))
+            .collect()
+    }
+
+    fn known_paths(tracked: &[Tracked]) -> HashSet<String> {
+        Self::nesting_projects(tracked)
+            .into_iter()
             .map(|t| t.path.clone())
             .collect()
+    }
+
+    /// A nesting project strictly contains `dir`.
+    fn inside_project(tracked: &[Tracked], dir: &Path) -> bool {
+        Self::nesting_projects(tracked)
+            .iter()
+            .any(|t| dir.starts_with(&t.path) && dir != Path::new(&t.path))
     }
 
     /// Canonical configured roots with their exclusion rules.
@@ -369,9 +385,7 @@ impl Tracker {
             if ex.is_under_boundary(&start) {
                 continue;
             }
-            let inside_project = tracked
-                .iter()
-                .any(|t| !t.missing && start.starts_with(&t.path) && start != Path::new(&t.path));
+            let inside_project = Self::inside_project(tracked, &start);
             let max_rel_depth = Some(if start == *root || start == home {
                 1
             } else {
@@ -838,10 +852,7 @@ impl Tracker {
             return Ok(Vec::new());
         };
         let tracked = self.tracked().await?;
-        let inside_project = tracked
-            .iter()
-            .filter(|t| !t.missing)
-            .any(|t| dir.starts_with(&t.path) && dir != Path::new(&t.path));
+        let inside_project = Self::inside_project(&tracked, dir);
         let sub = Subtree {
             root,
             start: dir.to_path_buf(),

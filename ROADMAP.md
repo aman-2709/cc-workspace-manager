@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **M3 (development continuity) complete — waiting for the maintainer's review and go-ahead for M4.**
+Current position: **M3.1 (M3 review fixes, real-home defects) complete — waiting for the maintainer's review and go-ahead for M4.** The "Claude running" indicator approved for M3.1 was deferred to v0.2 (Landlock blocks `/proc/<pid>/cwd`; ARCHITECTURE §14).
 
 ---
 
@@ -109,6 +109,26 @@ hides unreadable-folder paths; the CLI waits only while the instance lock is hel
 - [x] Security acceptance tests 2, 8, 10 (process level; `service uninstall --purge` part in M4); test 5 with the session cycle and the `claude` check
 - [x] fmt / clippy / test (`CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_INOTIFY=1`) / cargo deny green; synthetic daemon + real browser check; docs; local commit
 
+## M3.1 — M3 review fixes and real-home defects (review `docs/reviews/m3-security-review.md` + maintainer's real-home test)
+Spec changes approved by the maintainer and recorded in REQUIREMENTS.md (§4.4, §4.5, §7.1–§7.3, §8, §9, §10, §12,
+§13, §16, §18, Appendix A).
+
+- [x] M1: no resume command for a cwd with C0/C1 controls, DEL or bidi/format characters; `cwd_unsafe_characters`; escaped display; adversarial test expects no command for `\n`, `\r`, `\x15`, `ESC[201~`, `U+202E`; pty paste regression test (bash, bracketed paste on and off, control runs)
+- [x] M2: writer-side prompt-cache guard (flag cleared before `ClearPromptCache`); one settings lock from merge to apply; the page sends only changed fields; tests: stale form, concurrent saves, in-flight read during turn-off
+- [x] M3: identifier-suffix keyword rule (incl. quoted JSON/YAML keys), PGP/generic PEM keys, `sk_`/`rk_` live/test, `glpat-`, `npm_`, `AIza`, Basic credentials; every review table row tested; no stray quote; SECURITY.md wording
+- [x] M4: session-only candidates never nest others, `container` when projects lie below (both orders tested, unit and ingest); nested rule also against marker directories on disk (`monorepo/services/api` → `monorepo` on the first launch)
+- [x] L1 privacy on ignore and settings-save responses + real canaries; L2 `same_file_system`/`max_depth`; L3 caps/stripping, cwd not redacted (documented); L4 lower-case ids, first file wins, duplicates counted; L5 same-project continuations; L6 `secure_delete` + WAL checkpoint; L7 settings allowlist, port 0 and broad session dirs rejected; L8 flags before content
+- [x] SECURITY.md: unconfined `claude --version/--help` without Landlock
+- [x] Tests: DB scanned before and after clearing the index; test 10 restarts on an empty DB and waits for a full re-ingest
+- [x] Test isolation: the hygiene test runs in a throwaway repository under `/tmp`; the full run leaves the working tree unchanged
+- [x] Forget (missing projects, database only; `DELETE /projects/{id}`) and "Missing only" (`missing_only`)
+- [x] `ccwm status`: unassigned sessions by reason and folder; duplicates
+- [x] Early stop for sessions whose first cwd can never name a project (migration 5, partial checkpoints)
+- [x] UI: fixed-width actions column, inferred marker with tooltip, "—" for no commit, "sessions in projects", restart wording
+- [x] Test confirms `monorepo/services/api` (CLAUDE.md, no own Git) resolves to the monorepo (resolver unit test and ingest test)
+- [ ] ~~"Claude running" indicator~~ — deferred to v0.2 (maintainer decision; see the backlog and ARCHITECTURE §14)
+- [x] fmt / clippy / test (`CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_INOTIFY=1`) / cargo deny green; synthetic daemon + real browser check; docs; local commit
+
 ## M4 — Release readiness
 Accept: a fresh user account installs from the release archive; service starts at login (and at boot with
 lingering); projects appear; all tests including the full security acceptance suite pass; CI (gitleaks +
@@ -150,3 +170,4 @@ cargo-deny bans) green; benchmarks documented.
 - [ ] macOS and Windows support
 - [ ] Git `core.excludesFile` (the user's global ignore file) in the activity rules (maintainer request, post-v0.1)
 - [ ] Display of `pr-link` records (the session's pull request) in the detail panel (maintainer request, post-v0.1)
+- [ ] "Claude running" indicator (v0.2; deferred from M3.1): opt-in Claude Code `SessionStart`/`SessionEnd` hooks call a `ccwm` subcommand that reports `session_id`, `cwd`, `pid` over the Unix socket; liveness from `/proc/<pid>/status` + `cmdline`; never inferred from activity; ccwm documents the hook config and never edits `~/.claude`; verify the hook input fields against the installed Claude Code version first (ARCHITECTURE §14)

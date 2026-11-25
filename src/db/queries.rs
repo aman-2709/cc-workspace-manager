@@ -24,6 +24,8 @@ pub enum SortBy {
 pub struct Filters {
     pub q: Option<String>,
     pub include_missing: bool,
+    /// Only missing projects ("Missing only"; implies `include_missing`).
+    pub missing_only: bool,
     pub include_ignored: bool,
     /// Only projects with uncommitted changes (staged, modified or untracked).
     pub dirty: bool,
@@ -179,11 +181,13 @@ fn project_from_row(
     })
 }
 
-/// The `WHERE` clause for [`Filters`], using parameters `?1`..`?9`.
+/// The `WHERE` clause for [`Filters`], using parameters `?1`..`?9` (`?2`: 0 present only,
+/// 1 present and missing, 2 missing only).
 const FILTER_SQL: &str =
     "(?1 IS NULL OR p.name LIKE ?1 ESCAPE '\\' OR (NOT ?9 AND p.canonical_path LIKE ?1 ESCAPE '\\')
                            OR g.branch LIKE ?1 ESCAPE '\\')
-     AND (?2 OR p.missing_since IS NULL)
+     AND (CASE ?2 WHEN 0 THEN p.missing_since IS NULL WHEN 2 THEN p.missing_since IS NOT NULL
+          ELSE 1 END)
      AND (?3 OR i.canonical_path IS NULL)
      AND (NOT ?4 OR coalesce(g.staged, 0) + coalesce(g.modified, 0) + coalesce(g.untracked, 0) > 0)
      AND (?5 IS NULL OR p.activity_at >= ?5)
@@ -198,7 +202,11 @@ fn filter_values(f: &Filters) -> Vec<Value> {
         f.q.as_deref()
             .map(like_pattern)
             .map_or(Value::Null, Value::Text),
-        Value::Integer(i64::from(f.include_missing)),
+        Value::Integer(if f.missing_only {
+            2
+        } else {
+            i64::from(f.include_missing)
+        }),
         Value::Integer(i64::from(f.include_ignored)),
         Value::Integer(i64::from(f.dirty)),
         opt(range.from),
@@ -421,7 +429,7 @@ pub fn session_states(conn: &Connection) -> rusqlite::Result<Vec<SessionState>> 
                 s.last_activity_at, s.title, s.git_branch, s.version, s.entrypoint, s.continued_in,
                 s.derived_from, s.is_sidechain,
                 c.dev, c.ino, c.size, c.offset, c.mtime_ns, c.lines, c.malformed, c.oversized,
-                c.unknown, c.foreign_id
+                c.unknown, c.foreign_id, c.partial
          FROM sessions s JOIN session_file_checkpoints c ON c.session_id = s.id",
     )?
     .query_map([], |r| {
@@ -459,6 +467,7 @@ pub fn session_states(conn: &Connection) -> rusqlite::Result<Vec<SessionState>> 
                 size: u(r.get(17)?),
                 offset: u(r.get(18)?),
                 mtime_ns: r.get(19)?,
+                partial: r.get(25)?,
             },
         })
     })?
@@ -540,7 +549,13 @@ pub struct SessionCounts {
     pub unknown: u64,
     /// `(reason, sessions)` of the unassigned sessions.
     pub unassigned: Vec<(String, u64)>,
+    /// `(reason, first cwd, sessions)`: the folders most unassigned sessions were started in,
+    /// most first (at most [`MAX_UNASSIGNED_FOLDERS`]).
+    pub unassigned_folders: Vec<(String, Option<String>, u64)>,
 }
+
+/// Folders listed in [`SessionCounts::unassigned_folders`].
+pub const MAX_UNASSIGNED_FOLDERS: u32 = 10;
 
 pub fn session_counts(conn: &Connection) -> rusqlite::Result<SessionCounts> {
     let n = |v: Option<i64>| u64::try_from(v.unwrap_or(0)).unwrap_or(0);
@@ -557,12 +572,23 @@ pub fn session_counts(conn: &Connection) -> rusqlite::Result<SessionCounts> {
         )?
         .query_map([], |r| Ok((r.get::<_, String>(0)?, n(r.get(1)?))))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let unassigned_folders = conn
+        .prepare(
+            "SELECT unassigned, first_cwd, count(*) AS n FROM sessions
+             WHERE unassigned IS NOT NULL GROUP BY unassigned, first_cwd
+             ORDER BY n DESC, unassigned, first_cwd LIMIT ?1",
+        )?
+        .query_map([MAX_UNASSIGNED_FOLDERS], |r| {
+            Ok((r.get::<_, String>(0)?, r.get(1)?, n(r.get(2)?)))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(SessionCounts {
         indexed,
         malformed,
         oversized,
         unknown,
         unassigned,
+        unassigned_folders,
     })
 }
 

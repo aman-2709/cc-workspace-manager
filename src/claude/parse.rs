@@ -6,6 +6,12 @@
 //! never consumed (Claude Code may still be writing it). A new inode, a shrunk file or a rewrite of
 //! the same size resets the aggregate and parses from 0. Aggregates are minimum/maximum
 //! timestamps, first/last cwd and last-wins values, so reading a line twice changes nothing.
+//!
+//! **Early stop.** The caller passes a predicate over the first recorded cwd. Once it says the
+//! session can never belong to a project (an excluded folder, outside the roots, home, a
+//! temporary directory), the rest of the file is not read: the checkpoint is marked `partial`
+//! and later appends are not read either, until the predicate changes its mind (a restart with
+//! other roots) — then the file is parsed again from byte 0.
 
 use super::record::{parse_timestamp, DerivedFrom, Head, CONVERSATIONAL, KNOWN_TYPES};
 use super::redact::redact;
@@ -20,6 +26,11 @@ pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_TITLE_CHARS: usize = 300;
 /// At most this many `derived-from` session ids are kept per session.
 pub const MAX_DERIVED: usize = 16;
+/// A longer recorded cwd (`PATH_MAX`) is ignored like an absent one (M3 review, L3).
+pub const MAX_CWD_BYTES: usize = 4096;
+/// The Git branch, version and entrypoint are stored without control characters and cut to
+/// this many characters.
+pub const MAX_META_CHARS: usize = 256;
 const READ_BUFFER: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -31,6 +42,9 @@ pub struct Checkpoint {
     pub offset: u64,
     /// Modification time in nanoseconds since the epoch.
     pub mtime_ns: i64,
+    /// Reading stopped early because the first cwd names no project (see the module docs);
+    /// `offset` is where it stopped.
+    pub partial: bool,
 }
 
 /// Line counters of one file (cumulative since its last reset).
@@ -88,22 +102,45 @@ pub fn identity(md: &std::fs::Metadata) -> Checkpoint {
         size: md.len(),
         offset: 0,
         mtime_ns: md.mtime().saturating_mul(1_000_000_000) + md.mtime_nsec(),
+        partial: false,
     }
 }
 
-/// Parse what is new in `file` (whose id is `session_id`) since `prev`.
+/// Never stop early.
+pub fn read_all(_first_cwd: &str) -> bool {
+    false
+}
+
+/// Parse what is new in `file` (whose id is `session_id`) since `prev`. `stop(first_cwd)`:
+/// the session names no project, so nothing after its first cwd needs reading.
 pub fn parse(
     file: &mut File,
     session_id: &str,
     prev: Option<(&Checkpoint, &Aggregate)>,
+    stop: &dyn Fn(&str) -> bool,
 ) -> io::Result<Outcome> {
     let now = identity(&file.metadata()?);
     let (start, mut agg, reset) = match prev {
         Some((c, a)) if c.dev == now.dev && c.ino == now.ino && now.size >= c.offset => {
-            if now.size == c.size && now.mtime_ns == c.mtime_ns {
+            let stops = a.first_cwd.as_deref().is_some_and(stop);
+            if c.partial && !stops {
+                // Stopped early before, but the session may belong to a project now (other
+                // roots after a restart): read it all, changed or not.
+                (0, Aggregate::default(), true)
+            } else if now.size == c.size && now.mtime_ns == c.mtime_ns {
                 return Ok(Outcome::Unchanged);
-            }
-            if now.size == c.size {
+            } else if stops {
+                // Still nothing to learn from this file: note its new size, read nothing.
+                return Ok(Outcome::Updated {
+                    checkpoint: Checkpoint {
+                        offset: c.offset,
+                        partial: true,
+                        ..now
+                    },
+                    aggregate: Box::new(a.clone()),
+                    reset: false,
+                });
+            } else if now.size == c.size {
                 (0, Aggregate::default(), true) // same size, new mtime: rewritten in place
             } else {
                 (c.offset, a.clone(), false)
@@ -118,6 +155,7 @@ pub fn parse(
     let mut offset = start;
     let mut line: Vec<u8> = Vec::new();
     let mut oversized = false;
+    let mut partial = false;
     loop {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
@@ -143,17 +181,25 @@ pub fn parse(
                 agg.counts.lines += 1;
                 agg.counts.oversized += 1;
             } else if !line.iter().all(u8::is_ascii_whitespace) {
+                let had_cwd = agg.first_cwd.is_some();
                 apply_line(&mut agg, session_id, &line);
+                if !had_cwd && agg.first_cwd.as_deref().is_some_and(stop) {
+                    partial = true;
+                }
             }
             line.clear();
             oversized = false;
             offset = pos;
+            if partial {
+                break;
+            }
         }
     }
     Ok(Outcome::Updated {
         checkpoint: Checkpoint {
             offset,
             size: now.size.max(offset),
+            partial,
             ..now
         },
         aggregate: Box::new(agg),
@@ -161,9 +207,13 @@ pub fn parse(
     })
 }
 
+/// Keep the latest non-empty value, without control characters and at most
+/// [`MAX_META_CHARS`] long (it reaches terminals through `ccwm status`-style output).
 fn set_last(slot: &mut Option<String>, v: Option<String>) {
-    if v.is_some() {
-        *slot = v;
+    if let Some(v) = v.map(|v| crate::git::parse::clean(&v, MAX_META_CHARS)) {
+        if !v.is_empty() {
+            *slot = Some(v);
+        }
     }
 }
 
@@ -191,7 +241,10 @@ fn apply_line(agg: &mut Aggregate, session_id: &str, line: &[u8]) {
             agg.started_at = Some(agg.started_at.map_or(t, |s| s.min(t)));
             agg.last_activity_at = Some(agg.last_activity_at.map_or(t, |s| s.max(t)));
         }
-        if let Some(cwd) = head.cwd.filter(|c| !c.is_empty()) {
+        if let Some(cwd) = head
+            .cwd
+            .filter(|c| !c.is_empty() && c.len() <= MAX_CWD_BYTES)
+        {
             if agg.first_cwd.is_none() {
                 agg.first_cwd = Some(cwd.clone());
             }
@@ -249,7 +302,7 @@ mod tests {
 
     fn run(path: &std::path::Path, prev: Option<(Checkpoint, Aggregate)>) -> Outcome {
         let mut f = File::open(path).unwrap();
-        parse(&mut f, ID, prev.as_ref().map(|(c, a)| (c, a))).unwrap()
+        parse(&mut f, ID, prev.as_ref().map(|(c, a)| (c, a)), &read_all).unwrap()
     }
 
     fn updated(o: Outcome) -> (Checkpoint, Aggregate, bool) {
@@ -426,5 +479,78 @@ mod tests {
         let (_, a, _) = updated(run(&p, None));
         assert_eq!(a.continued_in.as_deref(), Some(other));
         assert_eq!(a.derived_from, [other.to_string()]);
+    }
+
+    #[test]
+    fn reading_stops_after_a_first_cwd_that_names_no_project() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("s.jsonl");
+        let body = [
+            r#"{"type":"ai-title","sessionId":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","aiTitle":"before"}"#.to_string(),
+            line("user", "2026-01-01T10:00:00.000Z", "/excluded/x"),
+            line("assistant", "2026-01-01T11:00:00.000Z", "/excluded/x"),
+            r#"{"type":"ai-title","sessionId":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","aiTitle":"never read"}"#.to_string(),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&p, &body).unwrap();
+        let excluded = |c: &str| c.starts_with("/excluded");
+        let open = || File::open(&p).unwrap();
+        let (c, a, _) = updated(parse(&mut open(), ID, None, &excluded).unwrap());
+        assert!(c.partial);
+        assert_eq!(a.counts.lines, 2, "nothing after the first cwd was read");
+        assert_eq!(a.title.as_deref(), Some("before"));
+        assert_eq!(a.first_cwd.as_deref(), Some("/excluded/x"));
+        let first_line = body.find('\n').unwrap() + 1;
+        let second = first_line + body[first_line..].find('\n').unwrap() + 1;
+        assert_eq!(c.offset, second as u64);
+        assert_eq!(c.size, body.len() as u64);
+        assert_eq!(
+            parse(&mut open(), ID, Some((&c, &a)), &excluded).unwrap(),
+            Outcome::Unchanged
+        );
+        // An append is noted (new size) but not read.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        writeln!(f, "{}", line("user", "2026-02-01T10:00:00.000Z", "/x")).unwrap();
+        let (c2, a2, reset) = updated(parse(&mut open(), ID, Some((&c, &a)), &excluded).unwrap());
+        assert!(!reset && c2.partial);
+        assert_eq!((c2.offset, a2.clone()), (c.offset, a.clone()));
+        assert_eq!(c2.size, std::fs::metadata(&p).unwrap().len());
+        // The predicate changed (other roots after a restart): read everything from byte 0.
+        let (c3, a3, reset) = updated(parse(&mut open(), ID, Some((&c2, &a2)), &read_all).unwrap());
+        assert!(reset && !c3.partial);
+        assert_eq!(a3.counts.lines, 5);
+        assert_eq!(a3.title.as_deref(), Some("never read"));
+        assert_eq!(a3.last_activity_at, Some(1_769_940_000));
+        // A session fully read before (an older ccwm) stops being read once it is excluded.
+        writeln!(f, "{}", line("user", "2026-03-01T10:00:00.000Z", "/x")).unwrap();
+        let (c4, a4, _) = updated(parse(&mut open(), ID, Some((&c3, &a3)), &excluded).unwrap());
+        assert!(c4.partial);
+        assert_eq!((c4.offset, a4), (c3.offset, a3));
+    }
+
+    #[test]
+    fn over_long_cwds_are_ignored_and_metadata_is_cleaned_and_capped() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("s.jsonl");
+        let long = format!("/{}", "d".repeat(MAX_CWD_BYTES));
+        let body = [
+            line("user", "2026-01-01T10:00:00.000Z", &long),
+            format!(
+                r#"{{"type":"user","sessionId":"{ID}","timestamp":"2026-01-01T10:00:01.000Z","gitBranch":"b\u001b[31mred\u0007","version":"{}","entrypoint":"cli\n"}}"#,
+                "9".repeat(1000)
+            ),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&p, body).unwrap();
+        let (_, a, _) = updated(run(&p, None));
+        assert_eq!(a.first_cwd, None, "a cwd longer than PATH_MAX is no cwd");
+        assert_eq!(a.git_branch.as_deref(), Some("b[31mred"));
+        assert_eq!(a.version.map(|v| v.len()), Some(MAX_META_CHARS));
+        assert_eq!(a.entrypoint.as_deref(), Some("cli"));
+        let ok = format!("/{}", "d".repeat(MAX_CWD_BYTES - 1));
+        std::fs::write(&p, line("user", "2026-01-01T10:00:00.000Z", &ok) + "\n").unwrap();
+        assert_eq!(updated(run(&p, None)).1.first_cwd, Some(ok));
     }
 }

@@ -171,7 +171,7 @@ MSRV: `rust-version = "1.94"` — the only toolchain tested here; widen in M4 wh
 ## 5. SQLite schema
 
 Per connection: `foreign_keys=ON`, `busy_timeout=5000`; writer also `journal_mode=WAL`, `synchronous=NORMAL`,
-`temp_store=MEMORY`. Readers open `SQLITE_OPEN_READ_ONLY`. Migrations are embedded `.sql` files applied in a
+`temp_store=MEMORY`, `secure_delete=ON` (M3.1: deleted content is overwritten, review L6). Readers open `SQLITE_OPEN_READ_ONLY`. Migrations are embedded `.sql` files applied in a
 transaction each, bumping `PRAGMA user_version`; each milestone adds only the tables it uses. Timestamps are
 Unix seconds (UTC). IDs are 128-bit CSPRNG hex (32 chars), opaque and validated.
 
@@ -229,6 +229,15 @@ change: sort `session`, filter `has_sessions`), index `(session_at, sort_key, id
 Writer commands added: `StoreSessions`, `AssignSessions`, `DeleteSessions`, `ClearSessionIndex`, `CachePrompt`
 (best effort), `ClearPromptCache`, `Revive`.
 
+### Migration 5 (M3.1)
+`session_file_checkpoints.partial` (0/1): the file was read only up to its first cwd because that cwd can never
+name a project (early stop, §7b). Writer changes: `Forget` (delete a **missing** project row; sessions → `SET
+NULL`, resolved again at the next ingest); `CachePrompt` is a no-op unless `Writer::set_store_prompts(true)` — an
+`AtomicBool` the writer thread reads **inside the transaction** (the service sets it from the config at start,
+clears it before `ClearPromptCache`, sets it when the setting turns on); after a batch that contains
+`ClearPromptCache` or `ClearSessionIndex` commits, the writer runs `PRAGMA wal_checkpoint(TRUNCATE)` before it
+replies. `session_counts` adds the top 10 `(reason, first_cwd, n)` of unassigned sessions.
+
 **Writer:** one `std::thread`, `sync_channel(1024)` of `WriteCmd` (`UpsertProjects`, `CreateSession`,
 `RotateSession`, `DeleteSession`, `TouchSession`, `RevokeAll`, `SetMeta`, `Flush`, `Shutdown`); commands needing
 an answer carry a `tokio::sync::oneshot::Sender`. Loop: block on one command, drain up to 256 more (or 50 ms),
@@ -256,7 +265,11 @@ same_file_system = true
 `activity.events_per_project` (200), `git.allow_unhardened_status` (false).
 M3 keys: `discovery.full_scan` (false), `sessions.dir` (unset: `$CLAUDE_CONFIG_DIR`, else `~/.claude`; absolute),
 `sessions.store_prompt_text` (false), `ui.default_view` (`cards`), `ui.theme` (`system`), `ui.privacy` (false).
-`PUT /settings` merges a partial object into the saved file, validates the whole configuration, writes
+`PUT /settings` accepts only the Settings page's keys (M3.1, review L7: `server.port`; `discovery.roots`, `exclude`,
+`max_depth`, `same_file_system`, `scan_interval_secs`, `missing_retention_days`, `full_scan`; `watch.budget`;
+`activity.inactive_after_days`, `dormant_after_days`; `sessions.dir`, `store_prompt_text`; `ui.*`), rejects port 0
+and a `sessions.dir` that is `/`, contains `.`/`..` or is an ancestor of home, then — under one async lock held from
+merge to apply (review M2) — merges the partial object into the saved file, validates the whole configuration, writes
 `<config>.tmp` (0600, fsync) and renames it; the service keeps the config **as loaded from the file** (command-line
 overrides such as `--port` are never written back). Live: scan interval, retention, `full_scan`, activity
 thresholds, `store_prompt_text` (off ⇒ cached prompts deleted), `ui.*`; everything else is listed in
@@ -349,6 +362,22 @@ the first cwd of new and unassigned sessions (`discovery::resolve`) → upsert t
 store aggregates + checkpoints in batches of 256 (`StoreSessions`; assigned sessions keep their project) → re-assign
 unparsed unassigned sessions whose resolution changed → delete sessions whose file is gone from a completely listed
 directory (`DeleteSessions`; projects stay) → `Cmd::WatchSessions(projects/ + every listed dir)` → session status.
+
+**M3.1 changes to the ingest.** One resolver `Context` per ingest (roots with exclusions, home, temp dirs, present
+projects, `max_depth`, `same_file_system`). Listing → `locate::dedupe` (one file per id: the indexed file, else the
+first by path; the rest counted as `duplicate_ids`; only lower-case UUID stems are sessions). Parsing an unassigned
+session passes `Context::never_a_project` as the early-stop predicate (memoized per cwd): once the first cwd fails a
+**static** check (`no_cwd`, `home`, `temporary`, `outside_roots`, `excluded`), reading stops and the checkpoint is
+`partial`; appends then only update size/mtime; a partial checkpoint whose cwd no longer stops is parsed again from
+byte 0, changed or not. Resolution is memoized per distinct cwd.
+**Resolver** (`discovery/resolve.rs`): `locate` (the static checks, plus every component's `st_dev` against the root
+with `same_file_system`, and `max_depth`) → nearest *anchored* directory (a `.git` entry or a `CLAUDE.md`) at or
+above the cwd → nested rule repeated: a candidate without its own `.git` that is not registered moves to the nearest
+ancestor that is a marker directory or a registered anchored project → no anchor: *session-only* candidate, which is
+`container` if a registered project lies below it or `project_below` finds a `.git` or a marker below it (preorder by
+descriptor, discovery's exclusions/depth/device rules, ≤ 2,000 directories, more = container). The tracker's marker
+scans use only anchored present projects as `known`/`inside_project` (`Tracker::nesting_projects`), so a
+session-only project never makes markers below it nested.
 
 **Watches**: the monitor watches `projects/` and every `<encoded-dir>` non-recursively (`Owner::Sessions`, first in
 the budget); a new `<encoded-dir>` gets a watch at once; changes are debounced (`watch.debounce_ms`) into
@@ -446,6 +475,16 @@ client receives the variant of its subscription.
   without root/unreadable/dev-root paths. `/service/status` adds `claude{state (verified|not_found|failed|
   timed_out|no_resume), program, version, resume_supported}` and `monitoring.session_watches`; with `privacy=1`
   without program paths and broad read rules.
+
+### M3.1 additions
+- `GET /projects?missing_only=1` (missing projects only; `?2` of the filter SQL is 0 present / 1 both / 2 missing).
+- `DELETE /projects/{id}` (Origin) → 204: forget a missing project; a present one → 400; unknown → 404.
+- `PUT`/`DELETE /projects/{id}/ignore?privacy=` and `PUT /settings?privacy=` return the privacy variant.
+- Session resume adds `continuation_cwd` (with `continuation_other_project` / `continuation_unassigned`) and the
+  warning `cwd_unsafe_characters` (no `command`); `cwd`, `first_cwd`, `last_cwd` and `continuation_cwd` are shown
+  through `resume::display` (escaped only when they hold control/bidi characters).
+- `/discovery/status` `sessions` adds `duplicate_ids` and `unassigned_folders[{reason, folder ("~/…", escaped),
+  sessions}]` (top 10; `folder` omitted with `privacy=1`); `unassigned` may hold `container`.
 
 Keyset cursors: base64url JSON `{s,o,k,i}`; a cursor whose `s`/`o` differ from the request, or is malformed, ⇒ 400.
 
@@ -667,6 +706,27 @@ codes go in `RestartPreventExitStatus=`.
 - Test 5 (strace variant) now includes the session cycle and the `claude` check: 2 `claude` execs
   (`--version`, `--help`), all other execs allowlisted Git, no non-loopback connect.
 
+## 13f. M3.1 verification notes (what was actually run, 2026-11-24)
+
+- `cargo test` with `CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_INOTIFY=1`, fmt, clippy `-D warnings`, `cargo deny check`;
+  `git status --ignored` identical before and after the full test run (no files in the working tree).
+- Mutation checks: with the writer's prompt guard disabled the in-flight test fails (a prompt is cached after the
+  setting turned off); without `secure_delete` the clear-index byte scan fails; without the WAL checkpoint both byte
+  scans fail. The pty test's control runs (the pre-M3.1 command with Ctrl-U + newline, and with an embedded
+  `ESC[201~` under bracketed paste) execute their sentinel in `bash` 5.2.21, so the harness is not blind.
+- Real daemon in a synthetic environment (12 bulk projects, a fake `claude`, a session started in `~/dev`, one whose
+  cwd holds `\x15`, a deleted project): `ccwm status` printed `3 not in a project` broken down as `1 container
+  (~/dev)`, `1 home (~)`, `1 nonexistent (~/dev/deleted-project)`. Real browser (Chrome extension): "sessions in
+  projects", the `≈` inferred marker with its tooltip, table "—" for a missing commit, "Missing only" listing the
+  deleted project, a two-click Forget removing it, the actions column on one line in all 21 rows (no clipping, no
+  horizontal scroll at 1230 px, also with "Confirm forget"), the detail panel's escaped cwd with the
+  `cwd_unsafe_characters` text and no command, a Settings save sending `{"server":{"port":8777}}` only and saying
+  "Saved; takes effect after ccwm restart: port.", a resave saying "Nothing changed."; no console errors; no prompt
+  text in the daemon log.
+- **Landlock and `/proc` (the deferred "Claude running" indicator):** a process that applied ccwm's daemon policy
+  (ABI 8, `/proc` in the read set) reading an unrelated process started before it: `readlink /proc/<pid>/cwd` and
+  `/exe` → `EACCES`; `/proc/<pid>/cmdline` and `status` readable; `stat` shortened. See §14.
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -697,6 +757,27 @@ relative time, `/`-boundary paths, unreadable list, one-line banner, CLI start-u
 Decided 2026-11-24 (before M3): O5 (the M2/pre-M2 spec changes) approved; O6 approved with the license exceptions
 scoped per crate in `deny.toml`; the M3 parser, discovery and wording decisions recorded in REQUIREMENTS.md §4, §5.1,
 §7, §8, §13 and Appendix A ("M3, approved").
+
+Decided 2026-11-24 (M3.1): every M3 security review finding accepted (M1, M3, M4 with the spec changes in
+REQUIREMENTS.md §4.4/§7.3/§8; M2, L1–L8 as written; the informational `claude --version` note in SECURITY.md); the
+real-home defects (test isolation, Forget, Missing only, `ccwm status` folders, early stop, UI details, restart
+wording); the `monorepo/services/api` expectation (the nested rule now also applies against marker directories on
+disk, so it holds on the first launch).
+
+**"Claude running" indicator — deferred to v0.2 (maintainer decision 2026-11-24).** Approved for M3.1 as a `/proc`
+scan reading `/proc/<pid>/cwd`; found infeasible: Landlock confines ptrace-class access to processes inside the
+caller's domain (a base Landlock rule, no right relaxes it), and `/proc/<pid>/cwd` and `/exe` need that access, so
+inside ccwm's sandbox both fail with `EACCES` for a `claude` started from the user's shell (verified, §13f; `cmdline`
+and `status` stay readable). Rejected alternatives: **(1)** an unsandboxed helper spawned before Landlock — breaks
+the §11.5 claim that the whole daemon is confined; **(2)** presence only (match `cmdline` argv[0] and the UID, one
+global "Claude running (N)") — too little value without the project. **Preferred future design:** opt-in Claude Code
+`SessionStart`/`SessionEnd` hooks that call a `ccwm` subcommand, which forwards `session_id`, `cwd` and `pid` to the
+daemon over the Unix socket (`SO_PEERCRED`-verified like every CLI call); the daemon resolves the cwd with the
+session-discovery rules, checks liveness through `/proc/<pid>/status` (UID) and `cmdline` (both readable under
+Landlock), drops entries whose process is gone, and never infers running state from file or session activity. ccwm
+documents the hook configuration for the user to add; it never edits `~/.claude`. The hook input fields must be
+verified against the installed Claude Code version (per §19: from documentation or the maintainer, not by reading
+real session data) before building it.
 
 Open:
 - **O1 (M3, needs approval):** roots, exclusions, depth, same-file-system, watch budget, port and session directory

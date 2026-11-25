@@ -281,13 +281,19 @@ pub struct ResumeView {
     /// and omitted in privacy mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// The cwd the command changes to (omitted in privacy mode).
+    /// The cwd the command changes to (omitted in privacy mode; escaped when it holds control or
+    /// bidi characters, see `resume::display`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// With `continuation_other_project` / `continuation_unassigned`: the first cwd of the
+    /// continuation that was not followed (omitted otherwise and in privacy mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_cwd: Option<String>,
     /// The command resumes a later session this one was continued in.
     pub via_continuation: bool,
     /// `claude_not_found`, `claude_unverified`, `resume_unsupported`, `cwd_missing`, `no_cwd`,
-    /// `continuation_not_indexed`.
+    /// `cwd_unsafe_characters`, `continuation_not_indexed`, `continuation_other_project`,
+    /// `continuation_unassigned`.
     pub warnings: Vec<&'static str>,
 }
 

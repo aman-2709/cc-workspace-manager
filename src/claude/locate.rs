@@ -18,7 +18,7 @@ pub const MAX_FILES: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionFile {
-    /// The file stem (a UUID, lower case).
+    /// The file stem (a lower-case UUID).
     pub id: String,
     pub path: PathBuf,
 }
@@ -35,10 +35,36 @@ pub struct Listing {
     pub errors: u64,
 }
 
-/// `<name>.jsonl` with a UUID stem.
+/// `<name>.jsonl` with a lower-case UUID stem. Claude Code writes lower case; other spellings are
+/// not sessions (folding them would let two files share one id, M3 review L4).
 pub fn session_id_of(name: &OsStr) -> Option<String> {
     let stem = name.to_str()?.strip_suffix(".jsonl")?;
-    is_uuid(stem).then(|| stem.to_ascii_lowercase())
+    (is_uuid(stem) && !stem.bytes().any(|b| b.is_ascii_uppercase())).then(|| stem.to_string())
+}
+
+/// Keep one file per session id (the same `<uuid>.jsonl` copied into a second
+/// `<encoded-dir>`, a common manual fix after moving a project): the file the index already
+/// holds for that id (`indexed`) wins, otherwise the first by path. Returns how many files were
+/// dropped (counted as duplicates).
+pub fn dedupe(files: &mut Vec<SessionFile>, indexed: impl Fn(&str) -> Option<PathBuf>) -> u64 {
+    files.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.path.cmp(&b.path)));
+    let before = files.len();
+    let mut keep: Vec<SessionFile> = Vec::with_capacity(before);
+    let mut i = 0;
+    while i < files.len() {
+        let j = i + files[i..]
+            .iter()
+            .take_while(|f| f.id == files[i].id)
+            .count();
+        let group = &files[i..j];
+        let chosen = indexed(&group[0].id)
+            .and_then(|p| group.iter().find(|f| f.path == p))
+            .unwrap_or(&group[0]);
+        keep.push(chosen.clone());
+        i = j;
+    }
+    *files = keep;
+    (before - files.len()) as u64
 }
 
 /// List one `<encoded-dir>` (opened from `parent` by name, or as a root).
@@ -156,12 +182,15 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_come_only_from_uuid_stems() {
+    fn session_ids_come_only_from_lower_case_uuid_stems() {
         assert_eq!(
-            session_id_of(OsStr::new(&format!("{}.jsonl", A.to_uppercase()))).as_deref(),
+            session_id_of(OsStr::new(&format!("{A}.jsonl"))).as_deref(),
             Some(A)
         );
+        let mixed = format!("{}{}.jsonl", &A[..1].to_uppercase(), &A[1..]);
         for bad in [
+            format!("{}.jsonl", A.to_uppercase()).as_str(),
+            mixed.as_str(),
             "x.jsonl",
             "agent-123.jsonl",
             &format!("{A}.json"),
@@ -169,5 +198,31 @@ mod tests {
         ] {
             assert!(session_id_of(OsStr::new(bad)).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn one_file_per_session_id_the_indexed_one_first() {
+        let f = |dir: &str, id: &str| SessionFile {
+            id: id.into(),
+            path: PathBuf::from(format!("/p/{dir}/{id}.jsonl")),
+        };
+        let all = vec![f("b", A), f("a", A), f("c", B), f("c", A)];
+        let mut files = all.clone();
+        assert_eq!(dedupe(&mut files, |_| None), 2);
+        assert_eq!(files, [f("a", A), f("c", B)], "first by path");
+        let mut files = all.clone();
+        let indexed = f("c", A).path;
+        assert_eq!(
+            dedupe(&mut files, |id| (id == A).then(|| indexed.clone())),
+            2
+        );
+        assert_eq!(files, [f("c", A), f("c", B)], "the indexed file wins");
+        let mut files = all;
+        assert_eq!(
+            dedupe(&mut files, |_| Some(PathBuf::from("/gone.jsonl"))),
+            2,
+            "an indexed file that is gone: first by path"
+        );
+        assert_eq!(files[0], f("a", A));
     }
 }

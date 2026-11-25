@@ -138,9 +138,11 @@ function buildQuery(state, limit, cursor, privacy) {
   if (q) qs.set("q", q);
   qs.set("sort", state.sort);
   qs.set("order", state.order);
-  if (state.activity && state.activity !== "all") qs.set("activity", state.activity);
+  // "Missing only" lives in the activity filter but is its own server flag.
+  if (state.activity === "missing") qs.set("missing_only", "1");
+  else if (state.activity && state.activity !== "all") qs.set("activity", state.activity);
   if (state.dirty) qs.set("dirty", "1");
-  if (state.missing) qs.set("include_missing", "1");
+  if (state.missing && state.activity !== "missing") qs.set("include_missing", "1");
   if (state.ignored) qs.set("include_ignored", "1");
   if (state.sessions) qs.set("has_sessions", "1");
   if (privacy) qs.set("privacy", "1");
@@ -171,7 +173,10 @@ const RESUME_WARNINGS = {
   resume_unsupported: "This claude version does not list --resume in its help.",
   cwd_missing: "The session's working folder no longer exists.",
   no_cwd: "The session recorded no working folder.",
+  cwd_unsafe_characters: "The working folder's name contains control or text-direction characters (shown escaped): no command is offered, because pasting it into a terminal could run something else.",
   continuation_not_indexed: "This session was continued in another session that ccwm has not indexed.",
+  continuation_other_project: "This session was continued in a session of another project; that one is not offered here.",
+  continuation_unassigned: "This session was continued in a session outside every project; that one is not offered here.",
 };
 
 function resumeWarningText(code) {
@@ -298,6 +303,28 @@ function wsUrl(loc) {
   return `ws://${loc.host}${API}/ws`;
 }
 
+// Only the fields of `patch` whose value differs from the saved `config` (the PUT body): a form
+// rendered earlier never sends back values it did not change, so it cannot revert a change made
+// elsewhere since (e.g. "Store prompt text" turned off in another tab).
+function changedSettings(patch, config) {
+  const out = {};
+  for (const [section, fields] of Object.entries(patch)) {
+    const saved = (config && config[section]) || {};
+    for (const [key, value] of Object.entries(fields)) {
+      if (JSON.stringify(value) !== JSON.stringify(saved[key])) {
+        out[section] = { ...(out[section] || {}), [key]: value };
+      }
+    }
+  }
+  return out;
+}
+
+// What a save says: nothing pending, or which saved values wait for a restart.
+function restartNote(keys, labels) {
+  if (!keys || !keys.length) return "";
+  return `Saved; takes effect after ccwm restart: ${keys.map((k) => (labels && labels[k]) || k).join(", ")}.`;
+}
+
 // Settings form values -> the PUT /settings patch (numbers parsed; path lists one per line).
 // `null` entries (e.g. hidden in privacy mode) are left out.
 function settingsPatch(v) {
@@ -318,13 +345,18 @@ function settingsPatch(v) {
   };
 }
 
+// The latest-commit text of a card or row: "—" when there is none (not Git, unborn, unknown).
+function commitText(git) {
+  return (git && git.commit && git.commit.subject) || "—";
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     parseFragmentToken, shouldRotate, describeDiscovery, readSession, shouldClearOnUnauthorized, preferStored,
     readPrefs, buildQuery, withView, withSort, relativeTime, gitSummary, paginate, reconnectDelay, wsUrl,
     plural, describeUnreadable, degradedSummary, truncatePath, calendarDaysAgo,
     withServerDefaults, privacySuffix, sessionSummary, resumeWarningText, durationText, promptStateText,
-    describeScope, settingsPatch,
+    describeScope, settingsPatch, changedSettings, restartNote, commitText,
     STORAGE_KEY, PREFS_KEY, DEFAULT_QUERY,
   };
 }
@@ -498,10 +530,14 @@ function startApp() {
     if (typeof at !== "number") return h("span", { text: "Last change unknown" });
     const exact = new Date(at * 1000).toLocaleString();
     const how = kind === "observed" ? "observed" : "inferred from file times";
-    return h("time", {
+    const t = h("time", {
       datetime: new Date(at * 1000).toISOString(), title: `${exact} (${how})`, tabindex: "0",
-      "aria-label": `Last change ${exact}, ${how}`, text: `${relativeTime(at, now(), activity.days_ago)}${kind === "inferred" ? " (inferred)" : ""}`,
+      "aria-label": `Last change ${exact}, ${how}`, text: relativeTime(at, now(), activity.days_ago),
     });
+    if (kind !== "inferred") return t;
+    // A marker, not words: the tooltip and the accessible name say what it means.
+    return h("span", { class: "inferred" }, t,
+      h("span", { class: "mark", title: "Inferred from file modification times, not observed live", "aria-hidden": "true", text: "≈" }));
   }
 
   // The visible text is fitted to the element's width by `fitPaths` (cut at a "/").
@@ -552,6 +588,37 @@ function startApp() {
     }
   }
 
+  // A missing project can be forgotten (ccwm's database only; its folder is already gone).
+  // Two clicks, like "Clear session index": no blocking confirm dialog.
+  function forgetButton(p) {
+    const btn = h("button", { type: "button", class: "link small", "aria-label": `Forget ${p.name}`, text: "Forget",
+      title: "Remove this missing project from ccwm (nothing on disk is touched)" });
+    let armed = false;
+    btn.addEventListener("click", async () => {
+      if (!armed) {
+        armed = true;
+        btn.textContent = "Confirm forget";
+        setTimeout(() => { armed = false; btn.textContent = "Forget"; }, 4000);
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await api(`/projects/${encodeURIComponent(p.id)}`, { method: "DELETE" });
+        items = items.filter((x) => x.id !== p.id);
+        if (detailFor === p.id) detailDlg.close();
+        renderContent();
+      } catch (e) {
+        if (e.message !== "unauthenticated") { btn.disabled = false; btn.textContent = "Not forgotten"; }
+      }
+    });
+    return btn;
+  }
+
+  // Ignore a present project; forget a missing one.
+  function stateButton(p) {
+    return p.missing_since ? forgetButton(p) : ignoreButton(p);
+  }
+
   function ignoreButton(p) {
     return h("button", {
       type: "button", class: "link small",
@@ -589,7 +656,7 @@ function startApp() {
             text: commit && commit.subject ? `Latest commit: ${commit.subject}` : "No commit recorded" }),
         ]),
       h("p", { class: "line small muted", title: sessionSummary(p.sessions, now()), text: sessionSummary(p.sessions, now()) }),
-      h("div", { class: "foot" }, badges(p), detailsButton(p), ignoreButton(p)));
+      h("div", { class: "foot" }, badges(p), detailsButton(p), stateButton(p)));
   }
 
   function sortHeader(label, sort, cls) {
@@ -619,10 +686,10 @@ function startApp() {
           h("td", {}, h("span", { class: "line" }, h("span", { class: "dot", "data-status": p.activity.status }),
             STATUS_LABEL[p.activity.status] || p.activity.status)),
           h("td", {}, h("span", { class: `line${p.git && p.git.dirty ? " dirty" : ""}`, title: gitSummary(p.git), text: gitSummary(p.git) })),
-          h("td", {}, h("span", { class: "line", title: (p.git && p.git.commit && p.git.commit.subject) || "",
-            text: (p.git && p.git.commit && p.git.commit.subject) || "None" })),
+          h("td", {}, h("span", { class: "line", title: (p.git && p.git.commit && p.git.commit.subject) || "No commit recorded",
+            text: commitText(p.git) })),
           h("td", {}, h("span", { class: "line", title: sessionSummary(p.sessions, now()), text: sessionSummary(p.sessions, now()) })),
-          h("td", {}, h("span", { class: "actions" }, detailsButton(p), copyResumeButton(p), ignoreButton(p))))))));
+          h("td", { class: "col-act" }, h("span", { class: "actions" }, detailsButton(p), copyResumeButton(p), stateButton(p))))))));
   }
 
   function statsList() {
@@ -635,7 +702,7 @@ function startApp() {
       item(stats.inactive, "inactive"),
       item(stats.dormant, "dormant"),
       item(stats.uncommitted_changes, "with uncommitted changes"),
-      item(stats.total_sessions, "sessions"),
+      item(stats.total_sessions, "sessions in projects"),
       stats.missing ? item(stats.missing, "missing") : null);
   }
 
@@ -659,7 +726,7 @@ function startApp() {
       reload();
     });
     const activity = h("select", { id: "activity", "aria-label": "Activity" },
-      ...[["all", "All activity"], ["today", "Changed today"], ["week", "This week"], ["inactive", "Inactive"], ["dormant", "Dormant"], ["unknown", "Unknown"]]
+      ...[["all", "All activity"], ["today", "Changed today"], ["week", "This week"], ["inactive", "Inactive"], ["dormant", "Dormant"], ["unknown", "Unknown"], ["missing", "Missing only"]]
         .map(([v, t]) => h("option", { value: v, text: t })));
     activity.addEventListener("change", () => { state = { ...state, activity: activity.value, page: 0 }; reload(); });
     const check = (id, label, key) => {
@@ -925,7 +992,7 @@ function startApp() {
 
   async function setIgnored(p, ignored) {
     try {
-      await api(`/projects/${encodeURIComponent(p.id)}/ignore`, { method: ignored ? "PUT" : "DELETE" });
+      await api(`/projects/${encodeURIComponent(p.id)}/ignore${privacySuffix(priv())}`, { method: ignored ? "PUT" : "DELETE" });
       if (page === "settings") showSettings(); else reload();
     } catch (e) {
       if (e.message !== "unauthenticated") showError("Could not change the project", e.message);
@@ -976,10 +1043,16 @@ function startApp() {
       copy.addEventListener("click", () => copyText(input, copy));
       parts.push(h("div", { class: "copy-row" }, input, copy));
       parts.push(h("p", { class: "small muted", text: "ccwm only shows this command for you to copy; it never runs it." }));
+    } else if (priv()) {
+      parts.push(h("p", { class: "muted", text: "Hidden in privacy mode." }));
+    } else if (r.cwd) {
+      // No command for this folder (see the warnings); its name is shown escaped.
+      parts.push(h("p", { class: "muted" }, "No resume command for the working folder ", h("bdi", { class: "path", text: r.cwd }), "."));
     } else {
-      parts.push(h("p", { class: "muted", text: priv() ? "Hidden in privacy mode." : "No resume command: the session has no valid id or working folder." }));
+      parts.push(h("p", { class: "muted", text: "No resume command: the session has no valid id or working folder." }));
     }
     if (r.via_continuation) parts.push(h("p", { class: "small", text: `This session was continued in a later one; the command resumes that session (${r.session_id}).` }));
+    if (r.continuation_cwd) parts.push(h("p", { class: "small" }, "The continuation not offered was started in ", h("bdi", { class: "path", text: r.continuation_cwd }), "."));
     if (r.warnings && r.warnings.length) {
       parts.push(h("ul", { class: "warnings" }, ...r.warnings.map((w) => h("li", { text: resumeWarningText(w) }))));
     }
@@ -996,7 +1069,9 @@ function startApp() {
     close.addEventListener("click", () => detailDlg.close());
     const sections = [
       h("header", { class: "detail-head" }, h("h2", { id: "detail-title", text: d.name }), close),
-      d.missing_since ? h("p", { class: "banner", text: `This project's folder was not found (missing since ${when(d.missing_since)}).` }) : null,
+      d.missing_since ? h("div", { class: "banner" },
+        h("p", { text: `This project's folder was not found (missing since ${when(d.missing_since)}).` }),
+        h("p", { class: "small" }, "Forget it to remove it from ccwm (nothing on disk is touched): ", forgetButton(d))) : null,
       h("section", {}, h("h3", { text: "Project" }), h("dl", {},
         field("Path", h("span", { class: "path", text: d.path || "Hidden in privacy mode" })),
         field("Found from", h("span", { text: d.sources.map((x) => (x === "session" ? "Claude Code sessions" : "CLAUDE.md")).join(" and ") })),
@@ -1080,10 +1155,7 @@ function startApp() {
     const c = st.config;
     const hidden = priv();
     const msg = h("p", { role: "status", class: "small" });
-    const restartNote = (keys) => (keys && keys.length
-      ? `Saved. Takes effect after a restart of the daemon: ${keys.map((k) => RESTART_LABELS[k] || k).join(", ")}.`
-      : "");
-    msg.textContent = restartNote(st.restart_required);
+    msg.textContent = restartNote(st.restart_required, RESTART_LABELS);
     const form = h("form", { class: "settings", novalidate: true },
       h("fieldset", {}, h("legend", { text: "Discovery" }),
         h("ul", { class: "scope" }, ...describeScope(st).map((l) => h("li", { class: "small", text: l }))),
@@ -1113,7 +1185,7 @@ function startApp() {
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       const val = (id) => form.querySelector(`#${id}`);
-      const patch = settingsPatch({
+      const patch = changedSettings(settingsPatch({
         roots: hidden || val("s-roots").disabled ? null : val("s-roots").value,
         exclude: hidden || val("s-exclude").disabled ? null : val("s-exclude").value,
         full_scan: val("s-full").checked, scan_interval_secs: val("s-interval").value,
@@ -1122,11 +1194,13 @@ function startApp() {
         inactive_after_days: val("s-inactive").value, dormant_after_days: val("s-dormant").value,
         store_prompt_text: val("s-store").checked, port: val("s-port").value,
         default_view: val("s-view").value, theme: val("s-theme").value, ui_privacy: val("s-privacy").checked,
-      });
+      }), st.config);
+      if (Object.keys(patch).length === 0) { msg.textContent = "Nothing changed."; return; }
       msg.textContent = "Saving…";
       try {
         const r = await rawSettingsPut(patch);
-        msg.textContent = restartNote(r.restart_required) || "Saved.";
+        Object.assign(st, r);
+        msg.textContent = restartNote(r.restart_required, RESTART_LABELS) || "Saved.";
       } catch (e) {
         if (e.message !== "unauthenticated") msg.textContent = `Not saved: ${e.message}`;
       }
@@ -1140,7 +1214,7 @@ function startApp() {
     const back = h("button", { type: "button", text: "Back to projects", onclick: () => showProjects() });
     return h("section", { class: "settings-page", "aria-labelledby": "settings-title" },
       h("div", { class: "detail-head" }, h("h2", { id: "settings-title", text: "Settings" }), back),
-      h("p", { class: "small muted", text: "Saved to config.toml (comments there are not kept). Changes marked \"requires restart\" apply when the daemon restarts." }),
+      h("p", { class: "small muted", text: "Saved to config.toml (comments there are not kept). Changes marked \"requires restart\" take effect after ccwm restarts." }),
       form, ignored);
   }
 
@@ -1177,7 +1251,7 @@ function startApp() {
   // PUT /settings: the server's validation message is shown as is.
   async function rawSettingsPut(patch) {
     await ensureFreshToken();
-    const r = await rawFetch("/settings", { method: "PUT", body: JSON.stringify(patch) });
+    const r = await rawFetch(`/settings${privacySuffix(priv())}`, { method: "PUT", body: JSON.stringify(patch) });
     if (r.status === 401) { showUnauthenticated("Your session has expired or was revoked."); throw new Error("unauthenticated"); }
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error((body.error && body.error.message) || `request failed (${r.status})`);

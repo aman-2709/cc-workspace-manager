@@ -7,6 +7,7 @@ use crate::auth::bootstrap::{BootstrapStore, BOOTSTRAP_TTL_SECS};
 use crate::auth::sessions::{AuthedSession, IssuedSession, Sessions};
 use crate::auth::tokens::{base64url_decode, base64url_encode};
 use crate::claude::cli::{CliCheck, CliState, Verifier};
+use crate::claude::resume;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::db::queries::{self, Filters, ListParams, Order, SortBy};
@@ -60,6 +61,8 @@ pub struct ProjectsQuery {
     pub activity: Option<String>,
     pub dirty: Option<String>,
     pub include_missing: Option<String>,
+    /// Only missing projects ("Missing only" in the activity filter).
+    pub missing_only: Option<String>,
     pub include_ignored: Option<String>,
     pub has_sessions: Option<String>,
     pub privacy: Option<String>,
@@ -207,6 +210,30 @@ const RESTART_KEYS: [(&str, ConfigValue); 10] = [
     ("sessions.dir", |c| format!("{:?}", c.sessions.dir)),
 ];
 
+/// The keys `PUT /settings` may change: exactly those of the Settings page (§9). Everything else
+/// (e.g. `git.allow_unhardened_status`, `watch.debounce_ms`) changes only by editing
+/// `config.toml` (M3 security review, L7: a stolen browser token must not be able to weaken the
+/// hardening persistently).
+const SETTABLE: [(&str, &[&str]); 6] = [
+    ("server", &["port"]),
+    (
+        "discovery",
+        &[
+            "roots",
+            "exclude",
+            "max_depth",
+            "same_file_system",
+            "scan_interval_secs",
+            "missing_retention_days",
+            "full_scan",
+        ],
+    ),
+    ("watch", &["budget"]),
+    ("activity", &["inactive_after_days", "dormant_after_days"]),
+    ("sessions", &["dir", "store_prompt_text"]),
+    ("ui", &["default_view", "theme", "privacy"]),
+];
+
 /// The configuration the daemon started with, the one saved since, and where it lives.
 struct SettingsState {
     running: Config,
@@ -271,6 +298,10 @@ pub struct Service {
     home: PathBuf,
     classifier: RwLock<Classifier>,
     settings: Mutex<SettingsState>,
+    /// Held across a whole settings save (merge, validate, write, apply): saves never interleave.
+    settings_update: tokio::sync::Mutex<()>,
+    /// Tests only: widen the window between reading a prompt and caching it.
+    prompt_read_delay_ms: std::sync::atomic::AtomicU64,
     session_dir: PathBuf,
     roots: Vec<PathBuf>,
     claude: Option<Arc<Verifier>>,
@@ -285,6 +316,8 @@ pub struct Service {
 impl Service {
     pub fn new(d: Deps) -> Self {
         let started_at = d.clock.now();
+        d.writer
+            .set_store_prompts(d.config.sessions.store_prompt_text);
         Self {
             bootstrap: BootstrapStore::new(Arc::clone(&d.clock)),
             sessions: Sessions::new(
@@ -308,6 +341,8 @@ impl Service {
                 running: d.config,
                 path: d.config_path,
             }),
+            settings_update: tokio::sync::Mutex::new(()),
+            prompt_read_delay_ms: std::sync::atomic::AtomicU64::new(0),
             session_dir: d.session_dir,
             roots: d.roots,
             claude: d.claude,
@@ -320,6 +355,16 @@ impl Service {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Tests only: sleep this long after reading a prompt from a session file, before caching it
+    /// (the in-flight read of M3 review M2).
+    #[doc(hidden)]
+    pub fn set_prompt_read_delay(&self, d: std::time::Duration) {
+        self.prompt_read_delay_ms.store(
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn health(&self) -> Health {
@@ -498,6 +543,10 @@ impl Service {
             let cached = store
                 .then(|| r.prompt_text.clone().map(|t| (t, r.prompt_at)))
                 .flatten();
+            let delay = std::time::Duration::from_millis(
+                self.prompt_read_delay_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             let (last, first) = tokio::task::spawn_blocking(move || {
                 let last = match cached {
                     Some((text, at)) => PromptView {
@@ -511,10 +560,13 @@ impl Service {
                 };
                 let first =
                     want_first.then(|| prompt_view(crate::claude::prompt::first_prompt(&path)));
+                std::thread::sleep(delay);
                 (last, first)
             })
             .await
             .map_err(|_| ApiError::internal("prompt read failed"))?;
+            // The writer stores it only if "Store prompt text" is still on when it executes this
+            // (the setting may have been turned off while the file was read).
             if store && r.prompt_text.is_none() && last.state == "found" {
                 self.writer
                     .cache_prompt(&r.id, last.text.clone().map(|t| (t, last.at)));
@@ -533,8 +585,8 @@ impl Service {
             title: privacy.keep(r.title.clone()),
             git_branch: r.git_branch.clone(),
             version: r.version.clone(),
-            first_cwd: privacy.keep(r.first_cwd.clone()),
-            last_cwd: privacy.keep(r.last_cwd.clone()),
+            first_cwd: privacy.keep(r.first_cwd.as_deref().map(resume::display)),
+            last_cwd: privacy.keep(r.last_cwd.as_deref().map(resume::display)),
             cwd_changed: r.first_cwd.is_some() && r.first_cwd != r.last_cwd,
             last_prompt,
             first_prompt,
@@ -542,8 +594,12 @@ impl Service {
         })
     }
 
-    /// The resume command for `r`: if it was continued in another recorded session, the latest
-    /// continuation; always from that session's **first** recorded cwd (§8).
+    /// The resume command for `r`: if it was continued in another recorded session **of the
+    /// same project**, the latest such continuation; always from that session's **first**
+    /// recorded cwd (§8). A link to another project's or an unassigned session is not followed
+    /// (a planted session file must not redirect the resume, M3 review L5): the session itself
+    /// is offered with a warning and the target's cwd. A cwd with terminal control or bidi
+    /// characters gets no command (M3 review M1) and is shown escaped.
     async fn resume(
         &self,
         r: &queries::SessionRow,
@@ -551,6 +607,7 @@ impl Service {
     ) -> Result<ResumeView, ApiError> {
         let mut target = r.clone();
         let mut warnings = Vec::new();
+        let mut continuation_cwd = None;
         let mut seen = vec![r.id.clone()];
         while let Some(next) = target.continued_in.clone() {
             if seen.contains(&next) || seen.len() > MAX_CONTINUATIONS {
@@ -563,7 +620,16 @@ impl Service {
                 .with(move |c| queries::session_by_id(c, &n))
                 .await?
             {
-                Some(s) => target = s,
+                Some(s) if s.project_id.is_some() && s.project_id == r.project_id => target = s,
+                Some(s) => {
+                    warnings.push(if s.project_id.is_some() {
+                        "continuation_other_project"
+                    } else {
+                        "continuation_unassigned"
+                    });
+                    continuation_cwd = s.first_cwd.as_deref().map(resume::display);
+                    break;
+                }
                 None => {
                     warnings.push("continuation_not_indexed");
                     break;
@@ -571,13 +637,17 @@ impl Service {
             }
         }
         let cwd = target.first_cwd.clone();
-        let command = cwd
-            .as_deref()
-            .and_then(|c| crate::claude::resume::command(c, &target.id));
+        let command = cwd.as_deref().and_then(|c| resume::command(c, &target.id));
         match cwd.as_deref() {
             None => warnings.push("no_cwd"),
-            Some(c) if !Path::new(c).is_dir() => warnings.push("cwd_missing"),
-            Some(_) => {}
+            Some(c) => {
+                if resume::unsafe_cwd(c) {
+                    warnings.push("cwd_unsafe_characters");
+                }
+                if !Path::new(c).is_dir() {
+                    warnings.push("cwd_missing");
+                }
+            }
         }
         match self
             .claude
@@ -594,7 +664,8 @@ impl Service {
             via_continuation: target.id != r.id,
             session_id: target.id,
             command: privacy.keep(command),
-            cwd: privacy.keep(cwd),
+            cwd: privacy.keep(cwd.as_deref().map(resume::display)),
+            continuation_cwd: privacy.keep(continuation_cwd),
             warnings,
         })
     }
@@ -658,15 +729,19 @@ impl Service {
         })
     }
 
-    /// Merge `patch` (a partial configuration object) into the saved configuration, validate it,
-    /// write the file atomically and apply what can change without a restart.
+    /// Merge `patch` (a partial configuration object with only the §9 Settings keys) into the
+    /// saved configuration, validate it, write the file atomically and apply what can change
+    /// without a restart. One save at a time, from merge to apply (M3 review, M2): a save can
+    /// never be lost to, or interleaved with, another. The UI sends only the fields the user
+    /// changed, so a stale form cannot revert anything else.
     pub async fn update_settings(
         &self,
         patch: serde_json::Value,
+        privacy: Privacy,
     ) -> Result<SettingsView, ApiError> {
-        if !patch.is_object() {
-            return Err(ApiError::invalid("the settings must be a JSON object"));
-        }
+        check_settable(&patch)?;
+        self.check_patch_values(&patch)?;
+        let _one_at_a_time = self.settings_update.lock().await;
         let (old, new, path) = {
             let st = self.settings.lock().map_err(ApiError::internal)?;
             let mut merged = serde_json::to_value(&st.saved).map_err(ApiError::internal)?;
@@ -698,7 +773,44 @@ impl Service {
             st.saved = new.clone();
         }
         self.apply_live(&old, &new).await?;
-        self.settings(Privacy::Off).await
+        self.settings(privacy).await
+    }
+
+    /// Values a browser may not set even though `config.toml` may hold them: port 0 (tests only)
+    /// and a session directory that is `/` or an ancestor of home (a Landlock read rule over
+    /// everything at the next start).
+    fn check_patch_values(&self, patch: &serde_json::Value) -> Result<(), ApiError> {
+        if let Some(port) = patch.pointer("/server/port") {
+            if port.as_u64().is_none_or(|p| !(1024..=65535).contains(&p)) {
+                return Err(ApiError::invalid(
+                    "server.port must be between 1024 and 65535",
+                ));
+            }
+        }
+        if let Some(dir) = patch.pointer("/sessions/dir").and_then(|d| d.as_str()) {
+            let p = Path::new(dir);
+            let plain = p.is_absolute()
+                && p.components().all(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                });
+            if !plain {
+                return Err(ApiError::invalid(
+                    "sessions.dir must be an absolute path without `.` or `..`",
+                ));
+            }
+            let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if canonical == Path::new("/")
+                || (self.home.starts_with(&canonical) && canonical != self.home)
+            {
+                return Err(ApiError::invalid(
+                    "sessions.dir must not be / or a folder that contains your home folder",
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn apply_live(&self, old: &Config, new: &Config) -> Result<(), ApiError> {
@@ -719,8 +831,13 @@ impl Service {
             });
         }
         if old.sessions.store_prompt_text && !new.sessions.store_prompt_text {
+            // First forbid caching in the writer, then clear: a prompt read still in flight can
+            // no longer be stored afterwards.
+            self.writer.set_store_prompts(false);
             let n = self.writer.clear_prompt_cache().await?;
             tracing::info!(cleared = n, "stored prompt text deleted");
+        } else if !old.sessions.store_prompt_text && new.sessions.store_prompt_text {
+            self.writer.set_store_prompts(true);
         }
         Ok(())
     }
@@ -741,7 +858,12 @@ impl Service {
     }
 
     /// Ignore (`true`) or un-ignore a project by its canonical path (§4.5). Idempotent.
-    pub async fn set_ignored(&self, id: &str, ignored: bool) -> Result<ProjectView, ApiError> {
+    pub async fn set_ignored(
+        &self,
+        id: &str,
+        ignored: bool,
+        privacy: Privacy,
+    ) -> Result<ProjectView, ApiError> {
         let row = self.row(id).await?;
         let changed = self
             .writer
@@ -756,7 +878,24 @@ impl Service {
             self.notifier.project(&row.id);
         }
         let row = self.row(id).await?;
-        Ok(self.view(&row, self.clock.now(), Privacy::Off))
+        Ok(self.view(&row, self.clock.now(), privacy))
+    }
+
+    /// "Forget" a missing project: remove it from ccwm's database only (its directory is gone;
+    /// nothing on disk is touched). Its sessions are resolved again at the next ingest.
+    pub async fn forget(&self, id: &str) -> Result<(), ApiError> {
+        let row = self.row(id).await?;
+        if row.missing_since.is_none() {
+            return Err(ApiError::invalid(
+                "only a missing project can be forgotten (ignore a present one instead)",
+            ));
+        }
+        if self.writer.forget(&row.id).await? {
+            tracing::info!("a missing project was forgotten");
+            self.notifier.removed(&row.id);
+            self.notifier.status();
+        }
+        Ok(())
     }
 
     fn control(&self, c: Control) {
@@ -814,6 +953,9 @@ impl Service {
             strip(&mut v, &["roots", "unreadable"], "path");
             if let Some(o) = v.as_object_mut() {
                 o.insert("dev_roots".into(), serde_json::json!([]));
+            }
+            if let Some(sessions) = v.get_mut("sessions") {
+                strip(sessions, &["unassigned_folders"], "folder");
             }
         }
         v
@@ -957,6 +1099,32 @@ fn prompt_view(r: std::io::Result<crate::claude::prompt::Found>) -> PromptView {
             whole_file: None,
         },
     }
+}
+
+/// Only the §9 Settings keys ([`SETTABLE`]), each section an object.
+fn check_settable(patch: &serde_json::Value) -> Result<(), ApiError> {
+    let Some(sections) = patch.as_object() else {
+        return Err(ApiError::invalid("the settings must be a JSON object"));
+    };
+    let not_here = |key: &str| {
+        ApiError::invalid(format!(
+            "{key} cannot be changed here; edit config.toml and restart ccwm"
+        ))
+    };
+    for (section, value) in sections {
+        let keys = SETTABLE
+            .iter()
+            .find(|(s, _)| s == section)
+            .map(|(_, k)| *k)
+            .ok_or_else(|| not_here(section))?;
+        let Some(fields) = value.as_object() else {
+            return Err(ApiError::invalid(format!("{section} must be an object")));
+        };
+        if let Some(k) = fields.keys().find(|k| !keys.contains(&k.as_str())) {
+            return Err(not_here(&format!("{section}.{k}")));
+        }
+    }
+    Ok(())
 }
 
 /// Remove `key` from every object in the arrays `arrays` of `v`.
@@ -1106,6 +1274,7 @@ fn validate_projects_query(
             filters: Filters {
                 q: search,
                 include_missing: flag(q.include_missing.as_deref(), "include_missing")?,
+                missing_only: flag(q.missing_only.as_deref(), "missing_only")?,
                 include_ignored: flag(q.include_ignored.as_deref(), "include_ignored")?,
                 dirty: flag(q.dirty.as_deref(), "dirty")?,
                 activity,

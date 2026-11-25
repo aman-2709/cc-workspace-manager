@@ -108,9 +108,17 @@ th button { background: none; border: none; padding: 0; font-weight: 600; }
 th button[aria-current="true"] { color: var(--accent); }
 tbody tr:last-child td { border-bottom: none; }
 td .line { max-width: 100%; }
-.col-name { width: 13%; } .col-path { width: 19%; } .col-mod { width: 11%; } .col-status { width: 8%; }
-.col-git { width: 13%; } .col-commit { width: 12%; } .col-session { width: 11%; } .col-act { width: 12%; }
-td .actions { display: inline-flex; gap: 0.6rem; }
+/* The data columns share what the fixed-width actions column leaves (their percentages sum to
+   less than 100 %, so a fixed table spreads the rest over them). */
+.col-name { width: 10%; } .col-path { width: 14%; } .col-mod { width: 8.5%; } .col-status { width: 6%; }
+.col-git { width: 10%; } .col-commit { width: 9%; } .col-session { width: 8.5%; }
+/* Actions: a fixed width that holds "Details", "Copy resume" and "Un-ignore"/"Confirm forget" on
+   one line, whatever the table width. */
+.col-act { width: 17rem; white-space: nowrap; }
+td .actions { display: inline-flex; gap: 0.6rem; white-space: nowrap; }
+td .actions button { flex: none; }
+.inferred { white-space: nowrap; }
+.inferred .mark { margin-left: 0.2rem; color: var(--muted); cursor: help; }
 .dot { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--unknown); margin-right: 0.35rem; }
 .dot[data-status="today"] { background: var(--today); } .dot[data-status="recent"] { background: var(--recent); }
 .dot[data-status="inactive"] { background: var(--inactive); } .dot[data-status="dormant"] { background: var(--dormant); }

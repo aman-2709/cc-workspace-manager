@@ -121,30 +121,56 @@ payloads, tool inputs, attachment bodies, queue contents and account/organizatio
 parser without being materialized. ccwm stores aggregates only (times, first/last cwd, title, branch, version,
 continuation links); prompt text is read from the session file when you open a project's details (a bounded
 4 MiB window), redacted, cut to 2,000 characters and not stored — unless you turn on "Store prompt text", which
-caches the redacted last prompt in ccwm's database and deletes the cache when turned off. Session text is never
-logged and never rendered as HTML.
+caches the redacted last prompt in ccwm's database. Turning it off first forbids caching inside the database
+writer (so a prompt read still in flight cannot be stored afterwards), then deletes the cache. Deletions of
+session data (turning the setting off, "Clear session index") overwrite the deleted content (`secure_delete`) and
+checkpoint and truncate the write-ahead log, so the text does not linger in free pages or old WAL frames. Backups
+or snapshots of the data directory taken earlier are outside ccwm's control. Session text is never logged and
+never rendered as HTML. The branch, Claude Code version and entrypoint are stored without control characters and
+cut to 256 characters; a cwd longer than 4,096 bytes is ignored. A session whose cwd can never name a project
+(excluded, outside the roots, home, a temporary directory) is read only up to that cwd.
 
-**Redaction is best effort.** Titles and prompts are scanned for private key blocks, GitHub tokens (`ghp_`,
-`gho_`, `github_pat_`…), `sk-…` API keys, AWS access key ids, Slack tokens, JSON Web Tokens, `Bearer …`,
-`password=`/`token:`/`api_key=`-style assignments and credentials in URLs. Other secret formats are **not**
-recognised; treat what ccwm shows as sensitive.
+**Redaction is best effort.** Titles and prompts are scanned for PEM and PGP private key blocks, GitHub tokens
+(`ghp_`, `gho_`, `github_pat_`…), GitLab (`glpat-`) and npm (`npm_`) tokens, Google API keys (`AIza…`), `sk-…` API
+keys, Stripe-style `sk_live_`/`sk_test_`/`rk_…` keys, AWS access key ids, Slack tokens, JSON Web Tokens,
+`Bearer …`, HTTP Basic credentials (after `Authorization:`, or a bare `Basic <base64>` that contains a digit,
+`+`, `/` or `=`), credentials in URLs, and assignments whose key **ends** in `password`, `passwd`, `pwd`, `secret`,
+`token`, `api_key`/`apikey`, `access_key` or `private_key` — `DB_PASSWORD=…`, `aws_secret_access_key = …`,
+`client_secret: …` and JSON/YAML-quoted keys such as `"password": "…"`. An AWS *secret* key is recognised only
+through such an assignment (it has no prefix of its own). Other formats — a bare high-entropy string, a secret
+under an unusual key name, a secret split across lines — are **not** recognised; treat what ccwm shows as
+sensitive. **Session cwds are not redacted** (a redacted path would break the resume command); privacy mode hides
+them.
 
 **Privacy mode** is enforced by the server: the browser never receives the hidden fields (paths, user names,
-remote URLs, session titles, prompts, cwds, resume commands, and the paths in the status and Settings payloads),
-for REST and WebSocket alike. It hides information from people looking at your screen; it is not access control.
+remote URLs, session titles, prompts, cwds, resume commands, and the paths in the status and Settings payloads,
+including the responses to ignore/un-ignore and to saving the settings), for REST and WebSocket alike. It hides information from people looking at your screen; it is not access control.
 
 **Resume commands** are built from the session's first recorded cwd (POSIX single-quoted) and a strictly
 validated UUID, and are only shown for copying; ccwm never runs them. Running one starts Claude Code, which is
-outside ccwm's guarantees. **The `claude` CLI check** runs `claude --version` and `claude --help` (5 s each, once
+outside ccwm's guarantees. Quoting protects against the shell *parser* only; a pasted command reaches the
+terminal's line editor first, which acts on control characters (Ctrl-U, newline, the bracketed-paste end marker
+`ESC[201~`). A cwd containing any C0/C1 control character, DEL or a Unicode bidi/format character therefore gets
+**no command** (warning `cwd_unsafe_characters`; the path is shown escaped). A pty test pastes every command ccwm
+generates into an interactive `bash` and checks that nothing runs. A `continued-in` link is followed only to a
+session of the same project, so a planted session file cannot redirect the resume into another project or an
+unassigned folder. **The `claude` CLI check** runs `claude --version` and `claude --help` (5 s each, once
 per binary version) as children of the sandboxed daemon: no TCP connect, no writes outside ccwm's directories;
 UDP and path-based Unix sockets are not confined (see below). ccwm sets `DISABLE_AUTOUPDATER`,
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` and `DISABLE_TELEMETRY` for these two calls as a best-effort request;
 their effect is Claude Code's, not verified by ccwm. Security acceptance test 5 allows exactly these two `claude`
-invocations.
+invocations. **Without Landlock** (an older kernel, or a report that is not `fully_enforced`) these two calls run
+the real `claude` binary **unconfined**, with your rights; the tests use a fake `claude`, so side effects of the
+real binary (for example on `~/.claude`) are not covered by them.
 
 **Settings.** `PUT /settings` (session token + allowed Origin) rewrites the configuration file atomically with
 mode 0600; it can change discovery roots, so it is as sensitive as the file itself. Roots added there are read only
-after a restart (the sandbox's read set is fixed at startup).
+after a restart (the sandbox's read set is fixed at startup). It accepts **only the keys of the Settings page**
+(REQUIREMENTS.md §9); everything else — `git.allow_unhardened_status`, `watch.debounce_ms`,
+`activity.events_per_project` — changes only by editing `config.toml`, so a stolen browser token cannot weaken the
+hardening persistently. It also refuses port 0 and a session directory that is `/` or contains your home folder.
+Saves are serialized from merge to apply, and the page sends only the fields you changed, so a stale Settings tab
+cannot revert a change made elsewhere.
 
 **Dependencies.** `cargo-deny` bans HTTP/TLS client and DNS resolver crates (`deny.toml`). Note:
 axum's WebSocket support enables the `connect` feature of `tokio-tungstenite` (a WebSocket *client*

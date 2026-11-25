@@ -236,28 +236,66 @@ pub fn folders(n: u64) -> String {
     format!("{n} folder{}", if n == 1 { "" } else { "s" })
 }
 
-/// The session index and the marker scan's scope (from `discovery.status`).
+/// The session index and the marker scan's scope (from `discovery.status`). Sessions that
+/// belong to no project are broken down by reason and by the folders most of them were started
+/// in (e.g. `831 excluded (~/.claude-mem/observer-sessions)`).
 pub fn format_sessions(d: &serde_json::Value) -> String {
-    let unassigned: Vec<String> = d
+    let n = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
+    let mut reasons: Vec<(&str, u64)> = d
         .pointer("/sessions/unassigned")
         .and_then(|u| u.as_object())
-        .map(|o| {
-            o.iter()
-                .map(|(k, n)| format!("{n} {}", k.replace('_', " ")))
+        .map(|o| o.iter().map(|(k, v)| (k.as_str(), n(v))).collect())
+        .unwrap_or_default();
+    reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let folders: Vec<(&str, Option<&str>, u64)> = d
+        .pointer("/sessions/unassigned_folders")
+        .and_then(|f| f.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|f| {
+                    (
+                        f.get("reason").and_then(|r| r.as_str()).unwrap_or(""),
+                        f.get("folder").and_then(|r| r.as_str()),
+                        f.get("sessions").map_or(0, n),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
+    let total: u64 = reasons.iter().map(|r| r.1).sum();
+    let duplicates = d.pointer("/sessions/duplicate_ids").map_or(0, n);
     let mut out = format!(
-        "  sessions: {} ({} files, {} indexed{})\n",
+        "  sessions: {} ({} files, {} indexed{}{})\n",
         s(d, "/sessions/state"),
         s(d, "/sessions/files"),
         s(d, "/sessions/indexed"),
-        if unassigned.is_empty() {
+        if total == 0 {
             String::new()
         } else {
-            format!("; not in a project: {}", unassigned.join(", "))
+            format!("; {total} not in a project")
+        },
+        if duplicates == 0 {
+            String::new()
+        } else {
+            format!("; {duplicates} duplicate session files skipped")
         }
     );
+    for (reason, count) in reasons {
+        let label = reason.replace('_', " ");
+        let mut listed = 0;
+        for (_, folder, k) in folders.iter().filter(|f| f.0 == reason) {
+            listed += k;
+            match folder {
+                Some(f) => out.push_str(&format!("    {k} {label} ({f})\n")),
+                None => out.push_str(&format!("    {k} {label} (no folder recorded)\n")),
+            }
+        }
+        match count.saturating_sub(listed) {
+            0 => {}
+            rest if listed == 0 => out.push_str(&format!("    {rest} {label}\n")),
+            rest => out.push_str(&format!("    {rest} {label} (other folders)\n")),
+        }
+    }
     let dev_roots: Vec<&str> = d
         .get("dev_roots")
         .and_then(|r| r.as_array())
@@ -476,9 +514,8 @@ mod status_tests {
         });
         let text = format_sessions(&d);
         assert!(
-            text.contains(
-                "sessions: ok (9 files, 9 indexed; not in a project: 1 home, 2 outside roots)"
-            ),
+            text.contains("sessions: ok (9 files, 9 indexed; 3 not in a project)\n")
+                && text.contains("    2 outside roots\n    1 home\n"),
             "{text}"
         );
         assert!(text.contains("development roots ~/dev, ~/work"), "{text}");
@@ -488,6 +525,32 @@ mod status_tests {
         assert!(
             full.contains("sessions: missing (0 files, 0 indexed)") && full.contains("every root"),
             "{full}"
+        );
+    }
+
+    #[test]
+    fn unassigned_sessions_are_broken_down_by_reason_and_folder() {
+        let d = serde_json::json!({
+            "scope": "full",
+            "sessions": {"state": "ok", "files": 900, "indexed": 899, "duplicate_ids": 1,
+                         "unassigned": {"excluded": 840, "home": 2, "container": 3},
+                         "unassigned_folders": [
+                             {"reason": "excluded", "folder": "~/.claude-mem/observer-sessions", "sessions": 831},
+                             {"reason": "container", "folder": "~/dev", "sessions": 3},
+                             {"reason": "home", "folder": "~", "sessions": 2},
+                             {"reason": "excluded", "folder": "~/.config/x", "sessions": 4}
+                         ]}
+        });
+        let text = format_sessions(&d);
+        assert_eq!(
+            text,
+            "  sessions: ok (900 files, 899 indexed; 845 not in a project; 1 duplicate session files skipped)\n\
+             \x20   831 excluded (~/.claude-mem/observer-sessions)\n\
+             \x20   4 excluded (~/.config/x)\n\
+             \x20   5 excluded (other folders)\n\
+             \x20   3 container (~/dev)\n\
+             \x20   2 home (~)\n\
+             \x20 marker scan: every root\n"
         );
     }
 

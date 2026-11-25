@@ -77,7 +77,10 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/auth/rotate", post(routes::rotate))
         .route("/auth/logout", post(routes::logout))
         .route("/projects", get(routes::projects))
-        .route("/projects/{id}", get(routes::project))
+        .route(
+            "/projects/{id}",
+            get(routes::project).delete(routes::forget),
+        )
         .route("/projects/{id}/sessions", get(routes::project_sessions))
         .route(
             "/projects/{id}/ignore",

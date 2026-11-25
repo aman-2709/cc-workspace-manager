@@ -17,7 +17,7 @@ struct Migration {
 }
 
 /// Ordered migrations; index + 1 is the `PRAGMA user_version` after applying it.
-const MIGRATIONS: [Migration; 4] = [
+const MIGRATIONS: [Migration; 5] = [
     Migration {
         sql: include_str!("migrations/001_init.sql"),
         backfill: None,
@@ -32,6 +32,10 @@ const MIGRATIONS: [Migration; 4] = [
     },
     Migration {
         sql: include_str!("migrations/004_sessions.sql"),
+        backfill: None,
+    },
+    Migration {
+        sql: include_str!("migrations/005_partial_checkpoints.sql"),
         backfill: None,
     },
 ];
@@ -65,12 +69,13 @@ pub(crate) fn db_err(context: &str, e: &rusqlite::Error) -> Error {
 }
 
 /// Open the read-write connection (creating the file with mode 0600 under umask 0077), set
-/// pragmas and apply pending migrations.
+/// pragmas and apply pending migrations. `secure_delete` overwrites deleted content (cleared
+/// prompts, a cleared session index) instead of leaving it in free pages (M3 review, L6).
 pub fn open_writer_connection(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path).map_err(|e| db_err("open", &e))?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = 5000; PRAGMA temp_store = MEMORY;",
+         PRAGMA busy_timeout = 5000; PRAGMA temp_store = MEMORY; PRAGMA secure_delete = ON;",
     )
     .map_err(|e| db_err("pragmas", &e))?;
     migrate(&mut conn)?;

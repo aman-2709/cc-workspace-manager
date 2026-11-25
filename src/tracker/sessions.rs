@@ -6,9 +6,11 @@
 use super::Tracker;
 use crate::claude::locate::{self, Listing, SessionFile, PROJECTS_DIR};
 use crate::claude::parse::{self, Outcome};
+use crate::claude::resume;
 use crate::db::queries::{self, SessionState};
 use crate::db::writer::{ProjectUpsert, SessionStore, Source, Upserted};
 use crate::discovery::resolve::{Context, Unassigned};
+use crate::discovery::status::UnassignedFolder;
 use crate::error::Result;
 use crate::watch::Cmd;
 use std::collections::{HashMap, HashSet};
@@ -25,6 +27,8 @@ struct Scanned {
     /// The directory does not exist (as opposed to being unreadable).
     absent: bool,
     parsed: Vec<(SessionFile, parse::Checkpoint, parse::Aggregate)>,
+    /// Files skipped because another file has the same session id.
+    duplicates: u64,
 }
 
 impl Tracker {
@@ -49,11 +53,15 @@ impl Tracker {
             .into_iter()
             .map(|s| (s.id.clone(), s))
             .collect();
-        let scanned = {
-            let (dir, states) = (projects_dir.clone(), states.clone());
-            tokio::task::spawn_blocking(move || scan(&dir, if full { None } else { dirs }, &states))
-                .await
-                .map_err(|e| crate::error::Error::new(format!("session scan failed: {e}")))?
+        let tracked = self.tracked().await?;
+        let ctx = Arc::new(self.resolve_context(&cfg, &tracked));
+        let mut scanned = {
+            let (dir, states, ctx) = (projects_dir.clone(), states.clone(), Arc::clone(&ctx));
+            tokio::task::spawn_blocking(move || {
+                scan(&dir, if full { None } else { dirs }, &states, &ctx)
+            })
+            .await
+            .map_err(|e| crate::error::Error::new(format!("session scan failed: {e}")))?
         };
 
         // Files that are gone: in a directory that was listed completely, or in a directory that
@@ -82,8 +90,6 @@ impl Tracker {
         }
 
         // Resolve new sessions, and re-try unassigned ones (a cwd may have appeared since).
-        let tracked = self.tracked().await?;
-        let ctx = self.resolve_context(&cfg, &tracked);
         let parsed_ids: HashSet<String> = scanned.parsed.iter().map(|p| p.0.id.clone()).collect();
         let mut wanted: Vec<(String, Option<String>)> = scanned
             .parsed
@@ -99,9 +105,18 @@ impl Tracker {
         );
         let resolved: HashMap<String, std::result::Result<PathBuf, Unassigned>> = {
             tokio::task::spawn_blocking(move || {
+                // Many sessions share a cwd: resolve each distinct one once.
+                let mut by_cwd: HashMap<Option<String>, std::result::Result<PathBuf, Unassigned>> =
+                    HashMap::new();
                 wanted
                     .into_iter()
-                    .map(|(id, cwd)| (id, ctx.resolve(cwd.as_deref())))
+                    .map(|(id, cwd)| {
+                        let r = by_cwd
+                            .entry(cwd)
+                            .or_insert_with_key(|c| ctx.resolve(c.as_deref()))
+                            .clone();
+                        (id, r)
+                    })
                     .collect()
             })
             .await
@@ -154,7 +169,7 @@ impl Tracker {
 
         // Store the parsed sessions; existing assigned ones keep their project.
         let mut stores = Vec::with_capacity(scanned.parsed.len());
-        for (f, checkpoint, aggregate) in scanned.parsed {
+        for (f, checkpoint, aggregate) in std::mem::take(&mut scanned.parsed) {
             let (project_id, unassigned) = match states.get(&f.id) {
                 Some(s) if s.project_id.is_some() => (s.project_id.clone(), None),
                 _ => assignment(&f.id),
@@ -201,8 +216,7 @@ impl Tracker {
                 let _ = self.monitor.send(Cmd::WatchSessions(dirs)).await;
             }
         }
-        self.update_session_status(&scanned.listing, scanned.absent, full)
-            .await;
+        self.update_session_status(&scanned, full).await;
         Ok(upserted)
     }
 
@@ -215,21 +229,25 @@ impl Tracker {
             .unwrap_or_else(|_| self.settings.scan.home.clone());
         Context {
             roots: self.root_exclusions(),
-            home,
-            temp_dirs: cfg.temp_dirs.clone(),
             known: tracked
                 .iter()
                 .filter(|t| !t.missing)
                 .map(|t| PathBuf::from(&t.path))
                 .collect(),
+            max_depth: self.settings.scan.max_depth,
+            same_file_system: self.settings.scan.same_file_system,
+            home,
+            temp_dirs: cfg.temp_dirs.clone(),
         }
     }
 
-    async fn update_session_status(&self, listing: &Option<Listing>, absent: bool, full: bool) {
+    async fn update_session_status(&self, scanned: &Scanned, full: bool) {
+        let (listing, absent) = (&scanned.listing, scanned.absent);
         let counts = self.reader.with(queries::session_counts).await;
         let (files, skipped) = listing
             .as_ref()
             .map_or((0, 0), |l| (l.files.len() as u64, l.skipped));
+        let home = self.settings.scan.home.clone();
         self.status.update(|s| {
             let st = &mut s.sessions;
             if full {
@@ -241,6 +259,7 @@ impl Tracker {
                 };
                 st.files = files;
                 st.skipped_entries = skipped;
+                st.duplicate_ids = scanned.duplicates;
             }
             if let Ok(c) = &counts {
                 st.indexed = c.indexed;
@@ -252,35 +271,66 @@ impl Tracker {
                     .iter()
                     .filter_map(|(k, n)| Unassigned::parse(k).map(|u| (u.as_str(), *n)))
                     .collect();
+                st.unassigned_folders = c
+                    .unassigned_folders
+                    .iter()
+                    .filter_map(|(k, cwd, n)| {
+                        Some(UnassignedFolder {
+                            reason: Unassigned::parse(k)?.as_str(),
+                            folder: cwd
+                                .as_deref()
+                                .map(|c| crate::view::display_path(&resume::display(c), &home)),
+                            sessions: *n,
+                        })
+                    })
+                    .collect();
             }
         });
         self.notifier.status();
     }
 }
 
-/// List and parse (blocking).
+/// List and parse (blocking). A session that is not assigned to a project stops being read
+/// once its first cwd shows it never can be ([`Context::never_a_project`]).
 fn scan(
     projects: &Path,
     dirs: Option<Vec<PathBuf>>,
     states: &HashMap<String, SessionState>,
+    ctx: &Context,
 ) -> Scanned {
-    let (listing, absent) = match dirs {
+    let (mut listing, absent) = match dirs {
         None => match locate::list_all(projects) {
             Some(l) => (Some(l), false),
             None => (None, std::fs::symlink_metadata(projects).is_err()),
         },
         Some(d) => (Some(locate::list_some(projects, &d)), false),
     };
+    let duplicates = listing.as_mut().map_or(0, |l| {
+        locate::dedupe(&mut l.files, |id| {
+            states.get(id).map(|s| PathBuf::from(&s.file_path))
+        })
+    });
+    let verdicts = std::cell::RefCell::new(HashMap::<String, bool>::new());
+    let never = |cwd: &str| -> bool {
+        if let Some(v) = verdicts.borrow().get(cwd) {
+            return *v;
+        }
+        let v = ctx.never_a_project(cwd);
+        verdicts.borrow_mut().insert(cwd.to_string(), v);
+        v
+    };
     let mut parsed = Vec::new();
     for f in listing.iter().flat_map(|l| l.files.iter()) {
-        let prev = states
+        let state = states
             .get(&f.id)
-            .filter(|s| Path::new(&s.file_path) == f.path)
-            .map(|s| (&s.checkpoint, &s.aggregate));
+            .filter(|s| Path::new(&s.file_path) == f.path);
+        let prev = state.map(|s| (&s.checkpoint, &s.aggregate));
+        let assigned = state.is_some_and(|s| s.project_id.is_some());
+        let stop: &dyn Fn(&str) -> bool = if assigned { &parse::read_all } else { &never };
         let Some(mut file) = locate::open(f) else {
             continue;
         };
-        match parse::parse(&mut file, &f.id, prev) {
+        match parse::parse(&mut file, &f.id, prev, stop) {
             Ok(Outcome::Updated {
                 checkpoint,
                 aggregate,
@@ -294,5 +344,6 @@ fn scan(
         listing,
         absent,
         parsed,
+        duplicates,
     }
 }

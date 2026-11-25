@@ -36,6 +36,7 @@ fn inotify_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 /// How a test stack is configured.
+#[derive(Clone)]
 struct Opts {
     budget: usize,
     /// Walk every root at every reconciliation (the M2 behaviour these tests were written for).
@@ -975,5 +976,129 @@ async fn after_the_first_full_scan_only_development_roots_are_walked() {
     s.wait_scans(1).await;
     assert_eq!(s.status.snapshot().scope, "full");
     s.wait_registered(&far).await;
+    s.stop().await;
+}
+
+/// M3.1 through the real ingest: a session in a container folder (`~/dev`, no Git, no marker)
+/// registers nothing, before and after the projects below it are known (M3 review M4); a session
+/// in a nested marker folder without Git (`monorepo/services/api`) belongs to the monorepo on the
+/// first launch already; a session in an excluded folder is read only up to its first cwd; and a
+/// session file copied into a second directory is indexed once (M3 review L4).
+#[tokio::test]
+async fn containers_nested_markers_excluded_folders_and_duplicates_in_the_ingest() {
+    let _g = inotify_lock().lock().await;
+    let e = env();
+    let h = &e.home;
+    let claude = h.join(".claude");
+    marker(&h.join("dev/app-a"), "# a");
+    marker(&h.join("dev/app-b"), "# b");
+    let mono = h.join("dev/monorepo");
+    fs::create_dir_all(mono.join(".git")).unwrap();
+    marker(&mono, "# mono");
+    marker(&mono.join("services/api"), "# api");
+    let observer = h.join(".tool/observer-sessions");
+    fs::create_dir_all(&observer).unwrap();
+    let session = |dir: &str, id: &str, cwd: &Path, extra: usize| {
+        let enc = claude.join("projects").join(dir);
+        fs::create_dir_all(&enc).unwrap();
+        let mut body = session_line(id, "2026-11-24T09:00:00.000Z", cwd, "x");
+        for i in 0..extra {
+            body.push_str(&session_line(
+                id,
+                &format!("2026-11-24T10:{:02}:00.000Z", i % 60),
+                cwd,
+                "SYNTHETIC-NEVER-READ",
+            ));
+        }
+        fs::write(enc.join(format!("{id}.jsonl")), body).unwrap();
+        enc.join(format!("{id}.jsonl"))
+    };
+    let dev_sid = "d0d0d0d0-0000-4000-8000-000000000001";
+    let api_sid = "d0d0d0d0-0000-4000-8000-000000000002";
+    let obs_sid = "d0d0d0d0-0000-4000-8000-000000000003";
+    session("-dev", dev_sid, &h.join("dev"), 0);
+    session(
+        "-dev-monorepo-services-api",
+        api_sid,
+        &mono.join("services/api"),
+        0,
+    );
+    let obs_file = session("-tool-observer", obs_sid, &observer, 50);
+    // The same file copied into a second directory (and an upper-case copy: not a session).
+    let copy = claude.join("projects/-dev-monorepo-copy");
+    fs::create_dir_all(&copy).unwrap();
+    fs::copy(
+        claude.join(format!(
+            "projects/-dev-monorepo-services-api/{api_sid}.jsonl"
+        )),
+        copy.join(format!("{api_sid}.jsonl")),
+    )
+    .unwrap();
+    fs::copy(
+        copy.join(format!("{api_sid}.jsonl")),
+        copy.join(format!("{}.jsonl", api_sid.to_uppercase())),
+    )
+    .unwrap();
+    let opts = Opts {
+        full_scan: false,
+        claude_dir: Some(claude.clone()),
+        ..Opts::default()
+    };
+    let clock = now_clock();
+    let Some(s) = Stack::start_with(h, &e.data, clock.clone(), opts.clone()).await else {
+        return;
+    };
+    s.wait_scans(1).await;
+    // Umbrella first: the markers below ~/dev were only on disk when the session was resolved.
+    s.wait_registered(&h.join("dev/app-a")).await;
+    s.wait_registered(&h.join("dev/app-b")).await;
+    assert!(
+        s.by_path(&h.join("dev")).await.is_none(),
+        "~/dev is no project"
+    );
+    let dev = s.session(dev_sid).await.unwrap();
+    assert_eq!(
+        (dev.project_id.as_deref(), dev.unassigned.as_deref()),
+        (None, Some("container"))
+    );
+    // The nested marker folder belongs to the monorepo.
+    let m = s.wait_registered(&mono).await;
+    assert!(s.by_path(&mono.join("services/api")).await.is_none());
+    assert_eq!(
+        s.session(api_sid).await.unwrap().project_id,
+        Some(m.id.clone())
+    );
+    // Excluded: read up to its first cwd only.
+    let obs = s.session(obs_sid).await.unwrap();
+    assert_eq!(obs.unassigned.as_deref(), Some("excluded"));
+    assert!(obs.checkpoint.partial);
+    assert_eq!(obs.aggregate.counts.lines, 1, "nothing after the first cwd");
+    assert!(obs.checkpoint.offset < fs::metadata(&obs_file).unwrap().len());
+    // One file per id; the upper-case copy is not a session at all.
+    let st = s.status.snapshot().sessions;
+    assert_eq!(st.duplicate_ids, 1, "{st:?}");
+    assert_eq!(st.indexed, 3);
+    assert_eq!(st.unassigned.get("container"), Some(&1));
+    assert_eq!(st.unassigned.get("excluded"), Some(&1));
+    assert!(
+        st.unassigned_folders
+            .iter()
+            .any(|f| f.reason == "container" && f.folder.as_deref() == Some("~/dev")),
+        "{st:?}"
+    );
+    s.stop().await;
+
+    // Projects first: they are registered now; the ~/dev session is resolved again.
+    let Some(s) = Stack::start_with(h, &e.data, clock, opts).await else {
+        return;
+    };
+    s.wait_scans(1).await;
+    assert!(s.by_path(&h.join("dev")).await.is_none());
+    assert_eq!(
+        s.session(dev_sid).await.unwrap().unassigned.as_deref(),
+        Some("container")
+    );
+    let obs = s.session(obs_sid).await.unwrap();
+    assert_eq!(obs.aggregate.counts.lines, 1, "still not read further");
     s.stop().await;
 }

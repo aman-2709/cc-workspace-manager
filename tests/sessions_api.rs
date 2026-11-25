@@ -218,125 +218,194 @@ async fn the_last_prompt_is_read_on_demand_and_the_resume_command_uses_the_first
 }
 
 #[tokio::test]
-async fn a_continued_session_resumes_its_latest_continuation_from_that_sessions_first_cwd() {
+async fn a_continued_session_resumes_its_latest_continuation_in_the_same_project_only() {
     let e = env().await;
     let token = e.login().await;
     e.seed(&["app", "other"]).await;
     let app = project_id(&e, &token, "app").await;
     let other = project_id(&e, &token, "other").await;
     let t = common::tempdir();
-    let (d1, d3) = (t.path().join("one"), t.path().join("three"));
-    std::fs::create_dir(&d1).unwrap();
-    std::fs::create_dir(&d3).unwrap();
+    let (d1, d2, d3) = (
+        t.path().join("one"),
+        t.path().join("two"),
+        t.path().join("three"),
+    );
+    for d in [&d1, &d2, &d3] {
+        std::fs::create_dir(d).unwrap();
+    }
     let p = |sid: &str| vec![prompt(sid, "2026-01-01T10:00:00.000Z", "x")];
-    // S1 -> S2 -> S3 (S3 in another project), titles recorded.
+    // S1 -> S2 (both in app) -> S3 (in another project), titles recorded.
+    for (id, project, cwd, title, next) in [
+        (S1, &app, &d1, "One", Some(S2)),
+        (S2, &app, &d2, "Two", Some(S3)),
+        (S3, &other, &d3, "Three", None),
+    ] {
+        add_session(
+            &e,
+            t.path(),
+            NewSession {
+                id,
+                project,
+                cwd: cwd.to_str().unwrap(),
+                title: Some(title),
+                continued_in: next,
+                lines: p(id),
+            },
+        )
+        .await;
+    }
+    let sessions = |project: String| {
+        let (e, token) = (&e, token.clone());
+        async move {
+            let (_, v) = json(
+                e.get(
+                    &format!("/api/v1/projects/{project}/sessions?limit=10"),
+                    Some(&token),
+                )
+                .await,
+            )
+            .await;
+            v
+        }
+    };
+    let v = sessions(app.clone()).await;
+    let one = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == S1)
+        .unwrap()
+        .clone();
+    let r = &one["resume"];
+    assert_eq!(r["session_id"], S2, "followed within app, not into other");
+    assert_eq!(r["via_continuation"], true);
+    assert_eq!(
+        r["cwd"],
+        d2.to_str().unwrap(),
+        "the continuation's first cwd"
+    );
+    assert_eq!(r["continuation_cwd"], d3.to_str().unwrap());
+    let w = r["warnings"].as_array().unwrap();
+    assert!(w.contains(&"continuation_other_project".into()), "{w:?}");
+    assert_eq!(one["title"], "One");
+    assert_eq!(one["title_source"], "ai_title");
+    assert_eq!(
+        one["first_prompt"],
+        serde_json::Value::Null,
+        "titled: no first prompt"
+    );
+
+    // A continuation into an unassigned session is not followed either.
+    let unassigned = "ffffffff-6666-4666-8666-666666666666";
+    let file = t.path().join(format!("{unassigned}.jsonl"));
+    std::fs::write(&file, p(unassigned).join("\n") + "\n").unwrap();
+    e.writer
+        .store_sessions(vec![SessionStore {
+            id: unassigned.into(),
+            file_path: file.to_string_lossy().into_owned(),
+            project_id: None,
+            unassigned: Some("temporary"),
+            aggregate: Aggregate {
+                first_cwd: Some("/tmp/CANARY-PLANTED".into()),
+                ..Aggregate::default()
+            },
+            checkpoint: Checkpoint::default(),
+        }])
+        .await
+        .unwrap();
+    let lone = "dddddddd-4444-4444-8444-444444444444";
+    for (id, next) in [
+        (lone, "eeeeeeee-5555-4555-8555-555555555555"),
+        ("99999999-7777-4777-8777-777777777777", unassigned),
+    ] {
+        add_session(
+            &e,
+            t.path(),
+            NewSession {
+                id,
+                project: &other,
+                cwd: "/nonexistent/lone",
+                title: None,
+                continued_in: Some(next),
+                lines: p(id),
+            },
+        )
+        .await;
+    }
+    let v = sessions(other.clone()).await;
+    let item = |id: &str| {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == id)
+            .unwrap()["resume"]
+            .clone()
+    };
+    let l = item(lone);
+    assert_eq!(l["session_id"], lone);
+    let w = l["warnings"].as_array().unwrap();
+    assert!(w.contains(&"continuation_not_indexed".into()), "{w:?}");
+    assert!(w.contains(&"cwd_missing".into()), "{w:?}");
+    let planted = item("99999999-7777-4777-8777-777777777777");
+    assert_eq!(
+        planted["session_id"],
+        "99999999-7777-4777-8777-777777777777"
+    );
+    assert_eq!(planted["continuation_cwd"], "/tmp/CANARY-PLANTED");
+    assert!(planted["warnings"]
+        .as_array()
+        .unwrap()
+        .contains(&"continuation_unassigned".into()));
+    let (_, private) = json(
+        e.get(
+            &format!("/api/v1/projects/{other}/sessions?limit=10&privacy=1"),
+            Some(&token),
+        )
+        .await,
+    )
+    .await;
+    assert!(!private.to_string().contains("CANARY-PLANTED"));
+}
+
+/// M3 security review, M1: a recorded cwd with terminal control characters gets no resume
+/// command, a warning, and is shown escaped.
+#[tokio::test]
+async fn a_cwd_with_control_characters_gets_no_command_and_is_shown_escaped() {
+    let e = env().await;
+    let token = e.login().await;
+    e.seed(&["app"]).await;
+    let id = project_id(&e, &token, "app").await;
+    let t = common::tempdir();
+    let hostile = "/home/u/x\u{15}touch /tmp/pwned\n";
     add_session(
         &e,
         t.path(),
         NewSession {
             id: S1,
-            project: &app,
-            cwd: d1.to_str().unwrap(),
-            title: Some("One"),
-            continued_in: Some(S2),
-            lines: p(S1),
-        },
-    )
-    .await;
-    add_session(
-        &e,
-        t.path(),
-        NewSession {
-            id: S2,
-            project: &other,
-            cwd: "/nonexistent/two",
-            title: Some("Two"),
-            continued_in: Some(S3),
-            lines: p(S2),
-        },
-    )
-    .await;
-    add_session(
-        &e,
-        t.path(),
-        NewSession {
-            id: S3,
-            project: &other,
-            cwd: d3.to_str().unwrap(),
-            title: Some("Three"),
-            continued_in: None,
-            lines: p(S3),
-        },
-    )
-    .await;
-    let (_, v) = json(
-        e.get(
-            &format!("/api/v1/projects/{app}/sessions?limit=10"),
-            Some(&token),
-        )
-        .await,
-    )
-    .await;
-    let r = &v["items"][0]["resume"];
-    assert_eq!(r["session_id"], S3);
-    assert_eq!(r["via_continuation"], true);
-    assert_eq!(r["cwd"], d3.to_str().unwrap());
-    assert_eq!(v["items"][0]["title"], "One");
-    assert_eq!(v["items"][0]["title_source"], "ai_title");
-    assert_eq!(
-        v["items"][0]["first_prompt"],
-        serde_json::Value::Null,
-        "titled: no first prompt"
-    );
-
-    // A continuation that is not in the index: resume the session itself, with a warning.
-    let (_, v) = json(
-        e.get(
-            &format!("/api/v1/projects/{other}/sessions?limit=10"),
-            Some(&token),
-        )
-        .await,
-    )
-    .await;
-    let two = v["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|i| i["id"] == S2)
-        .unwrap();
-    assert_eq!(two["resume"]["session_id"], S3);
-    let lone = "dddddddd-4444-4444-8444-444444444444";
-    add_session(
-        &e,
-        t.path(),
-        NewSession {
-            id: lone,
-            project: &other,
-            cwd: "/nonexistent/lone",
+            project: &id,
+            cwd: hostile,
             title: None,
-            continued_in: Some("eeeeeeee-5555-4555-8555-555555555555"),
-            lines: p(lone),
+            continued_in: None,
+            lines: vec![prompt(S1, "2026-01-01T10:00:00.000Z", "x")],
         },
     )
     .await;
     let (_, v) = json(
-        e.get(
-            &format!("/api/v1/projects/{other}/sessions?limit=10"),
-            Some(&token),
-        )
-        .await,
+        e.get(&format!("/api/v1/projects/{id}/sessions"), Some(&token))
+            .await,
     )
     .await;
-    let l = v["items"]
+    let item = &v["items"][0];
+    let r = &item["resume"];
+    assert!(r.get("command").is_none(), "{r}");
+    assert!(r["warnings"]
         .as_array()
         .unwrap()
-        .iter()
-        .find(|i| i["id"] == lone)
-        .unwrap();
-    assert_eq!(l["resume"]["session_id"], lone);
-    let w = l["resume"]["warnings"].as_array().unwrap();
-    assert!(w.contains(&"continuation_not_indexed".into()), "{w:?}");
-    assert!(w.contains(&"cwd_missing".into()), "{w:?}");
+        .contains(&"cwd_unsafe_characters".into()));
+    assert_eq!(r["cwd"], r"/home/u/x\x15touch /tmp/pwned\x0a");
+    assert_eq!(item["first_cwd"], r"/home/u/x\x15touch /tmp/pwned\x0a");
+    assert!(!v.to_string().contains('\u{15}'));
 }
 
 #[tokio::test]
@@ -624,7 +693,12 @@ async fn store_prompt_text_caches_redacted_prompts_and_turning_it_off_deletes_th
         v["items"][0]["last_prompt"]["state"], "unreadable",
         "the file is gone, the cache too"
     );
-    // The deleted text may linger in free pages until SQLite reuses them; it is never read.
+    // Deleted for real (secure_delete + a truncating WAL checkpoint, M3 review L6): not in the
+    // database, WAL or SHM bytes either.
+    assert!(
+        !has(&e, "CANARY-CACHED"),
+        "the deleted text lingers on disk"
+    );
     let n: i64 = rusqlite::Connection::open(&e.db)
         .unwrap()
         .query_row(
@@ -649,13 +723,18 @@ async fn clearing_the_session_index_keeps_projects_and_needs_origin() {
         NewSession {
             id: S1,
             project: &id,
-            cwd: "/x",
-            title: None,
+            cwd: "/x/CANARY-INDEXED-CWD",
+            title: Some("CANARY-INDEXED-TITLE"),
             continued_in: None,
             lines: vec![prompt(S1, "2026-01-01T10:00:00.000Z", "p")],
         },
     )
     .await;
+    let has = |e: &Env, s: &str| e.db_bytes().windows(s.len()).any(|w| w == s.as_bytes());
+    assert!(
+        has(&e, "CANARY-INDEXED-TITLE") && has(&e, "CANARY-INDEXED-CWD"),
+        "indexed before the clear (the check below would prove nothing otherwise)"
+    );
     let req = axum::http::Request::builder()
         .method("POST")
         .uri("/api/v1/session-index/clear")
@@ -687,6 +766,12 @@ async fn clearing_the_session_index_keeps_projects_and_needs_origin() {
         t.path().join(format!("{S1}.jsonl")).is_file(),
         "the session file is untouched"
     );
+    for c in ["CANARY-INDEXED-TITLE", "CANARY-INDEXED-CWD"] {
+        assert!(
+            !has(&e, c),
+            "{c} lingers in the database files after the clear"
+        );
+    }
 }
 
 #[tokio::test]
@@ -789,4 +874,319 @@ async fn has_sessions_filters_and_sort_by_session_orders_with_unknown_last() {
     e.writer.store_sessions(vec![store]).await.unwrap();
     let (_, v) = json(e.get("/api/v1/projects?has_sessions=1", Some(&token)).await).await;
     assert_eq!(names(&v), ["b-old"]);
+}
+
+async fn put_settings(e: &Env, token: &str, query: &str, body: &str) -> (u16, serde_json::Value) {
+    json(
+        e.send_json("PUT", &format!("/api/v1/settings{query}"), token, body)
+            .await,
+    )
+    .await
+}
+
+/// M3 security review, M2: a save from a Settings form rendered earlier (it sends only what the
+/// user changed there) cannot turn "Store prompt text" back on or revert other fields; saves
+/// never lose each other.
+#[tokio::test]
+async fn a_stale_settings_form_cannot_re_enable_prompt_storage_or_revert_other_fields() {
+    let e = env().await;
+    let token = e.login().await;
+    let (s, _) = put_settings(
+        &e,
+        &token,
+        "",
+        r#"{"sessions":{"store_prompt_text":true},"discovery":{"scan_interval_secs":120}}"#,
+    )
+    .await;
+    assert_eq!(s, 200);
+    // Tab A renders the form now (store on, 120 s). Tab B turns storage off and changes the
+    // interval. Tab A then saves only the theme the user changed there.
+    let (_, tab_a) = json(e.get("/api/v1/settings", Some(&token)).await).await;
+    assert_eq!(tab_a["config"]["sessions"]["store_prompt_text"], true);
+    let (s, _) = put_settings(
+        &e,
+        &token,
+        "",
+        r#"{"sessions":{"store_prompt_text":false},"discovery":{"scan_interval_secs":300}}"#,
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, v) = put_settings(&e, &token, "", r#"{"ui":{"theme":"dark"}}"#).await;
+    assert_eq!(s, 200, "{v}");
+    let saved = cc_workspace_manager::config::Config::parse(
+        &std::fs::read_to_string(&e.config_path).unwrap(),
+    )
+    .unwrap();
+    assert!(!saved.sessions.store_prompt_text, "storage stays off");
+    assert_eq!(
+        saved.discovery.scan_interval_secs, 300,
+        "tab B's value stays"
+    );
+    assert_eq!(saved.ui.theme, "dark");
+
+    // Concurrent saves of different fields both survive (one lock from merge to apply).
+    let mut tasks = Vec::new();
+    for (i, body) in [
+        r#"{"activity":{"inactive_after_days":8}}"#,
+        r#"{"discovery":{"missing_retention_days":45}}"#,
+        r#"{"ui":{"default_view":"table"}}"#,
+        r#"{"discovery":{"full_scan":true}}"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let svc = e.service.clone();
+        let patch: serde_json::Value = serde_json::from_str(body).unwrap();
+        tasks.push(tokio::spawn(async move {
+            (
+                i,
+                svc.update_settings(patch, cc_workspace_manager::view::Privacy::Off)
+                    .await
+                    .is_ok(),
+            )
+        }));
+    }
+    for t in tasks {
+        assert!(t.await.unwrap().1);
+    }
+    let saved = cc_workspace_manager::config::Config::parse(
+        &std::fs::read_to_string(&e.config_path).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved.activity.inactive_after_days, 8);
+    assert_eq!(saved.discovery.missing_retention_days, 45);
+    assert_eq!(saved.ui.default_view, "table");
+    assert!(saved.discovery.full_scan);
+    assert_eq!(saved.ui.theme, "dark");
+}
+
+/// M3 security review, M2: a prompt read that is still in flight when "Store prompt text" is
+/// turned off stores nothing (the writer checks the setting itself).
+#[tokio::test]
+async fn a_prompt_read_in_flight_while_storage_turns_off_stores_nothing() {
+    let e = env().await;
+    let token = e.login().await;
+    e.seed(&["app"]).await;
+    let id = project_id(&e, &token, "app").await;
+    let t = common::tempdir();
+    add_session(
+        &e,
+        t.path(),
+        NewSession {
+            id: S1,
+            project: &id,
+            cwd: "/nonexistent",
+            title: Some("T"),
+            continued_in: None,
+            lines: vec![prompt(S1, "2026-01-01T10:00:00.000Z", "CANARY-IN-FLIGHT")],
+        },
+    )
+    .await;
+    let (s, _) = put_settings(&e, &token, "", r#"{"sessions":{"store_prompt_text":true}}"#).await;
+    assert_eq!(s, 200);
+    e.service
+        .set_prompt_read_delay(std::time::Duration::from_millis(600));
+    let read = {
+        let router = e.router.clone();
+        let req = axum::http::Request::builder()
+            .uri(format!("/api/v1/projects/{id}/sessions"))
+            .header("host", format!("127.0.0.1:{}", common::PORT))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        tokio::spawn(async move {
+            use tower::ServiceExt;
+            router.oneshot(req).await.unwrap()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let (s, _) = put_settings(
+        &e,
+        &token,
+        "",
+        r#"{"sessions":{"store_prompt_text":false}}"#,
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, v) = json(read.await.unwrap()).await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        v["items"][0]["last_prompt"]["text"], "CANARY-IN-FLIGHT",
+        "the read itself succeeded (and was in flight)"
+    );
+    e.writer.flush().await.unwrap();
+    let n: i64 = rusqlite::Connection::open(&e.db)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE prompt_text IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "a prompt was cached after storage was turned off");
+    let bytes = e.db_bytes();
+    assert!(!bytes
+        .windows("CANARY-IN-FLIGHT".len())
+        .any(|w| w == b"CANARY-IN-FLIGHT"));
+}
+
+/// M3 security review, L7: the browser API changes only the Settings page's keys, never port 0
+/// or a session directory that would open the whole disk to reads.
+#[tokio::test]
+async fn settings_puts_accept_only_the_settings_page_keys_and_safe_values() {
+    let e = env().await;
+    let token = e.login().await;
+    let (s, _) = put_settings(&e, &token, "", r#"{"ui":{"theme":"light"}}"#).await;
+    assert_eq!(s, 200);
+    let before = std::fs::read(&e.config_path).unwrap();
+    for bad in [
+        r#"{"git":{"allow_unhardened_status":true}}"#,
+        r#"{"watch":{"debounce_ms":10}}"#,
+        r#"{"activity":{"events_per_project":5}}"#,
+        r#"{"server":{"port":0}}"#,
+        r#"{"server":{"port":"8765"}}"#,
+        r#"{"sessions":{"dir":"/"}}"#,
+        r#"{"sessions":{"dir":"/home"}}"#,
+        r#"{"sessions":{"dir":"/home/u/../.."}}"#,
+        r#"{"sessions":{"dir":"relative"}}"#,
+        r#"{"ui":"dark"}"#,
+    ] {
+        let (s, v) = put_settings(&e, &token, "", bad).await;
+        assert_eq!((s, code(&v)), (400, "invalid_argument"), "{bad}: {v}");
+    }
+    assert_eq!(std::fs::read(&e.config_path).unwrap(), before);
+    let (s, v) = put_settings(
+        &e,
+        &token,
+        "",
+        r#"{"sessions":{"dir":"/srv/claude-config"},"server":{"port":9000}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        v["restart_required"],
+        serde_json::json!(["server.port", "sessions.dir"])
+    );
+}
+
+/// M3 security review, L1: privacy mode also covers the ignore and settings-save responses, and
+/// the settings check uses roots, exclusions and a session directory that hold canaries.
+#[tokio::test]
+async fn privacy_mode_covers_the_ignore_and_settings_save_responses() {
+    let e = env().await;
+    let token = e.login().await;
+    e.seed(&["app"]).await;
+    let id = project_id(&e, &token, "app").await;
+    let body = r#"{"discovery":{"roots":["/srv/CANARY-ROOT"],"exclude":["CANARY-EXCL/"]},"sessions":{"dir":"/srv/CANARY-SESSIONS"}}"#;
+    let canaries = ["CANARY-ROOT", "CANARY-EXCL", "CANARY-SESSIONS", "/home/u"];
+    let (s, private) = put_settings(&e, &token, "?privacy=1", body).await;
+    assert_eq!(s, 200, "{private}");
+    let (_, private_get) = json(e.get("/api/v1/settings?privacy=1", Some(&token)).await).await;
+    let (_, full) = json(e.get("/api/v1/settings", Some(&token)).await).await;
+    for c in canaries {
+        assert!(!private.to_string().contains(c), "PUT response leaks {c}");
+        assert!(!private_get.to_string().contains(c), "GET leaks {c}");
+        if c != "/home/u" {
+            assert!(full.to_string().contains(c), "{c} missing without privacy");
+        }
+    }
+    for (method, path) in [
+        ("PUT", format!("/api/v1/projects/{id}/ignore")),
+        ("DELETE", format!("/api/v1/projects/{id}/ignore")),
+    ] {
+        let (s, v) = json(
+            e.send_json(method, &format!("{path}?privacy=1"), &token, "")
+                .await,
+        )
+        .await;
+        assert_eq!(s, 200, "{v}");
+        assert!(
+            v.get("path").is_none() && v.get("display_path").is_none(),
+            "{v}"
+        );
+        let (_, v) = json(e.send_json(method, &path, &token, "").await).await;
+        assert_eq!(v["path"], "/home/u/app", "without privacy");
+    }
+    // Discovery status: the folders of unassigned sessions are hidden too.
+    e.service.discovery.update(|d| {
+        d.sessions.unassigned_folders =
+            vec![cc_workspace_manager::discovery::status::UnassignedFolder {
+                reason: "excluded",
+                folder: Some("~/CANARY-FOLDER".into()),
+                sessions: 3,
+            }];
+    });
+    let (_, v) = json(
+        e.get("/api/v1/discovery/status?privacy=1", Some(&token))
+            .await,
+    )
+    .await;
+    assert!(!v.to_string().contains("CANARY-FOLDER"), "{v}");
+    assert_eq!(v["sessions"]["unassigned_folders"][0]["sessions"], 3);
+    let (_, v) = json(e.get("/api/v1/discovery/status", Some(&token)).await).await;
+    assert!(v.to_string().contains("CANARY-FOLDER"));
+}
+
+/// "Forget" removes a missing project from ccwm's database only; "Missing only" lists them.
+#[tokio::test]
+async fn missing_projects_can_be_listed_alone_and_forgotten() {
+    let e = env().await;
+    let token = e.login().await;
+    e.seed(&["gone", "here"]).await;
+    let gone = project_id(&e, &token, "gone").await;
+    let here = project_id(&e, &token, "here").await;
+    e.writer
+        .mark_missing(vec![gone.clone()], START)
+        .await
+        .unwrap();
+    let names = |v: &serde_json::Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (_, v) = json(e.get("/api/v1/projects?missing_only=1", Some(&token)).await).await;
+    assert_eq!(names(&v), ["gone"]);
+    assert_eq!(v["total"], 1);
+    let (s, v) = json(
+        e.get("/api/v1/projects?missing_only=yes", Some(&token))
+            .await,
+    )
+    .await;
+    assert_eq!((s, code(&v)), (400, "invalid_argument"));
+
+    let (s, v) = json(
+        e.send_json("DELETE", &format!("/api/v1/projects/{here}"), &token, "")
+            .await,
+    )
+    .await;
+    assert_eq!(
+        (s, code(&v)),
+        (400, "invalid_argument"),
+        "a present project stays"
+    );
+    let req = axum::http::Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/projects/{gone}"))
+        .header("host", format!("127.0.0.1:{}", common::PORT))
+        .header("authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(e.send(req).await.status(), 403, "no Origin");
+    let resp = e
+        .send_json("DELETE", &format!("/api/v1/projects/{gone}"), &token, "")
+        .await;
+    assert_eq!(resp.status(), 204);
+    let (_, v) = json(
+        e.get("/api/v1/projects?include_missing=1", Some(&token))
+            .await,
+    )
+    .await;
+    assert_eq!(names(&v), ["here"]);
+    let resp = e
+        .send_json("DELETE", &format!("/api/v1/projects/{gone}"), &token, "")
+        .await;
+    assert_eq!(resp.status(), 404, "already forgotten");
 }

@@ -77,8 +77,25 @@ pub struct SessionStatus {
     pub malformed_lines: u64,
     pub oversized_lines: u64,
     pub unknown_records: u64,
-    /// Sessions whose cwd names no project, by reason (`home`, `temporary`, `nonexistent`, …).
+    /// Session files skipped because another file has the same session id (one file per id:
+    /// the indexed one, else the first by path).
+    pub duplicate_ids: u64,
+    /// Sessions whose cwd names no project, by reason (`home`, `temporary`, `nonexistent`,
+    /// `container`, …).
     pub unassigned: std::collections::BTreeMap<&'static str, u64>,
+    /// Where most unassigned sessions were started (by reason and first cwd, most first;
+    /// omitted in privacy mode).
+    pub unassigned_folders: Vec<UnassignedFolder>,
+}
+
+/// One folder of [`SessionStatus::unassigned_folders`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UnassignedFolder {
+    pub reason: &'static str,
+    /// The first recorded cwd (`~/…` inside home); absent when the sessions recorded none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    pub sessions: u64,
 }
 
 #[derive(Debug, Clone, Default)]

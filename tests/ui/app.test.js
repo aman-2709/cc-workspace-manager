@@ -278,3 +278,48 @@ test("the settings form becomes a partial patch: numbers parsed, path lists spli
   assert.deepStrictEqual(p.sessions, { store_prompt_text: false });
   assert.strictEqual("exclude" in p.discovery, false, "hidden in privacy mode: not sent");
 });
+
+// ---- M3.1 helpers -------------------------------------------------------------------------------
+const { changedSettings, restartNote, commitText } = require("../../web/app.js");
+
+test("a settings save sends only the fields that differ from the saved configuration", () => {
+  const saved = {
+    server: { port: 8765 },
+    discovery: { roots: ["/a"], scan_interval_secs: 600, full_scan: false },
+    sessions: { store_prompt_text: true },
+    ui: { theme: "system", default_view: "cards", privacy: false },
+  };
+  // A form rendered while storage was on; meanwhile another tab turned it off (saved now says
+  // false). Only the theme was changed in this form.
+  const form = settingsPatch({
+    roots: "/a", exclude: null, full_scan: false, scan_interval_secs: "600", max_depth: "",
+    store_prompt_text: false, port: "8765", default_view: "cards", theme: "dark", ui_privacy: false,
+  });
+  assert.deepStrictEqual(changedSettings(form, saved), { sessions: { store_prompt_text: false }, ui: { theme: "dark" } });
+  const fresh = { ...saved, sessions: { store_prompt_text: false } };
+  assert.deepStrictEqual(changedSettings(form, fresh), { ui: { theme: "dark" } },
+    "a stale checkbox that matches the current value is not sent");
+  assert.deepStrictEqual(changedSettings(settingsPatch({ roots: "/a\n/b" }), saved), { discovery: { roots: ["/a", "/b"] } });
+  assert.deepStrictEqual(changedSettings(settingsPatch({ roots: "/a" }), saved), {}, "nothing changed");
+  assert.deepStrictEqual(changedSettings({ ui: { theme: "dark" } }, null), { ui: { theme: "dark" } });
+});
+
+test("restart notes say the change takes effect after a ccwm restart", () => {
+  assert.strictEqual(restartNote([], {}), "");
+  assert.strictEqual(restartNote(undefined, {}), "");
+  assert.strictEqual(restartNote(["server.port", "x.y"], { "server.port": "port" }), "Saved; takes effect after ccwm restart: port, x.y.");
+});
+
+test("Missing only is its own server flag; the commit column shows a dash when there is none", () => {
+  const p = new URLSearchParams(buildQuery({ ...DEFAULT_QUERY, activity: "missing", missing: true }, 10, null, false));
+  assert.deepStrictEqual([p.get("missing_only"), p.has("activity"), p.has("include_missing")], ["1", false, false]);
+  const q = new URLSearchParams(buildQuery({ ...DEFAULT_QUERY, activity: "week", missing: true }, 10, null, false));
+  assert.deepStrictEqual([q.get("activity"), q.get("include_missing"), q.has("missing_only")], ["week", "1", false]);
+  assert.strictEqual(commitText(null), "—");
+  assert.strictEqual(commitText({ state: "not_git", commit: null }), "—");
+  assert.strictEqual(commitText({ commit: { subject: "" } }), "—");
+  assert.strictEqual(commitText({ commit: { subject: "Fix it" } }), "Fix it");
+  assert.match(resumeWarningText("cwd_unsafe_characters"), /control or text-direction characters/);
+  assert.match(resumeWarningText("continuation_other_project"), /another project/);
+  assert.match(resumeWarningText("continuation_unassigned"), /outside every project/);
+});

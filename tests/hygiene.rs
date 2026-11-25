@@ -76,32 +76,45 @@ fn every_runtime_file_name_is_ignored_wherever_it_appears() {
     assert!(visible.is_empty(), "runtime files not ignored: {visible:?}");
 }
 
-/// A synthetic environment generated *inside* the repository leaves nothing for Git to pick up.
+/// A synthetic environment someone generates *inside* the repository (`ccwm-synth ./x`) leaves
+/// nothing for Git to pick up. A test must never create projects or `CLAUDE.md` files in the
+/// working tree (a real ccwm watching the maintainer's home registers them, and they turn into
+/// "missing" projects when the test deletes them), so the check runs in a throwaway repository
+/// under `/tmp` that carries this repository's `.gitignore`.
 #[test]
 fn a_synthetic_environment_created_inside_the_repository_is_ignored() {
     if !git_available() {
         return;
     }
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let dir = Path::new(REPO).join(format!("hygiene-synth-{}", std::process::id()));
-    let _cleanup = Cleanup(dir.clone());
+    let t = tempfile::Builder::new()
+        .prefix("ccwm-hygiene-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let repo = t.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    git(&["init", "-q"]);
+    std::fs::copy(Path::new(REPO).join(".gitignore"), repo.join(".gitignore")).unwrap();
+    let dir = repo.join(format!("hygiene-synth-{}", std::process::id()));
     let env = cc_workspace_manager::synth::generate(&dir, 2).unwrap();
     std::fs::write(dir.join("env"), "HOME=x\n").unwrap(); // what ccwm-synth writes
     std::fs::write(env.home.join("dev/alpha/notes.txt"), "x").unwrap();
-    let out = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard", "--"])
-        .arg(&dir)
-        .current_dir(REPO)
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let listed = String::from_utf8_lossy(&out.stdout);
-    assert!(listed.trim().is_empty(), "visible to git:\n{listed}");
+    let listed = git(&["ls-files", "--others", "--exclude-standard", "--"]);
+    assert_eq!(listed.trim(), ".gitignore", "visible to git:\n{listed}");
+    // Control: without the ignore rules the environment is visible, so the check can fail.
+    std::fs::remove_file(dir.join(".gitignore")).unwrap();
+    std::fs::write(repo.join(".gitignore"), "").unwrap();
+    assert!(git(&["ls-files", "--others", "--exclude-standard", "--"]).contains("CLAUDE.md"));
 }
 
 #[test]

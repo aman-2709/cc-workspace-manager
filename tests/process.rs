@@ -1661,8 +1661,9 @@ fn db_files(env: &SynthEnv) -> Vec<std::path::PathBuf> {
 /// resume command from the recorded cwd, escaped); no prompt text persisted by default; privacy
 /// mode removes the listed fields. Security acceptance tests **2** (session files unchanged by
 /// parsing and clearing the index), **8** (canary secrets in prompts, tokens and remote URLs
-/// never reach the trace log) and **10** (clearing the index and deleting the database leave
-/// project and Claude data byte-identical). `service uninstall --purge` arrives in M4.
+/// never reach the trace log) and **10** (clearing the index, and deleting the database followed
+/// by a restart that re-ingests everything from byte 0, leave project and Claude data
+/// byte-identical). `service uninstall --purge` arrives in M4.
 #[test]
 fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
     let t = common::tempdir();
@@ -1802,7 +1803,41 @@ fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
     );
     assert_eq!(mode(&file), 0o600);
 
-    // Nothing of the prompts was stored; then clear the index (projects stay).
+    // Nothing of the prompts was stored while the index is populated (scanned **before** the
+    // clear, so the check does not depend on deleted bytes lingering); then clear the index
+    // (projects stay) and scan again after the daemon stopped.
+    let db_bytes = || {
+        let mut db = Vec::new();
+        for f in db_files(&env) {
+            db.extend(std::fs::read(f).unwrap_or_default());
+        }
+        db
+    };
+    let prompt_canaries = [
+        "SYNTHETIC first prompt",
+        "SYNTHETIC last prompt",
+        "SYNTHETIC suggestion",
+        "SYNTHETIC session-only prompt",
+        "SYNTHETIC tool output",
+        "SYNTHETIC-CANARY-API-BLOB",
+        "SYNTHETIC-CANARY-ACCOUNT",
+    ];
+    let before_clear = db_bytes();
+    let title = "Alpha tests, continued";
+    assert!(
+        before_clear
+            .windows(title.len())
+            .any(|w| w == title.as_bytes()),
+        "the index holds the sessions' titles before the clear"
+    );
+    for canary in prompt_canaries {
+        assert!(
+            !before_clear
+                .windows(canary.len())
+                .any(|w| w == canary.as_bytes()),
+            "{canary} stored"
+        );
+    }
     let (st, _, b) = d.http(
         "POST",
         "/api/v1/session-index/clear",
@@ -1821,22 +1856,11 @@ fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
     let bootstrap_like = d.open_url(&env);
     let (code, log) = d.stop();
     assert_eq!(code, Some(0), "{log}");
-    let mut db = Vec::new();
-    for f in db_files(&env) {
-        db.extend(std::fs::read(f).unwrap_or_default());
-    }
-    for canary in [
-        "SYNTHETIC first prompt",
-        "SYNTHETIC last prompt",
-        "SYNTHETIC suggestion",
-        "SYNTHETIC session-only prompt",
-        "SYNTHETIC tool output",
-        "SYNTHETIC-CANARY-API-BLOB",
-        "SYNTHETIC-CANARY-ACCOUNT",
-    ] {
+    let db = db_bytes();
+    for canary in prompt_canaries.iter().chain([&title]) {
         assert!(
             !db.windows(canary.len()).any(|w| w == canary.as_bytes()),
-            "{canary} stored"
+            "{canary} in the database files after the clear"
         );
     }
 
@@ -1859,10 +1883,33 @@ fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
         assert!(!log.contains(canary), "{canary:?} reached the log");
     }
 
-    // Test 10: delete the database; tests 2 and 10: project and Claude data byte-identical.
+    // Test 10: delete the database and start again on the empty one: a full re-ingest of every
+    // session file from byte 0 (and a full marker scan). Wait until every file is indexed, stop,
+    // then tests 2 and 10: project and Claude data byte-identical.
     for f in db_files(&env) {
         let _ = std::fs::remove_file(f);
     }
+    let d = Daemon::start_with_env(&env, &[], &[("PATH", &path_env)]);
+    let token = d.login(&env);
+    d.wait_scan_done(&token);
+    let st = d.get_json(&token, "/api/v1/discovery/status");
+    let (files, indexed) = (
+        st["sessions"]["files"].as_u64().unwrap(),
+        st["sessions"]["indexed"].as_u64().unwrap(),
+    );
+    assert!(files > 0 && indexed == files, "re-ingested: {st}");
+    assert_eq!(
+        st["scope"], "full",
+        "an empty database means a first launch"
+    );
+    let page = d.get_json(&token, "/api/v1/projects?limit=200");
+    assert_eq!(
+        project_by_name(&page, "session-only")["sessions"]["count"],
+        1,
+        "the sessions are back"
+    );
+    let (code, log) = d.stop();
+    assert_eq!(code, Some(0), "{log}");
     assert_eq!(
         snapshot(&env.claude_dir),
         claude_before,
