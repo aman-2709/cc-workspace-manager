@@ -267,9 +267,16 @@ fn install_start_stop_restart_status_doctor_uninstall_and_purge_acceptance_2_and
         out.contains("Installed") && out.contains("(running)"),
         "{out}"
     );
-    assert!(
+    // The hint about starting at boot is printed unless lingering is already enabled for the
+    // user the test runs as. That is the real machine's state (`/var/lib/systemd/linger`), which
+    // no synthetic environment changes: off on a developer machine, on for a CI runner's user.
+    // Both states of the hint itself are unit-tested in `systemd.rs`.
+    let user = cc_workspace_manager::systemd::user_name(nix::unistd::geteuid().as_raw());
+    let lingering = cc_workspace_manager::systemd::linger_enabled(user.as_deref());
+    assert_eq!(
         out.contains("loginctl enable-linger"),
-        "lingering is documented: {out}"
+        lingering != Some(true),
+        "the lingering hint does not match this machine's state ({lingering:?}): {out}"
     );
     assert_eq!(
         std::fs::read_to_string(w.unit()).unwrap(),

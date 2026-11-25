@@ -71,6 +71,18 @@ pub fn linger_enabled(user: Option<&str>) -> Option<bool> {
     Some(Path::new("/var/lib/systemd/linger").join(user?).exists())
 }
 
+/// What `ccwm service install` says about starting at boot: a hint naming the command, unless
+/// lingering is known to be enabled already (then there is nothing to suggest). ccwm never runs
+/// the command itself.
+pub fn linger_hint(linger: Option<bool>, user: Option<&str>) -> Option<String> {
+    (linger != Some(true)).then(|| {
+        format!(
+            "It starts when you log in. To start it at boot, before you log in, enable lingering: `loginctl enable-linger {}` (may need administrator authorization).",
+            user.unwrap_or("$USER")
+        )
+    })
+}
+
 /// The name of the user `uid` (for the linger check and the documentation hints).
 pub fn user_name(uid: u32) -> Option<String> {
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
@@ -397,6 +409,24 @@ mod tests {
         ] {
             assert_eq!(confirm("Purge?", &mut input.as_bytes()), want, "{input:?}");
         }
+    }
+
+    /// The hint depends on the host's lingering state, so both states are checked here, where
+    /// the state is an argument (the service test can only see the state of the machine it
+    /// runs on: off on a developer machine, on for a CI runner's user).
+    #[test]
+    fn the_boot_hint_is_given_unless_lingering_is_already_enabled() {
+        assert_eq!(linger_hint(Some(true), Some("alice")), None);
+        for linger in [Some(false), None] {
+            let hint = linger_hint(linger, Some("alice")).unwrap();
+            assert!(
+                hint.contains("`loginctl enable-linger alice`")
+                    && hint.contains("administrator authorization"),
+                "{hint}"
+            );
+        }
+        let hint = linger_hint(Some(false), None).unwrap();
+        assert!(hint.contains("`loginctl enable-linger $USER`"), "{hint}");
     }
 
     #[test]

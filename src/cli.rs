@@ -601,12 +601,10 @@ fn service_install() -> Result<()> {
         outln!("The service was already running: `ccwm restart` applies the new unit.");
     }
     report_running("running")?;
-    let linger = systemd::linger_enabled(systemd::user_name(uid).as_deref());
-    if linger != Some(true) {
-        outln!(
-            "It starts when you log in. To start it at boot, before you log in, enable lingering: `loginctl enable-linger {}` (may need administrator authorization).",
-            systemd::user_name(uid).unwrap_or_else(|| "$USER".into())
-        );
+    let user = systemd::user_name(uid);
+    let linger = systemd::linger_enabled(user.as_deref());
+    if let Some(hint) = systemd::linger_hint(linger, user.as_deref()) {
+        outln!("{hint}");
     }
     Ok(())
 }
