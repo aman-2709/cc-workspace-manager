@@ -170,7 +170,10 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
 - [x] musl release binary built, stripped, static, smoke-tested in a synthetic env; package + `sha256sum -c` locally
 - ~~Test 5 network-namespace variant~~ — removed in the v0.1.0 fix pass (it cannot start the daemon without
   weakening the ownership checks); test 5 uses strace
-- [ ] CI and the release workflow on GitHub (needs a push: owner action)
+- [x] CI on GitHub: green as of `2b97ea0` (pushed by the maintainer). The first runs found two tests that
+  depended on the runner: a rejected connection closing before the client wrote (`7323ef9`), and the lingering
+  state of the runner's user (`2b97ea0`)
+- [ ] The release workflow on GitHub (runs on a tag: owner action)
 - [ ] Fresh-account install from the archive, start at login / at boot with lingering (owner, release checklist)
 - [ ] Manual two-user check (owner; procedure in docs/two-user-verification.md)
 - [ ] History/secret audit sign-off, repository recreation, naming-conflict check (O3), tag + release (owner;

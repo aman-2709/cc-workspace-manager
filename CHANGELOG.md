@@ -84,8 +84,8 @@ These never shipped; they are listed because the review is part of the repositor
   the ownership checks; `strace` tracing and the seccomp filter cover it).
 
 ### Known limitations
-- Linux x86_64 only, and only the environments above were tested. Not yet run: CI on GitHub, the release
-  workflow, a fresh-account install from the archive, and the two-user check. The real `claude` binary
+- Linux x86_64 only, and only the environments above were tested. Not yet run: the release workflow, a
+  fresh-account install from the archive, and the two-user check. The real `claude` binary
   has not been run under the seccomp filter (the tests use a stand-in): if its `--version` needs a
   socket, `ccwm doctor` reports the check as failed.
 - The ignore-file limits apply per project, not across projects. The directory trust check does not read
