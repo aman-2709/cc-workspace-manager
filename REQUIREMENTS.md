@@ -55,32 +55,35 @@ Non-goals for v0.1:
 
 ### 4.1 Roots and scope
 - The default discovery root is the home directory of the non-root user running the service, resolved by platform mechanisms (`$HOME` if it is an absolute path to a directory owned by that user, which is what systemd and login shells provide and what the synthetic test environment of §19 overrides; otherwise the passwd entry of the effective UID). Never hardcode `~/dev` or a username. Refuse to run as root.
-- Users can add, remove and narrow roots (including roots outside home that they explicitly authorize) and add exclusion patterns. Changes apply without restart (watchers are reconfigured safely).
+- Users can add, remove and narrow roots (including roots outside home that they explicitly authorize) and add exclusion patterns. Changes apply without restart (watchers are reconfigured safely). *(M3: root, exclusion, depth and file-system changes are saved and take effect at the next start — spec change pending approval, see §9 and Appendix A.)*
 - Hard safety boundaries that explicit roots can never override: `/proc`, `/sys`, `/dev`, `/run`, the ccwm data, config, state and runtime directories, and any path not readable by the user.
 - `same_file_system = true` by default. Symlinked directories are not followed by default. Max traversal depth defaults to 10 (configurable).
 - Paths that are not valid UTF-8 are skipped and counted (`non_utf8` in the discovery status); they are never registered.
 - Discovery reads **directory entries and metadata only**. File contents are read only for CLAUDE.md markers (bounded size; a content hash is kept to recognise moved projects, §4.5), Claude session files, and `.gitignore` files and `.git/info/exclude` (bounded) for the in-process ignore evaluation of §5.2.
 
 ### 4.2 Default exclusions (configurable)
-Skip hidden directories by default (`.*`, which covers `.git`, `.cache`, `.local`, `.config`, `.ssh`, `.npm`, `.cargo`, `.rustup`, `.claude`, `.venv`, browser profiles, trash). Also skip `node_modules`, `target`, `build`, `dist`, `venv`, `__pycache__`, `~/snap`, cloud-sync and FUSE mounts (detected via mount type where possible, e.g. `fuse.*`), VM and container image directories (e.g. `~/VirtualBox VMs`, `~/.local/share/containers` already hidden), and generated artifact and log directories. Prune excluded directories **before** descending. `~/.claude` is read only by the session integration (§7).
+Skip hidden directories by default (`.*`, which covers `.git`, `.cache`, `.local`, `.config`, `.ssh`, `.npm`, `.cargo`, `.rustup`, `.claude`, `.venv`, browser profiles, trash). Also skip `node_modules`, `target`, `build`, `_build`, `dist`, `venv`, `__pycache__`, `~/snap`, cloud-sync and FUSE mounts (detected via mount type where possible, e.g. `fuse.*`), VM and container image directories (e.g. `~/VirtualBox VMs`, `~/.local/share/containers` already hidden), and generated artifact and log directories. Prune excluded directories **before** descending. `~/.claude` is read only by the session integration (§7).
 
 ### 4.3 What qualifies as a project
-A directory is a project candidate if **either** of these holds (both enabled by default):
-1. **Marker:** it contains a file named exactly `CLAUDE.md` (case-sensitive). A `CLAUDE.md` that is a symlink counts as a marker (a common `AGENTS.md` pattern). Its target is read only if it resolves to a regular file inside the same project directory.
-2. **Session:** a Claude Code session record's working directory (cwd) exists, lies within the allowed roots, and is not excluded.
+Sessions are the **primary** discovery source; the marker scan is secondary (§4.5). A directory is a project candidate if **either** of these holds (both enabled by default):
+1. **Session:** the first recorded working directory (cwd) of a Claude Code session exists, lies within the allowed roots, and is not excluded; it resolves to a project root as in §4.4.
+2. **Marker:** it contains a file named exactly `CLAUDE.md` (case-sensitive). A `CLAUDE.md` that is a symlink counts as a marker (a common `AGENTS.md` pattern). Its target is read only if it resolves to a regular file inside the same project directory.
 
 Never a project: the home directory itself, `~/.claude`, anything under a hard safety boundary, and paths in the ignore list.
 
 ### 4.4 Resolving project roots
-- **Session cwd → project root:** walk upward from the recorded cwd to the nearest directory that has a `CLAUDE.md` or is a Git work-tree root, without crossing the discovery-root boundary. If none is found, the cwd itself becomes the project root (session-only, non-Git). If the result is the home directory, don't register it; count it as "unassigned sessions" in discovery stats.
+- **Session cwd → project root:** walk upward from the recorded cwd (canonicalized) to the nearest directory that is a Git work-tree root (a `.git` entry) or has a `CLAUDE.md`, without crossing the discovery-root boundary and never reaching the home directory (a dotfiles repository at home is not a project's repository). If none is found, the cwd itself becomes the project root (session-only, non-Git). Then the nested rule below applies against the registered projects.
+- **Unassigned sessions** (never projects; counted by reason in the discovery status): no usable cwd (`no_cwd`), a cwd that no longer exists or is not a directory (`nonexistent`), the home directory or an ancestor of it (`home`), a temporary directory — `/tmp`, `/var/tmp`, `/dev/shm`, `$TMPDIR` — unless the cwd is inside the home directory (`temporary`), outside every discovery root (`outside_roots`), below an excluded directory or a hard boundary (`excluded`). Unassigned sessions are resolved again at every reconciliation (a cwd may appear later).
 - **Store both** the resolved project root (for grouping) and the original session cwd (the **first** recorded cwd, for resume, §8).
 - **Nested candidates:** if candidate B lies inside candidate A, B is a separate project only if B is a Git work-tree root different from A's. Otherwise B's `CLAUDE.md` is treated as a nested instruction file belonging to A. Ordinary Git subdirectories never become projects.
 - File activity inside a nested project is attributed **only** to that nested project, never to its parent.
 - Canonicalize all paths and deduplicate on the canonical path. Record every discovery source per project (`marker`, `session`, or both) and show it in the UI.
 
 ### 4.5 Lifecycle
-- **First launch:** the server starts immediately. Discovery runs in the background and publishes projects progressively over WebSocket. **Later launches:** cached projects are shown immediately and reconciled in the background.
-- **New projects:** a new `CLAUDE.md` in a watched directory (or a new session cwd) registers a project, enriches it and publishes it live, without a restart or page reload. In unwatched locations, the project appears at the next reconciliation.
+- **First launch:** the server starts immediately. Discovery runs in the background and publishes projects progressively over WebSocket: sessions first, then a **full marker scan** of every root (to catch projects whose transcripts Claude Code already pruned). **Later launches:** cached projects are shown immediately and reconciled in the background.
+- **Marker-scan scope after the first full scan:** reconciliations scan for markers only below the **development roots**: the parent directories of present session-discovered projects that lie within a discovery root, walked 3 levels deep (a development root that is a configured root or the home directory: 1 level). The setting "Scan entire home" (`discovery.full_scan`) restores a full scan of every root at every reconciliation. The discovery status reports the scope and the development roots.
+- **Persistence:** a project, once discovered, persists while its directory exists, even after its marker or its session files are deleted. It becomes **missing** when its directory is gone (and its root is available); a missing project whose directory returns is revived with its id.
+- **New projects:** a new `CLAUDE.md` in a watched directory, or a new session (the session directories are watched, §7.2), registers a project, enriches it and publishes it live, without a restart or page reload. In unwatched locations, the project appears at the next reconciliation (for markers: if inside the scan scope above).
 - **Moves and renames:** use paired inotify rename events when available. Otherwise treat a missing project plus a new project with the same Git HEAD commit and remote (or the same CLAUDE.md content hash for non-Git projects) as a move, and keep the project's ID. If no match is found, mark the old project **missing** (shown in a "Missing" filter) and purge it after the retention period (default 30 days, configurable). Never silently delete projects.
 - **Ignore:** users can permanently ignore a project. The ignore is stored by canonical path, and source files are untouched. Ignored projects are hidden and can be un-ignored in Settings.
 - **Reconciliation:** a low-priority scan of the roots (default every 10 minutes, configurable). It must not overlap with a running scan, must use bounded concurrency, and must back off on errors. Manual refresh triggers a coalesced reconciliation.
@@ -95,7 +98,7 @@ Never a project: the home directory itself, `~/.claude`, anything under a hard s
 - Add watches dynamically for newly created eligible directories, and remove obsolete ones.
 - Use exactly **one** notify watcher (one inotify instance) for the whole daemon, because `max_user_instances` is a small shared pool. If the instance cannot be created, start with every project in polled mode and report it (banner, `ccwm doctor`).
 - **Watch budget:** default 25% of `/proc/sys/fs/inotify/max_user_watches` (no fixed ceiling; 8192 if the limit cannot be read), configurable. The inotify pool is shared with IDEs and other tools. Allocation is **breadth first**: every project's root directory, then the parents of project roots (sibling detection), then every project's `.git` and top-level directories, then deeper directories of the most recently active projects first. Gitignored directories (including rules from a repository root above the project) are never watched.
-- **Degraded mode:** when the budget or the kernel limit is reached, or on queue overflow (`IN_Q_OVERFLOW`), never change kernel limits automatically, show a degraded-monitoring banner (one line, details behind a toggle), and cover what has no watch in reconciliation (mtime checks): a project whose root is watched but not all of its tree is *partly watched* and only its unwatched subtrees are polled; a project without a root watch (or without an inotify instance) is *polled* as a whole. `ccwm status` reports partly watched and polled projects separately. Exposing `ccwm doctor` guidance is fine.
+- **Degraded mode:** when the budget or the kernel limit is reached, or on queue overflow (`IN_Q_OVERFLOW`), never change kernel limits automatically, and cover what has no watch in reconciliation (mtime checks): a project whose root is watched but not all of its tree is *partly watched* and only its unwatched subtrees are polled; a project without a root watch (or without an inotify instance) is *polled* as a whole. `ccwm status` reports partly watched and polled projects separately. **Partly watched projects with nothing polled are normal operation, not degraded.** "DEGRADED" and the degraded-monitoring banner (one line, details behind a toggle) are reserved for real failures: no inotify instance, a queue overflow being recovered, or projects without any watch (polled). Exposing `ccwm doctor` guidance is fine.
 - Debounce and coalesce events per project (default 2 s). Bounded queues everywhere.
 - Never generate activity from ccwm's own writes. The data, config and state directories are excluded unconditionally.
 
@@ -147,7 +150,8 @@ The thresholds are configurable. The **"Modified this week"** statistic = Today 
 - Maintain a **versioned corpus of synthetic fixture files** (`tests/fixtures/sessions/<claude-code-version>/…`) that reproduce the verified schema: real record shapes, subagent/sidechain records, summaries, tool-result "user" records, malformed lines and truncated files. **Never commit real session records, even redacted ones.**
 - Schema verification follows the development-time privacy rules (§19).
 - Parse unknown record types and unknown fields without failing (skip them and count them).
-- Only top-level `projects/<encoded-dir>/<session-id>.jsonl` files are sessions. Files under `<session-id>/subagents/` and everything else in the tree are ignored in v0.1 (counted as skipped) and the limitation is documented.
+- **Allowlist parsing** (maintainer decision, M3): only the fields ccwm needs are read — `type`, `sessionId`, `uuid`, `timestamp`, `cwd`, `gitBranch`, `isMeta`, `isSidechain`, `isCompactSummary`, `promptSource`, `turnOrigin`, `message.role`, the `message.content` text of genuine prompts (on demand only), `aiTitle`, the `continued-in` / `derived-from` links, `version` and `entrypoint`. ccwm never reads or stores `api-request-blob` content, `toolUseResult`, `wireToolInputs`, attachment bodies, `serverClassifierContext`, `queue-operation` content, or the account/organization UUIDs of `session-owner` / `bridge-session` records (the JSON parser skips them without materializing them).
+- Only top-level `projects/<encoded-dir>/<session-id>.jsonl` files are sessions. Files under `<session-id>/subagents/` and everything else in the tree are ignored in v0.1 (counted as skipped) and the limitation is documented. Session files up to ~80 MB are expected (the largest seen was 76 MB): incremental parsing and bounded tail/head reads keep the cost proportional to what is new or shown.
 
 ### 7.2 Incremental parsing
 - Keep a checkpoint per file: device, inode, size, byte offset of the last complete line, and mtime.
@@ -157,11 +161,12 @@ The thresholds are configurable. The **"Modified this week"** statistic = Today 
 - There is no per-record deduplication. Sessions store idempotent per-session aggregates (minimum/maximum timestamps, last-wins title) and the byte-offset checkpoint prevents re-reading, so restarts never double-count.
 
 ### 7.3 Extracted data (only what v0.1 needs)
-**Stored metadata** per session: session ID, file path, recorded cwd(s) (first and last seen), start time (the **minimum** timestamp over conversational records, i.e. `user`, `assistant`, `attachment` and `system` records), last activity time (the **maximum**; timestamps are not ordered within a file, so neither the first nor the last line is used), whether it is a subagent/sidechain session (when recorded; always false for ingested files in v0.1), and the recorded title or summary (when present, labeled *recorded*, redacted before storage).
+**Stored metadata** per session: session ID, file path, recorded cwd(s) (first and last seen, in file order), start time (the **minimum** timestamp over conversational records, i.e. `user`, `assistant`, `attachment` and `system` records), last activity time (the **maximum**; timestamps are not ordered within a file, so neither the first nor the last line is used), whether it is a subagent/sidechain session (always false for ingested files in v0.1), the Git branch, Claude Code version and entrypoint last recorded, the `continued-in` target and `derived-from` sources (validated UUIDs), and the title.
+- **Session title** (maintainer decision): the **latest `ai-title` record** (file order), redacted, at most 300 characters, labeled "AI title (recorded by Claude Code)". Without one, the card says "Untitled session" and the detail panel shows the first genuine prompt, labeled "first prompt", read on demand.
 
 **Prompt text is not stored by default.**
 - The **last genuine user prompt** (and the first-prompt fallback) are read **on demand** when the detail panel is opened. Use a bounded tail read (or head read for the first prompt) of the original session file, at most 4 MiB, and truncate to 2,000 characters. Redact the result and don't persist it.
-- *Genuine user prompt:* Claude Code also writes tool results and meta/command records as `user`-type records. A genuine prompt is a `user` record whose `promptSource` is `typed` or `queued`. `promptSource` values `sdk` and `system` are never genuine (the session itself still counts), and any other value is not genuine unless the maintainer's schema output (§19) shows otherwise. Records **without** `promptSource` go through a multi-field classifier built from the verified schema: not `isMeta`, not `isSidechain`, not `isCompactSummary`, no `toolUseResult` and no `tool_result` content, `turnOrigin` not `task_notification`, and text not beginning with a known synthetic tag. The last prompt is taken from `user` records, **never** from `last-prompt` records (which are truncated to about 200 characters).
+- *Genuine user prompt* (maintainer decision, M3): Claude Code also writes tool results and meta/command records as `user`-type records. A genuine prompt is a `user` record with `message.role = "user"`, not `isMeta`, not `isSidechain`, not `isCompactSummary`, without `toolUseResult` and without `tool_result` content, whose text does not begin with a known synthetic tag, and whose `promptSource` is `typed`, `queued` or `suggestion_accepted` (`sdk` and `system` are never genuine; the session itself still counts; any other value is not genuine). Records **without** `promptSource` (older versions) pass the same checks plus `turnOrigin` not `task_notification`. The known synthetic tags are the §19 script's table **except `<pasted_content>`**, which the schema output shows at the start of a `queued`, human-origin prompt (text the user pasted). Text is the string content or the joined `text` blocks (images are skipped). The last prompt is taken from `user` records, **never** from `last-prompt` records (which are truncated to about 200 characters).
 - Cards show the recorded title, or "Untitled session". The truncated **first** genuine user prompt, explicitly labeled "first prompt", appears only in the detail panel, on demand.
 - Setting: "Store prompt text" (**opt-in, default off**). When on, the last prompt is cached in SQLite (redacted) for faster display. Turning it off deletes the cached text.
 - Never store full transcripts, assistant responses, or tool inputs or outputs in v0.1.
@@ -175,9 +180,10 @@ The thresholds are configurable. The **"Modified this week"** statistic = Today 
 
 - Command form: `cd -- '<recorded-session-cwd>' && claude --resume <session-id>`
 - The cwd is the session's **first recorded cwd** (a session can change directory later; the first cwd matches the directory Claude Code stores the session under), not the last cwd and not the resolved project root.
+- **Continuations** (maintainer decision, M3): if the session was continued in another session (`continued-in` link), the command resumes the **latest recorded continuation** (links followed while the target is in the index; cycle-safe, at most 16 hops), with that session's first recorded cwd. A continuation that is not in the index is not followed: the session itself is offered with a warning.
 - Session IDs must pass strict UUID validation, or no command is generated.
 - Paths are shell-escaped with POSIX single quotes (each `'` becomes `'\''`). Add a unit test with adversarial paths (spaces, quotes, `$()`, backticks, newlines, leading `-`).
-- **CLI verification:** at startup and in `ccwm doctor`, locate `claude` on `PATH` and run `claude --version` and `claude --help` with a 5 s timeout. Confirm `--resume` is supported and cache the result keyed by binary path and mtime. Never run it per request.
+- **CLI verification:** at startup (and at each reconciliation, only if the binary changed) and in `ccwm doctor`, locate `claude` on `PATH` and run `claude --version` and `claude --help` with a 5 s timeout, inside the daemon's sandbox. Confirm `--resume` is supported and cache the result keyed by binary path, size and mtime. Never run it per request. The result is in `/service/status` and `ccwm status`.
 - If `claude` is missing or unverified, still show the command with a warning. If the recorded cwd no longer exists, show a warning.
 - The UI offers **copy only**. ccwm never executes resume commands or anything else taken from sessions or projects.
 
@@ -192,7 +198,7 @@ Clean, modern and responsive, inspired by GitHub and Linear without copying thei
 - **Table view:** compact, sortable columns for the same core fields, plus actions (open details, copy resume command, ignore). Paginate when there are more than 100 rows.
 - Both views share the same data, search, sort and filters. View and theme persist in `localStorage`, and the default view comes from Settings.
 - **Project detail panel** (opened from a card or row): canonical path, discovery sources, Git branch / upstream / ahead-behind, latest commit (short hash, subject, author, date), staged / modified / untracked files (capped at 200, with a count beyond that), latest session (title or first prompt, start and last activity, session count), **last user prompt**, and the **resume command** with a copy button and any warnings. Missing projects show a missing state.
-- **Settings page:** roots, exclusions, ignored projects (un-ignore), scan interval, watch budget, activity thresholds, default view, theme, port (marked "requires restart"), store prompt text, clear session index, missing-project retention. Show the current discovery scope and exclusions in plain language. Validate input and explain which changes need a restart.
+- **Settings page:** roots, exclusions, ignored projects (un-ignore), scan interval, watch budget, activity thresholds, default view, theme, privacy-mode default, port (marked "requires restart"), store prompt text, clear session index, missing-project retention, "Scan entire home" (§4.5). Show the current discovery scope and exclusions in plain language. Validate input and explain which changes need a restart. Changes apply without a restart where the running daemon can apply them safely (scan interval, retention, "Scan entire home", activity thresholds, store prompt text, UI defaults); roots, exclusions, depth, same-file-system, watch budget, port and the session directory are saved and marked "requires restart" (roots outside the startup read set cannot be read before a restart anyway: Landlock, §11.5).
 - **States:** loading, empty (explains the roots and qualification rules), error, partial discovery progress, degraded-monitoring banner, disconnected/reconnecting banner, unauthenticated page ("Run `ccwm open` in a terminal").
 - **Live updates:** WebSocket events for project added/updated/removed, stats and discovery status. Reconnect with exponential backoff and fetch a fresh snapshot after reconnecting.
 
@@ -203,7 +209,8 @@ A one-click toggle in the header (persisted in `localStorage`, with a default in
 - usernames (including Git author names)
 - Git remote URLs
 - session titles, first and last user prompts, and excerpts
-- resume commands
+- resume commands and session cwds
+- the paths of unreadable folders, discovery roots and development roots in the discovery status, the `git`/`claude` program paths and broad read rules in the service status, and the roots, exclusions, session directory and config path in Settings
 
 Applied consistently in cards, table, detail panel, search results and tooltips. Search must not match hidden fields while privacy mode is on. Project-name anonymization is deferred (§18).
 
@@ -284,7 +291,7 @@ All endpoints live under `/api/v1`. They return JSON and use structured errors `
 | POST | `/session-index/clear` | Clear derived session data |
 | GET | `/ws` | WebSocket (auth per §11.2) |
 
-Privacy mode is a per-request flag (`privacy=1`) and a per-WebSocket subscription option.
+Privacy mode is a per-request flag (`privacy=1` on `/projects`, `/projects/{id}`, `/projects/{id}/sessions`, `/discovery/status`, `/service/status` and `/settings`) and a per-WebSocket subscription option (`"privacy": true` in the auth message, or a later `{"type":"privacy","on":…}` message).
 
 ## 13. CLI and service management (v0.1)
 
@@ -295,6 +302,7 @@ Privacy mode is a per-request flag (`privacy=1`) and a per-WebSocket subscriptio
 | `ccwm status` | systemd state plus a `/service/status` summary, including the Git commit of the daemon's build; warns when it differs from the CLI's own build |
 | `ccwm open [--print]` | Get a bootstrap token and open or print the URL |
 | `ccwm scan` | Trigger a refresh through the daemon over the Unix socket and report progress. **Never opens SQLite itself.** Errors clearly if no daemon is running. |
+| (all CLI commands) | When the daemon's socket is not reachable, the CLI waits (up to 5 s) **only while the instance lock is held** (a daemon is starting); with no lock holder it fails immediately. |
 | `ccwm doctor` | Checks: daemon running (verified over the Unix socket), port, inotify limits and usage, Git version, `claude` CLI and resume support, session directory found and readable, data directory permissions, active Landlock protections (filesystem/network, ABI level), lingering status. Suggests fixes and never applies them. |
 | `ccwm service install` / `uninstall [--purge]` | Write or remove the user unit, then `daemon-reload` and `enable --now` / `disable --now`. Uninstall preserves data unless `--purge` is given (with a confirmation prompt). No sudo. |
 | `ccwm auth revoke-all` | Revoke all browser sessions |
@@ -491,6 +499,16 @@ Built from the maintainer's pasted schema output (§19), using synthetic fixture
 | Test 4 without lazy fetch; `sshCommand` control via `ls-remote` | Promisor vectors with `HEAD` removed; controls use commands ccwm runs (§16; M2.1) |
 | Test 5 checks `connect()` only | Plus an `execve` allowlist and zero fetch children for promisor repositories (§16; M2.1, review L3) |
 | Watch budget `min(8192, 25%)`, roots then recency, whole projects polled | 25%, no fixed ceiling; breadth first; *partly watched* projects poll only their unwatched subtrees; `ccwm status` separates partly watched and polled (§5.1; M2.1) |
+| Marker and session discovery on equal footing; full marker scan at every reconciliation | Sessions primary; full marker scan on first launch, then only the development roots; "Scan entire home" restores full scans (§4.3–§4.5; M3, approved) |
+| Missing = not found by the scan | Missing = directory gone; projects persist after their marker or sessions are deleted (§4.5; M3, approved as "projects persist") |
+| Genuine prompt = `promptSource` `typed`/`queued` | Plus `suggestion_accepted`; allowlist parsing; `<pasted_content>` is user text (§7.1, §7.3; M3, approved except the `<pasted_content>` rule — needs approval) |
+| Title = recorded title or summary | Latest `ai-title`, labeled "AI title (recorded by Claude Code)"; first prompt in the detail panel otherwise (§7.3; M3, approved) |
+| Resume the session itself | Resume the latest recorded continuation (`continued-in`) from its first cwd (§8; M3, approved) |
+| `_build` not excluded | `_build` excluded by default (§4.2; M3, approved) |
+| Partly watched ⇒ DEGRADED | DEGRADED and the banner only for real failures (§5.1; M3, approved) |
+| Privacy hides paths, names, URLs, titles, prompts, commands | Also unreadable-folder paths (approved) and the other status/settings paths listed in §10 (M3, needs approval) |
+| CLI waits up to 5 s for any unreachable daemon | Waits only while the instance lock is held (§13; M3, approved) |
+| Every setting applies without restart | Live where safe; roots, exclusions, depth, same-file-system, budget, port, session dir need a restart (§9; M3, needs approval) |
 
 ## Appendix B — Assumptions and verdicts
 

@@ -70,6 +70,19 @@ pub struct Subtree {
     pub start: PathBuf,
     /// A registered project already contains `start` (strictly above it).
     pub inside_project: bool,
+    /// Walk at most this many levels below `start` (development roots); `None`: down to
+    /// `max_depth` below the root.
+    pub max_rel_depth: Option<usize>,
+}
+
+/// What a reconciliation's marker scan covers (REQUIREMENTS.md §4.5).
+#[derive(Debug, Clone, Copy)]
+pub enum Scope<'a> {
+    /// Every configured root, `max_depth` deep (first launch, or "scan entire home").
+    Full,
+    /// Only these development roots (parents of session-discovered projects), depth-limited;
+    /// the configured roots are checked for availability but not walked.
+    DevRoots(&'a [Subtree]),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,6 +136,8 @@ struct Frame {
 
 struct Walker<'a> {
     opts: &'a ScanOptions,
+    /// Registered projects (canonical paths): directories below them follow the nested rule.
+    known: &'a HashSet<String>,
     cancel: &'a AtomicBool,
     status: &'a SharedStatus,
     sink: &'a mut dyn FnMut(Vec<Candidate>) -> bool,
@@ -141,6 +156,19 @@ pub fn scan(
     status: &SharedStatus,
     sink: &mut dyn FnMut(Vec<Candidate>) -> bool,
 ) -> ScanSummary {
+    scan_scope(opts, &HashSet::new(), Scope::Full, cancel, status, sink)
+}
+
+/// The marker scan of a reconciliation: [`Scope::Full`] walks every root, [`Scope::DevRoots`]
+/// only the given development roots. `known` projects make the directories below them nested.
+pub fn scan_scope(
+    opts: &ScanOptions,
+    known: &HashSet<String>,
+    scope: Scope<'_>,
+    cancel: &AtomicBool,
+    status: &SharedStatus,
+    sink: &mut dyn FnMut(Vec<Candidate>) -> bool,
+) -> ScanSummary {
     let opts = &opts.normalized();
     status.update(|s| {
         s.phase = Phase::Scanning;
@@ -151,6 +179,7 @@ pub fn scan(
     });
     let mut w = Walker {
         opts,
+        known,
         cancel,
         status,
         sink,
@@ -160,11 +189,30 @@ pub fn scan(
         seen: HashSet::new(),
         roots: Vec::new(),
     };
-    for root in &opts.roots {
-        if w.summary.cancelled {
-            break;
+    match scope {
+        Scope::Full => {
+            for root in &opts.roots {
+                if w.summary.cancelled {
+                    break;
+                }
+                w.scan_root(root);
+            }
         }
-        w.scan_root(root);
+        Scope::DevRoots(subtrees) => {
+            for root in &opts.roots {
+                let state = w.root_state(root).map(|_| "ok").unwrap_or_else(|s| s);
+                w.roots.push(RootStatus {
+                    path: root.to_string_lossy().into_owned(),
+                    state,
+                });
+            }
+            for sub in subtrees {
+                if w.summary.cancelled {
+                    break;
+                }
+                w.scan_subtree(sub);
+            }
+        }
     }
     w.flush();
     let (summary, roots) = (w.summary.clone(), w.roots);
@@ -184,6 +232,7 @@ pub fn scan(
 pub fn scan_subtree(
     opts: &ScanOptions,
     sub: &Subtree,
+    known: &HashSet<String>,
     cancel: &AtomicBool,
     sink: &mut dyn FnMut(Vec<Candidate>) -> bool,
 ) -> ScanSummary {
@@ -191,6 +240,7 @@ pub fn scan_subtree(
     let status = SharedStatus::default();
     let mut w = Walker {
         opts,
+        known,
         cancel,
         status: &status,
         sink,
@@ -298,6 +348,7 @@ impl Walker<'_> {
             state: "ok",
         });
         let root_dev = handle.identity().dev;
+        let limit = self.opts.max_depth;
         self.walk(
             Frame {
                 open: Open::Root(handle),
@@ -307,6 +358,7 @@ impl Walker<'_> {
             },
             &exclusions,
             root_dev,
+            limit,
         );
     }
 
@@ -344,6 +396,9 @@ impl Walker<'_> {
         if self.opts.same_file_system && handle.identity().dev != root_md.dev() {
             return;
         }
+        let limit = sub
+            .max_rel_depth
+            .map_or(self.opts.max_depth, |d| self.opts.max_depth.min(depth + d));
         self.walk(
             Frame {
                 open: Open::Root(handle),
@@ -353,17 +408,19 @@ impl Walker<'_> {
             },
             &exclusions,
             root_md.dev(),
+            limit,
         );
     }
 
-    fn walk(&mut self, first: Frame, exclusions: &Exclusions, root_dev: u64) {
+    /// Preorder walk from `first`, at most `depth_limit` levels below the configured root.
+    fn walk(&mut self, first: Frame, exclusions: &Exclusions, root_dev: u64, depth_limit: usize) {
         let mut stack = vec![first];
         while let Some(frame) = stack.pop() {
             if self.cancel.load(Ordering::Relaxed) {
                 self.summary.cancelled = true;
                 return;
             }
-            self.visit(frame, exclusions, root_dev, &mut stack);
+            self.visit(frame, exclusions, root_dev, depth_limit, &mut stack);
         }
     }
 
@@ -372,6 +429,7 @@ impl Walker<'_> {
         frame: Frame,
         exclusions: &Exclusions,
         root_dev: u64,
+        depth_limit: usize,
         stack: &mut Vec<Frame>,
     ) {
         self.summary.dirs_visited += 1;
@@ -432,8 +490,12 @@ impl Walker<'_> {
                 inside_project = true;
             }
         }
+        // A registered project (e.g. found from a session) contains its subdirectories too.
+        if frame.path.to_str().is_some_and(|p| self.known.contains(p)) {
+            inside_project = true;
+        }
 
-        if frame.depth >= self.opts.max_depth {
+        if frame.depth >= depth_limit {
             return;
         }
         subdirs.sort_by(|a, b| a.0.cmp(&b.0));

@@ -58,12 +58,19 @@ src/
                   #     (porcelain v2 -z, config -z, log, version, remote-URL sanitizing). The ONLY module that spawns `git`.
   watch/          # M2: mod.rs (Monitor actor: one inotify instance, watch table, budget, polled mode, debounce, rename pairing,
                   #     meaningful-activity rules -> Signals), tree.rs (fd-based project-tree walk + in-process gitignore matcher)
-  tracker.rs      # M2: reconciliation loop, missing/purge, enrollment (walk -> inferred activity -> Git -> move matching -> watches),
-                  #     handling of the monitor's Signals, GitQueue (4 concurrent, one refresh per project, rerun-once)
+  tracker/        # M2: mod.rs: reconciliation loop, missing/purge, enrollment (walk -> inferred activity -> Git -> move matching -> watches),
+                  #     handling of the monitor's Signals, GitQueue (4 concurrent, one refresh per project, rerun-once);
+                  #     M3: sessions.rs (session ingest: list -> incremental parse -> resolve cwd -> upsert projects -> store),
+                  #     dev-root marker scans, stat-based missing/revive, live settings, `claude` CLI check
   events.rs       # M2: Notifier (bounded change queue), coalesced batches, Hub (broadcast of pre-serialized JSON), until_stopped
   view.rs         # M2: API/WS JSON shape of projects (display_path, activity status, git summary/detail, monitoring)
   http/ws.rs      # M2: GET /api/v1/ws
-  claude/ privacy.rs           # M3   (claude/ is the only module that knows Claude's file formats)
+  claude/         # M3: the ONLY module that knows Claude Code's formats: locate.rs (top-level session files, fd-based),
+                  #     record.rs (allowlisted serde structs, lenient fields), parse.rs (checkpoints + aggregates),
+                  #     prompt.rs (genuine-prompt classifier, bounded on-demand reads), redact.rs, resume.rs (UUID, POSIX quoting),
+                  #     cli.rs (`claude --version/--help`, cached by path+size+mtime)
+  discovery/resolve.rs         # M3: session cwd -> project root, unassigned reasons
+  (privacy)                    # M3: no module of its own: `view::Privacy` omits fields on the server (view.rs, service.rs)
 build.rs                       # M2-pre: CCWM_GIT_COMMIT = 12-hex HEAD (+ "-dirty"), or "unknown"; runs git on THIS repo at build time only
 web/ index.html app.css app.js # embedded with include_str!
 scripts/ inspect-session-schema.py   # §19: maintainer-run, structure-only
@@ -91,7 +98,7 @@ flowchart LR
     WATCH[watch::Monitor<br/>1 inotify instance]
     TRK[tracker<br/>reconcile + signals]
     PUB[publisher -> Hub]
-    SESS[claude:: M3]
+    SESS[tracker::sessions<br/>claude:: parse]
     GIT[git:: GitQueue x4]
   end
   FS[(home / roots)] -->|dir entries + metadata| SCAN
@@ -113,9 +120,11 @@ flowchart LR
   TRK --> W
   W -.->|after commit: Notifier| PUB
   PUB -->|ws events| HTTP
-  SESS -.-> W
+  CLD[(Claude config dir<br/>projects/*/*.jsonl)] -->|read-only, incremental| SESS
+  WATCH -->|Signal::Sessions| SESS
+  SESS -->|session projects + aggregates| W
 ```
-Dashed = M3. The CLI never uses TCP and never reads a token file; the browser never reaches the socket.
+The CLI never uses TCP and never reads a token file; the browser never reaches the socket.
 
 ### Start sequence (`ccwm serve`)
 1. Refuse if `geteuid()==0`. `umask(0o077)`. Parse args/config path.
@@ -147,6 +156,7 @@ banned (§11.5).**
 | `jiff` (M2, approved) | calendar days in the system time zone (DST-correct day boundaries) |
 | `notify` 9 (M2) | the single inotify watcher; brings `inotify`, `inotify-sys` (ISC), `mio`, `walkdir`, `xxhash-rust` (BSL-1.0); `notify` itself is CC0-1.0 — licenses added to `deny.toml` (flagged for review) |
 | `axum` `ws` (M2) | WebSocket upgrade; brings `tokio-tungstenite`/`tungstenite`, `sha1` 0.10, `base64` 0.22, `rand` 0.9 (`getrandom` 0.3). **axum enables `tokio-tungstenite`'s default `connect` feature** (a WebSocket client entry point): no extra crate, never called, TCP connect denied by Landlock; noted in SECURITY.md. Duplicate-version warnings (base64, digest/sha1 vs sha2, getrandom) are accepted (`multiple-versions = "warn"`) |
+| `regex` 1.x (M3, approved; `default-features = false`, `std`, `perf`, `unicode-perl`, `unicode-case`) | secret redaction of titles and prompts (`claude/redact.rs`); `regex-automata`/`regex-syntax` were already in the tree through `ignore` |
 | dev: `tempfile` | temp dirs/repos |
 
 Not added: `ureq`/`reqwest`/any client; `rust-embed` (`include_str!` for three files); `tracing-journald`
@@ -208,8 +218,16 @@ or name a newer file; `path = NULL` keeps the file), `StoreGit`, `MarkMissing`, 
 (deletes a duplicate row already at the new path, keeps the id, moves the ignore entry), `SetIgnored`; `UpsertProjects`
 now returns per-row `{id, inserted, revived}` and clears `missing_since`.
 
-Later: **M3** `sessions` (aggregates only: min/max timestamps, first/last cwd, title, `is_sidechain`) and
-`session_file_checkpoints`; prompt text only if the opt-in "Store prompt text" is on. No per-record table.
+### Migration 4 (M3)
+`sessions(id UUID PK, project_id → projects ON DELETE SET NULL, file_path UNIQUE, first_cwd, last_cwd, started_at
+(min), last_activity_at (max), title (redacted ai-title), git_branch, version, entrypoint, continued_in, derived_from
+JSON, is_sidechain (always 0), unassigned (reason), prompt_text, prompt_at)` — aggregates only; `prompt_text` is set
+only while "Store prompt text" is on (redacted) and cleared whenever the session's aggregate changes.
+`session_file_checkpoints(session_id PK → CASCADE, dev, ino, size, offset, mtime_ns, lines, malformed, oversized,
+unknown, foreign_id)`. `projects` + `session_count`, `session_at` (maintained by the writer from `sessions` on every
+change: sort `session`, filter `has_sessions`), index `(session_at, sort_key, id)`. No per-record table.
+Writer commands added: `StoreSessions`, `AssignSessions`, `DeleteSessions`, `ClearSessionIndex`, `CachePrompt`
+(best effort), `ClearPromptCache`, `Revive`.
 
 **Writer:** one `std::thread`, `sync_channel(1024)` of `WriteCmd` (`UpsertProjects`, `CreateSession`,
 `RotateSession`, `DeleteSession`, `TouchSession`, `RevokeAll`, `SetMeta`, `Flush`, `Shutdown`); commands needing
@@ -236,6 +254,13 @@ same_file_system = true
 `discovery.scan_interval_secs` (600, 60–86400), `discovery.missing_retention_days` (30), `watch.budget` (0 = auto: 25 % of `max_user_watches`, 8192 if unreadable),
 `watch.debounce_ms` (2000), `activity.inactive_after_days` (7), `activity.dormant_after_days` (30),
 `activity.events_per_project` (200), `git.allow_unhardened_status` (false).
+M3 keys: `discovery.full_scan` (false), `sessions.dir` (unset: `$CLAUDE_CONFIG_DIR`, else `~/.claude`; absolute),
+`sessions.store_prompt_text` (false), `ui.default_view` (`cards`), `ui.theme` (`system`), `ui.privacy` (false).
+`PUT /settings` merges a partial object into the saved file, validates the whole configuration, writes
+`<config>.tmp` (0600, fsync) and renames it; the service keeps the config **as loaded from the file** (command-line
+overrides such as `--port` are never written back). Live: scan interval, retention, `full_scan`, activity
+thresholds, `store_prompt_text` (off ⇒ cached prompts deleted), `ui.*`; everything else is listed in
+`restart_required` until the next start.
 
 ---
 
@@ -313,6 +338,31 @@ status per row and the `[from, until)` ranges used by the `activity` filter and 
 boundaries. Sort keys: `k1` = negated time for "newest first", time for "oldest first", `i64::MAX` for unknown (last
 in both orders), then `sort_key`, then `id`; the cursor carries `(k1, sort_key, id)`.
 
+## 7b. M3 sessions and session-based discovery
+
+**Ingest** (`tracker/sessions.rs`; serialized by a lock; at every reconciliation, before the marker scan, and on
+`Signal::Sessions`): list `<config dir>/projects/*/` by descriptor (`claude::locate`; only `<uuid>.jsonl` regular
+files are sessions, everything else is counted as skipped) → for each file, open with `O_NOFOLLOW`, compare
+`(dev, ino, size, mtime)` with the checkpoint, parse from the stored offset (`claude::parse`: complete lines only,
+8 MiB line cap, unknown/malformed/foreign counted; a new inode, a shrink or a same-size rewrite resets) → resolve
+the first cwd of new and unassigned sessions (`discovery::resolve`) → upsert those roots as `session` projects →
+store aggregates + checkpoints in batches of 256 (`StoreSessions`; assigned sessions keep their project) → re-assign
+unparsed unassigned sessions whose resolution changed → delete sessions whose file is gone from a completely listed
+directory (`DeleteSessions`; projects stay) → `Cmd::WatchSessions(projects/ + every listed dir)` → session status.
+
+**Watches**: the monitor watches `projects/` and every `<encoded-dir>` non-recursively (`Owner::Sessions`, first in
+the budget); a new `<encoded-dir>` gets a watch at once; changes are debounced (`watch.debounce_ms`) into
+`Signal::Sessions(dirs)` (`projects/` in the list = everything). Without a watch, the next reconciliation ingests.
+
+**Reconciliation order (M3)**: `claude` check (only if the binary changed) → session ingest → marker scan (full on
+the first launch — meta `full_scan_done_at` absent — or with `discovery.full_scan`; otherwise the development roots,
+`Scope::DevRoots`, each a `Subtree` with `max_rel_depth` 3, or 1 for a configured root / home) with the present
+projects as `known` (nested rule) → missing = present project whose directory is gone (roots whose state is not
+`ok` exempt) → revive missing projects whose directory is back → enroll new/revived → poll → purge.
+
+**Privacy** is applied when building payloads (`view::Privacy`), never in the browser: list/detail/session views
+omit their fields; status and settings JSON have path keys removed. Search in privacy mode ignores the path.
+
 ## 8. API and IPC contracts
 
 ### Connection handling (M1.1)
@@ -370,6 +420,32 @@ unhardened_status_allowed}`, `queues{git_in_flight,websocket_clients}`.
 `project` (`{"project":…}`), `project_removed` (`{"id"}`), `stats`, `discovery`, `monitoring`, `resync` (a lagging
 client, or lost changes: fetch a fresh snapshot). Revalidation on revocation (logout, revoke-all, hourly purge) and
 every 10 s ⇒ 4401. The UI reconnects with back-off 1 s…30 s and refetches after every `ready`.
+M3: the auth message may carry `"privacy": true`; later `{"type":"privacy","on":bool}` switches the subscription.
+The publisher builds each `project` and `discovery` event twice (full and privacy variant, `events::Msg`); each
+client receives the variant of its subscription.
+
+### M3 additions
+- `GET /projects`: `sort=session` (latest session activity; unknown last in both orders), `has_sessions`, `privacy`;
+  in privacy mode `q` matches name and branch only. Project objects add `sessions{count, latest{title (omitted in
+  privacy mode), title_source ("ai_title"|null), last_activity_at}|null}`; `path`/`display_path` are omitted in
+  privacy mode. `/stats` adds `total_sessions`.
+- `GET /projects/{id}?privacy=1`: no `path`, `display_path`, `git_detail.head.author`, `git_detail.remote_url`.
+- `GET /projects/{id}/sessions?limit=1..10&privacy=` → `{"items":[session],"total"}`; session = `{id, started_at,
+  last_activity_at, duration_s, title, title_source, git_branch, version, first_cwd, last_cwd, cwd_changed,
+  last_prompt{state: found|none|unreadable|hidden, text, truncated, at, whole_file}, first_prompt (only when
+  untitled), resume{session_id, command, cwd, via_continuation, warnings[]}}`. Prompts are read from the session
+  file at request time (4 MiB window, redacted, 2,000 characters) unless "Store prompt text" is on and a cached
+  prompt exists. Warning codes: `claude_not_found`, `claude_unverified`, `resume_unsupported`, `cwd_missing`,
+  `no_cwd`, `continuation_not_indexed`.
+- `GET /settings?privacy=` → `{config, restart_required[], effective{roots, session_dir, config_path,
+  default_exclusions, home_only_exclusions, hidden_excluded, max_depth, same_file_system}, ignored[{id, name,
+  display_path}]}`; `PUT /settings` (Origin) with a partial config object → the same; 400 with the validation
+  message otherwise. `POST /session-index/clear` (Origin) → `{"status":"cleared","projects_affected":n}`.
+- `/discovery/status` adds `scope` (`full`|`dev_roots`), `dev_roots[]` and `sessions{state, files, indexed,
+  skipped_entries, malformed_lines, oversized_lines, unknown_records, unassigned{reason: n}}`; with `privacy=1`
+  without root/unreadable/dev-root paths. `/service/status` adds `claude{state (verified|not_found|failed|
+  timed_out|no_resume), program, version, resume_supported}` and `monitoring.session_watches`; with `privacy=1`
+  without program paths and broad read rules.
 
 Keyset cursors: base64url JSON `{s,o,k,i}`; a cursor whose `s`/`o` differ from the request, or is malformed, ⇒ 400.
 
@@ -444,37 +520,53 @@ git://127.0.0.1:…` ⇒ `EACCES`, the listener receives nothing) and `git init`
 
 ---
 
-## 11. Verified Claude Code session schema (structural inspection by the agent, accepted by the maintainer; further inspection only via §19)
+## 11. Verified Claude Code session schema (structure only, via the §19 script; accepted by the maintainer)
 
-Data written by Claude Code 2.1.217–2.1.331 (17 versions on one machine). 697 top-level session files, 83
-subagent files, 498 MB; largest file 76 MB; longest line 1.9 MB (≥17 lines > 1 MiB) ⇒ the 8 MiB cap is safe;
-0 malformed lines. Claude Code prunes old sessions, so a project's latest session can disappear.
+First inspection 2026-11-23 (697 files); refreshed for M3 from the maintainer's run of
+`scripts/inspect-session-schema.py` on 2026-11-24 (checked for leaks by the maintainer; the agent read only that
+output, never a session file). Claude Code 2.1.217–2.1.331 (17 versions); **819** top-level session files (91,581
+lines), 84 subagent files (28,340 lines); largest session file 76 MB; 0 malformed and 0 oversized lines; every
+record's `sessionId` equals its file stem; 817/819 files have unordered timestamps (9 where the first is not the
+minimum, 7 where the last is not the maximum); 8 files change cwd; 0 files without a cwd; one timestamp shape
+(`YYYY-MM-DDTHH:MM:SS.mmmZ`). Claude Code prunes old sessions, so a project's latest session can disappear.
 
 **Layout**
 ```
 <config dir>/projects/<encoded-cwd>/<session-uuid>.jsonl                     # sessions
-<config dir>/projects/<encoded-cwd>/<session-uuid>/subagents/agent-<hex>.jsonl (+ .json)   # ignored in v0.1
-<config dir>/projects/<encoded-cwd>/<session-uuid>/tool-results/…, memory/…, .session-aliases   # not sessions
+<config dir>/projects/<encoded-cwd>/<session-uuid>/subagents/agent-<id>.jsonl (+ <name>.json)   # ignored in v0.1
+<config dir>/projects/<encoded-cwd>/<session-uuid>/tool-results/<name>.txt   # not sessions
+<config dir>/projects/<encoded-cwd>/memory/<name>.md, .session-aliases      # not sessions
 ```
-Filename stem = `sessionId` in 697/697 files and always a UUID; `<encoded-cwd>` = first cwd with non-alphanumerics → `-`
-(697/697) — a consistency check only, never used to derive paths. Subagent records carry `isSidechain:true`,
-`agentId` and the parent's `sessionId`.
+`<encoded-cwd>` is never decoded (a consistency check at most).
 
-**Records:** ~26 types (`attachment`, `assistant`, `user`, `api-request*`, `last-prompt`, `ai-title`, `system`,
-`queue-operation`, `session-owner`, `cost-state`, `file-history-*`, …); the set drifts between versions ⇒
-unknown types are skipped and counted. `cwd` exists only on `user|assistant|attachment|system` ("conversational");
-`timestamp` is ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS.mmmZ`) on those plus several others.
+**Record types** (29): `agent-color`, `agent-name`, `ai-title`, `api-request`, `api-request-blob`,
+`api-request-shape`, `artifact-autoreact-ledger`, `artifact-comment-monitor`, `assistant`, `atis-latch`,
+`attachment`, `bridge-session`, `continued-in`, `cost-state`, `data-flow-records`, `derived-from`,
+`file-history-delta`, `file-history-snapshot`, `fork-context-ref` (subagent files only), `frame-link`, `last-prompt`,
+`mode`, `permission-mode`, `pr-link`, `queue-operation`, `session-owner`, `system`, `tools-used`, `user`. Unknown
+types are skipped and counted. `cwd`, `uuid`, `parentUuid` exist only on `user|assistant|attachment|system`;
+`timestamp` also on `api-request*`, `continued-in`, `file-history-delta`, `frame-link`, `pr-link`,
+`queue-operation`; `ai-title` has **no** timestamp (title = latest in file order).
+- `ai-title`: `aiTitle`. `continued-in`: `continuedInSessionId` (+ `timestamp`; 2 records). `derived-from`:
+  `sessions[{id,type,via}]`, `v` (4 records; `type`/`via` values not inspected ⇒ stored, not used for resume).
+- `user` discriminators: `promptSource` ∈ {`typed` 512, `queued` 20, `suggestion_accepted` 83, `sdk` 795, `system`
+  278}; `turnOrigin` ∈ {`human`, `sdk`, `task_notification`}; `entrypoint` ∈ {`cli`, `sdk-ts`};
+  `message.content[].type` ∈ {`text`, `image`, `tool_result`, `tool_use`, `thinking`, `tool_addition`}. 31 distinct
+  user-record signatures (`isMeta`, `isSidechain`, `isCompactSummary`, `promptSource`, `turnOrigin`,
+  `toolUseResult`, content kind); every one is a case in `claude::prompt` tests. Notably: `queued` +
+  `<pasted_content>` (a paste ⇒ genuine), `promptSource` absent + `<command-name>` / `<local-command-*>` /
+  `<bash-*>` (synthetic), `system` + `<task-notification>`, sidechain plain text (subagent prompts).
+- Sensitive types and fields exist (`session-owner`/`bridge-session` account and organization UUIDs, `cost-state`,
+  `api-request-blob` payloads, `toolUseResult`, `wireToolInputs`, `serverClassifierContext` with git state and
+  cwds, `mcpMeta`): none is declared in ccwm's structs, so none is materialized.
 
-**Decisions derived from the findings (all in the spec now)**
-1. Timestamps are unordered within files (695/697) ⇒ `started_at = min`, `last_activity_at = max` over conversational records; idempotent aggregates make restarts safe without a per-record dedup key (most types have no `uuid`).
-2. 8 files change cwd mid-session ⇒ store first and last; **resume uses the first** (its encoding names the containing directory). Running `claude --resume` from another directory is untested.
-3. `user` records (7,745): 5,939 tool results (`toolUseResult`, `tool_result` blocks); `promptSource` values seen: `typed`, `queued`, `sdk`, `system`, `suggestion_accepted`; `turnOrigin`: `human`, `sdk`, `task_notification`; `isMeta` (129), `isCompactSummary` (33); ~90 records lack `promptSource`. **Genuine = `promptSource` ∈ {`typed`,`queued`}; `sdk`/`system` never; records without `promptSource` use the classifier** (not `isMeta`/`isSidechain`/`isCompactSummary`, no `toolUseResult`/`tool_result`, `turnOrigin ≠ task_notification`, text not starting with a synthetic tag such as `<task-notification>`, `<local-command-caveat>`, `<command-name>`, `<local-command-stdout>`, `<bash-input>`, `<bash-stdout>`, `<system-reminder>`, `<command-message>`). **Open (M3):** `suggestion_accepted` (human-origin) is not listed by the maintainer; treated as *not genuine* until the §19 output says otherwise.
-4. `last-prompt` records are truncated (≤ ~201 chars) ⇒ never used for the last prompt.
-5. Title: `ai-title` records, last wins, labeled *recorded*, redacted.
-6. Sensitive record types exist (`session-owner` account/org ids, `cost-state` amounts, `api-request-blob` full payloads) ⇒ deserialize into a minimal struct with `#[serde(default)]`; ignore everything else (also keeps 1.9 MB lines cheap).
-7. Cold-parse cost of ~500 MB is unmeasured; M3 measures it (maintainer-run, §19) and may skip `api-request-blob` lines cheaply.
+**Decisions** (all in the spec): min/max timestamps over conversational records; first/last cwd in file order,
+resume from the first; genuine prompts per §7.3; last prompt never from `last-prompt` (truncated ≈ 200 chars);
+title = latest `ai-title`; resume follows `continued-in`; top-level files only.
 
----
+**Fixtures:** `tests/fixtures/sessions/<version>/projects/…` (2.1.331 and 2.1.220), synthetic, generated once from
+these shapes (see the README there); `synth::SESSION_FIXTURES` embeds them for `ccwm-synth` and the tests, with
+`@HOME@` replaced by the synthetic home.
 
 ## 12. Git hardening — verified results (git 2.43.0)
 
@@ -559,6 +651,22 @@ codes go in `RestartPreventExitStatus=`.
   could not be read" with the path in the tooltip, one-line non-Git cards, "partly watched" badges, a long path
   shown as `…/internal-services/backend-api-gateway`; no console errors.
 
+## 13e. M3 verification notes (what was actually run, 2026-11-24)
+
+- `cargo test` with `CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_INOTIFY=1`; real daemon in a synthetic environment
+  (30 bulk projects, real Git repositories, the fixture corpus, a fake `claude` on `PATH` in `~/.local/bin`):
+  `claude: verified`, `sessions: ok (7 files, 7 indexed; not in a project: 1 home, 1 nonexistent)`, first launch
+  `marker scan: every root`, second launch `development roots ~/dev, ~/dev/beta/packages`.
+- Real browser (Chrome extension, synthetic daemon): table with the session column, detail panel (AI title label,
+  start/last activity/duration, last prompt read on demand, resume command, Copy → "Copied"), Esc closes it;
+  privacy toggle: paths, title, prompt and command hidden, and the page's HTML holds no home path, title or
+  prompt; Settings page with the plain-language scope, a rejected scan interval shows the server's message;
+  cards with "Has sessions": the session-only project with only the `session` badge. No console errors.
+- Found while testing: the daemon passed its `--port`-overridden config to Settings, so saving would have written
+  the override into `config.toml` (fixed: the service keeps the file's config; process test asserts it).
+- Test 5 (strace variant) now includes the session cycle and the `claude` check: 2 `claude` execs
+  (`--version`, `--help`), all other execs allowlisted Git, no non-loopback connect.
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -586,10 +694,18 @@ Decided 2026-11-24 (M2.1): the M2 security review's H1 fix (per-protocol denies,
 plus the directory check), and the real-home defect fixes (breadth-first watches, 25 % budget, calendar-day
 relative time, `/`-boundary paths, unreadable list, one-line banner, CLI start-up wait).
 
+Decided 2026-11-24 (before M3): O5 (the M2/pre-M2 spec changes) approved; O6 approved with the license exceptions
+scoped per crate in `deny.toml`; the M3 parser, discovery and wording decisions recorded in REQUIREMENTS.md §4, §5.1,
+§7, §8, §13 and Appendix A ("M3, approved").
+
 Open:
-- **O5 (M2, needs approval):** the REQUIREMENTS.md changes listed in the M2 report (Appendix A rows marked "M2"/"pre-M2").
-- **O6:** new dependency licenses ISC, CC0-1.0, BSL-1.0 (via `notify`) allowed in `deny.toml`; review.
-- **O1 (M3):** Landlock vs. "roots change without restart" (§4.1): roots added later outside the startup read set need a restart; Settings must say so. Not a blocker for M1.
-- **O2 (M3):** `suggestion_accepted` prompts; `claude` binary outside allowed system paths.
+- **O1 (M3, needs approval):** roots, exclusions, depth, same-file-system, watch budget, port and session directory
+  changes are saved and marked "requires restart" (live reconfiguration of the tracker and monitor is not built;
+  Landlock needs a restart for new roots anyway). Alternative: an in-process restart of tracker + monitor in M4.
+- **O7 (M3, needs approval):** `<pasted_content>` is user text, not a synthetic tag; privacy mode also hides the
+  status/settings paths listed in §10; the cwd walk-up also stops at a `CLAUDE.md` directory (the user's wording
+  named the Git root only; kept from §4.4 so a session in a monorepo package and the package's marker agree).
+- **O2:** a `claude` binary outside the sandbox read set cannot be executed: reported as `failed` (the usual
+  `~/.local/bin/claude` → `~/.local/share/claude/…` install is inside home, a root).
 - **O3 (M4):** crate/GitHub/distro naming-conflict check needs outbound requests — needs the maintainer's OK.
 - **O4:** `app.js` DOM tests only if Node is present.

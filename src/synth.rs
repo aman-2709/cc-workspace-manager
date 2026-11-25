@@ -43,7 +43,7 @@ impl SynthEnv {
     }
 
     /// Project directories (relative to `home`) that marker discovery must find.
-    pub fn expected_projects(&self, bulk: usize) -> Vec<String> {
+    pub fn expected_marker_projects(&self, bulk: usize) -> Vec<String> {
         let mut v: Vec<String> = [
             "dev/alpha",
             "dev/beta",
@@ -61,7 +61,19 @@ impl SynthEnv {
         v.sort();
         v
     }
+
+    /// Every project the daemon must register: the marker projects plus those known only from
+    /// sessions ([`SESSION_ONLY_PROJECTS`]).
+    pub fn expected_projects(&self, bulk: usize) -> Vec<String> {
+        let mut v = self.expected_marker_projects(bulk);
+        v.extend(SESSION_ONLY_PROJECTS.iter().map(ToString::to_string));
+        v.sort();
+        v
+    }
 }
+
+/// Projects of the synthetic home that have sessions but no `CLAUDE.md` (relative to home).
+pub const SESSION_ONLY_PROJECTS: [&str; 1] = ["dev/session-only"];
 
 fn mkdir(p: &Path) -> io::Result<()> {
     fs::create_dir_all(p)
@@ -226,30 +238,76 @@ pub fn generate_with(root: &Path, bulk: usize, layout: Layout) -> io::Result<Syn
     mkdir(&home.join("dev/abs-escape"))?;
     symlink("/etc/hostname", home.join("dev/abs-escape/CLAUDE.md"))?;
 
-    // A synthetic Claude config directory with an invented session (used from M3 on).
-    let enc = "-synthetic-home-dev-alpha";
-    let session = "11111111-2222-4333-8444-555555555555";
-    let cwd = home.join("dev/alpha");
-    let line = |ty: &str, extra: &str| {
-        format!(
-            r#"{{"type":"{ty}","sessionId":"{session}","cwd":"{}","timestamp":"2026-01-01T00:00:00.000Z","version":"0.0.0-synthetic"{extra}}}"#,
-            cwd.display()
-        )
-    };
-    let records = [
-        line("user", r#","message":{"role":"user","content":"SYNTHETIC first prompt"},"promptSource":"typed","isSidechain":false"#),
-        line("assistant", r#","message":{"role":"assistant","content":[{"type":"text","text":"SYNTHETIC reply"}]}"#),
-        line("user", r#","message":{"role":"user","content":[{"type":"tool_result","content":"x"}]},"toolUseResult":{}"#),
-        r#"{"type":"ai-title","sessionId":"11111111-2222-4333-8444-555555555555","aiTitle":"Synthetic title"}"#.to_string(),
-    ];
-    write(
-        &env.claude_dir
-            .join("projects")
-            .join(enc)
-            .join(format!("{session}.jsonl")),
-        &(records.join("\n") + "\n"),
-    )?;
+    // A project known only from its Claude Code sessions (no CLAUDE.md), with a Git root above
+    // the recorded cwd; and the session fixture corpus (cwds point into this home).
+    mkdir(&home.join("dev/session-only/src"))?;
+    git_dir(&home.join("dev/session-only"))?;
+    write(&home.join("dev/session-only/src/main.rs"), "fn main() {}\n")?;
+    mkdir(&home.join("dev/alpha/src"))?;
+    mkdir(&home.join("dev/beta/packages/inner/src"))?;
+    install_sessions(&env.claude_dir, home)?;
     Ok(env)
+}
+
+/// The versioned synthetic session corpus (`tests/fixtures/sessions/<version>/projects/…`),
+/// embedded so the generator and the tests share one set of fixtures. `@HOME@` stands for the
+/// synthetic home directory.
+pub const SESSION_FIXTURES: [(&str, &str); 9] = [
+    (
+        "2.1.331/projects/-synthetic-dev-alpha/11111111-2222-4333-8444-555555555555.jsonl",
+        include_str!("../tests/fixtures/sessions/2.1.331/projects/-synthetic-dev-alpha/11111111-2222-4333-8444-555555555555.jsonl"),
+    ),
+    (
+        "2.1.331/projects/-synthetic-dev-alpha/11111111-2222-4333-8444-555555555555/subagents/agent-a1b2c3.jsonl",
+        include_str!("../tests/fixtures/sessions/2.1.331/projects/-synthetic-dev-alpha/11111111-2222-4333-8444-555555555555/subagents/agent-a1b2c3.jsonl"),
+    ),
+    (
+        "2.1.331/projects/-synthetic-dev-alpha/22222222-3333-4444-8555-666666666666.jsonl",
+        include_str!("../tests/fixtures/sessions/2.1.331/projects/-synthetic-dev-alpha/22222222-3333-4444-8555-666666666666.jsonl"),
+    ),
+    (
+        "2.1.331/projects/-synthetic-dev-alpha/memory/notes.md",
+        include_str!("../tests/fixtures/sessions/2.1.331/projects/-synthetic-dev-alpha/memory/notes.md"),
+    ),
+    (
+        "2.1.331/projects/-synthetic-dev-deleted/55555555-6666-4777-8888-999999999999.jsonl",
+        include_str!("../tests/fixtures/sessions/2.1.331/projects/-synthetic-dev-deleted/55555555-6666-4777-8888-999999999999.jsonl"),
+    ),
+    (
+        "2.1.331/projects/-synthetic-dev-gamma/66666666-7777-4888-8999-aaaaaaaaaaaa.jsonl",
+        include_str!("../tests/fixtures/sessions/2.1.331/projects/-synthetic-dev-gamma/66666666-7777-4888-8999-aaaaaaaaaaaa.jsonl"),
+    ),
+    (
+        "2.1.331/projects/-synthetic-dev-session-only-src/33333333-4444-4555-8666-777777777777.jsonl",
+        include_str!("../tests/fixtures/sessions/2.1.331/projects/-synthetic-dev-session-only-src/33333333-4444-4555-8666-777777777777.jsonl"),
+    ),
+    (
+        "2.1.331/projects/-synthetic-home/44444444-5555-4666-8777-888888888888.jsonl",
+        include_str!("../tests/fixtures/sessions/2.1.331/projects/-synthetic-home/44444444-5555-4666-8777-888888888888.jsonl"),
+    ),
+    (
+        "2.1.220/projects/-synthetic-dev-beta-packages-inner-src/77777777-8888-4999-8aaa-bbbbbbbbbbbb.jsonl",
+        include_str!("../tests/fixtures/sessions/2.1.220/projects/-synthetic-dev-beta-packages-inner-src/77777777-8888-4999-8aaa-bbbbbbbbbbbb.jsonl"),
+    ),
+];
+
+/// Copy the session corpus into `claude_dir` (every version's `projects/` merged), with
+/// `@HOME@` replaced by `home` (JSON-escaped). Also adds the non-session entries Claude Code
+/// keeps there (an alias file), which must be skipped.
+pub fn install_sessions(claude_dir: &Path, home: &Path) -> io::Result<()> {
+    let quoted = serde_json::to_string(&home.to_string_lossy())
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let escaped = &quoted[1..quoted.len() - 1];
+    for (rel, text) in SESSION_FIXTURES {
+        let (_, inside) = rel
+            .split_once('/')
+            .ok_or_else(|| io::Error::other("fixture path without a version"))?;
+        write(&claude_dir.join(inside), &text.replace("@HOME@", escaped))?;
+    }
+    write(
+        &claude_dir.join("projects/-synthetic-dev-alpha/.session-aliases"),
+        "synthetic\n",
+    )
 }
 
 /// Turn the synthetic Git projects (`dev/beta`, its nested `packages/inner`, `dev/monorepo`) into
@@ -289,6 +347,7 @@ pub fn init_git(env: &SynthEnv) -> io::Result<bool> {
         ("dev/beta/packages/inner", &["CLAUDE.md"][..]),
         ("dev/beta", &["CLAUDE.md"][..]),
         ("dev/monorepo", &["CLAUDE.md", "services/api/CLAUDE.md"][..]),
+        ("dev/session-only", &["src/main.rs"][..]),
     ] {
         let dir = home.join(rel);
         fs::remove_dir_all(dir.join(".git"))?;
@@ -342,7 +401,13 @@ mod tests {
         }
         assert!(env.home.join("dev/alpha/CLAUDE.md").is_file());
         assert!(env.claude_dir.join("projects").is_dir());
-        assert_eq!(env.expected_projects(3).len(), 11);
+        assert_eq!(env.expected_projects(3).len(), 12);
+        let alpha = env
+            .claude_dir
+            .join("projects/-synthetic-dev-alpha/11111111-2222-4333-8444-555555555555.jsonl");
+        let text = fs::read_to_string(alpha).unwrap();
+        assert!(!text.contains("@HOME@"));
+        assert!(text.contains(&format!("\"cwd\":\"{}/dev/alpha\"", env.home.display())));
     }
 
     #[test]

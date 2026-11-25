@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod api_error;
 pub mod auth;
+pub mod claude;
 pub mod cli;
 pub mod client;
 pub mod clock;

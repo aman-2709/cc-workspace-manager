@@ -17,7 +17,10 @@ use cc_workspace_manager::discovery::status::SharedStatus;
 use cc_workspace_manager::discovery::walk::ScanOptions;
 use cc_workspace_manager::events::Notifier;
 use cc_workspace_manager::git::{find_on_path, Git};
-use cc_workspace_manager::tracker::{Control, Settings as TrackerSettings, Tracker};
+use cc_workspace_manager::synth;
+use cc_workspace_manager::tracker::{
+    Control, SessionSettings as TrackerSessions, Settings as TrackerSettings, Tracker,
+};
 use cc_workspace_manager::watch::{self, Monitor, Monitoring, SharedMonitor, WatchBackend};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,8 +35,28 @@ fn inotify_lock() -> &'static tokio::sync::Mutex<()> {
     L.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// How a test stack is configured.
+struct Opts {
+    budget: usize,
+    /// Walk every root at every reconciliation (the M2 behaviour these tests were written for).
+    full_scan: bool,
+    /// Claude Code's config directory: enables the session integration.
+    claude_dir: Option<PathBuf>,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            budget: 1000,
+            full_scan: true,
+            claude_dir: None,
+        }
+    }
+}
+
 struct Stack {
     tracker: Arc<Tracker>,
+    status: SharedStatus,
     reader: Reader,
     writer: Arc<Writer>,
     monitor: SharedMonitor,
@@ -138,6 +161,26 @@ impl Stack {
         clock: Arc<FakeClock>,
         budget: usize,
     ) -> Option<Self> {
+        Self::start_with(
+            home,
+            data,
+            clock,
+            Opts {
+                budget,
+                ..Opts::default()
+            },
+        )
+        .await
+    }
+
+    /// `None` if no inotify instance could be created (notice printed).
+    async fn start_with(
+        home: &Path,
+        data: &Path,
+        clock: Arc<FakeClock>,
+        opts: Opts,
+    ) -> Option<Self> {
+        let budget = opts.budget;
         let db = data.join("t.db");
         let writer = Arc::new(Writer::spawn(&db).unwrap());
         let reader = Reader::open(&db, 2).unwrap();
@@ -169,12 +212,13 @@ impl Stack {
             boundaries: vec![data.to_path_buf()],
             fuse_mounts: vec![],
         };
+        let status = SharedStatus::default();
         let tracker = Tracker::new(
             Arc::clone(&writer),
             reader.clone(),
             clock.clone(),
             notifier.clone(),
-            SharedStatus::default(),
+            status.clone(),
             Arc::new(Git::detect(
                 find_on_path(std::env::var_os("PATH").as_deref()),
                 home,
@@ -187,6 +231,12 @@ impl Stack {
                 interval: Duration::from_secs(3600),
                 retention_secs: RETENTION,
                 events_per_project: 50,
+                full_scan: opts.full_scan,
+                sessions: opts.claude_dir.map(|d| TrackerSessions {
+                    config_dir: d,
+                    temp_dirs: vec![],
+                    claude: None,
+                }),
             },
         );
         let monitor = Monitor::new(
@@ -218,6 +268,7 @@ impl Stack {
         ];
         Some(Self {
             tracker,
+            status,
             reader,
             writer,
             monitor: monitor_state,
@@ -619,5 +670,310 @@ async fn moves_while_stopped_are_recognised_and_missing_projects_are_purged() {
         !s.tracked().await.iter().any(|t| t.id == g.id)
     })
     .await;
+    s.stop().await;
+}
+
+// ---- M3: sessions as the primary discovery source -------------------------------------------
+
+impl Stack {
+    async fn sessions(&self) -> Vec<queries::SessionState> {
+        self.reader.with(queries::session_states).await.unwrap()
+    }
+
+    async fn session(&self, id: &str) -> Option<queries::SessionState> {
+        self.sessions().await.into_iter().find(|s| s.id == id)
+    }
+
+    async fn wait_scans(&self, n: u64) {
+        self.wait(&format!("{n} reconciliations"), 20, || async {
+            self.status.snapshot().scans_finished >= n
+        })
+        .await;
+    }
+}
+
+fn session_line(id: &str, ts: &str, cwd: &Path, text: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type": "user", "sessionId": id, "timestamp": ts, "cwd": cwd,
+                           "promptSource": "typed", "message": {"role": "user", "content": text}})
+    )
+}
+
+/// The synthetic corpus: projects from session cwds (also one without `CLAUDE.md`), the first
+/// cwd resolved upward, home and vanished cwds unassigned, subagent files ignored; then live:
+/// a new session in a new directory registers its project, an append updates the aggregates, a
+/// deleted session file leaves the index while its project stays. No prompt text is stored.
+#[tokio::test]
+async fn sessions_register_projects_live_and_follow_appends_and_deletions() {
+    let _g = inotify_lock().lock().await;
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 0).unwrap();
+    let home = fs::canonicalize(&env.home).unwrap();
+    let claude = fs::canonicalize(&env.claude_dir).unwrap();
+    let data = t.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let Some(s) = Stack::start_with(
+        &home,
+        &data,
+        now_clock(),
+        Opts {
+            full_scan: false,
+            claude_dir: Some(claude.clone()),
+            ..Opts::default()
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    s.wait_scans(1).await;
+    let so = s.wait_registered(&home.join("dev/session-only")).await;
+    assert_eq!(
+        s.row(&so.id).await.sources,
+        ["session"],
+        "found from its session only"
+    );
+    assert_eq!(s.row(&so.id).await.sessions.count, 1);
+    let alpha = s.by_path(&home.join("dev/alpha")).await.unwrap();
+    let a = s.row(&alpha.id).await;
+    assert_eq!(a.sources, ["marker", "session"]);
+    assert_eq!(a.sessions.count, 2);
+    assert_eq!(
+        a.sessions.latest_title.as_deref(),
+        Some("Alpha tests, continued"),
+        "the most recent session's title"
+    );
+    let inner = s
+        .by_path(&home.join("dev/beta/packages/inner"))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.row(&inner.id).await.sessions.count,
+        1,
+        "cwd …/inner/src resolved upward"
+    );
+    assert!(
+        s.by_path(&home.join("dev/beta/packages/inner/src"))
+            .await
+            .is_none()
+            && s.by_path(&home.join("dev/session-only/src"))
+                .await
+                .is_none()
+            && s.by_path(&home).await.is_none(),
+        "neither the cwd itself nor home is registered"
+    );
+
+    let all = s.sessions().await;
+    assert_eq!(
+        all.len(),
+        7,
+        "top-level files only (the subagent transcript is skipped)"
+    );
+    let a1 = s
+        .session("11111111-2222-4333-8444-555555555555")
+        .await
+        .unwrap();
+    assert_eq!(
+        a1.aggregate.continued_in.as_deref(),
+        Some("22222222-3333-4444-8555-666666666666")
+    );
+    assert_eq!(
+        a1.aggregate.title.as_deref(),
+        Some("Alpha config parser and tests")
+    );
+    assert_eq!(
+        a1.aggregate.started_at,
+        Some(1_795_165_199),
+        "minimum, not the first line"
+    );
+    let a2 = s
+        .session("22222222-3333-4444-8555-666666666666")
+        .await
+        .unwrap();
+    assert_eq!(
+        a2.aggregate.derived_from,
+        ["11111111-2222-4333-8444-555555555555"]
+    );
+    assert_eq!(
+        a2.aggregate.first_cwd.as_deref(),
+        home.join("dev/alpha").to_str()
+    );
+    assert_eq!(
+        a2.aggregate.last_cwd.as_deref(),
+        home.join("dev/alpha/src").to_str()
+    );
+    let edge = s
+        .session("66666666-7777-4888-8999-aaaaaaaaaaaa")
+        .await
+        .unwrap();
+    let c = edge.aggregate.counts;
+    assert_eq!((c.malformed, c.unknown, c.foreign), (1, 2, 1));
+    assert!(!edge.aggregate.is_sidechain);
+    let st = s.status.snapshot().sessions;
+    assert_eq!(st.state, "ok");
+    assert_eq!((st.files, st.indexed), (7, 7));
+    assert_eq!(st.unassigned.get("home"), Some(&1));
+    assert_eq!(st.unassigned.get("nonexistent"), Some(&1));
+    assert!(
+        st.skipped_entries >= 3,
+        "subagent dir, memory, aliases: {st:?}"
+    );
+
+    // Live: a new session in a new project directory.
+    let live = home.join("dev/live-proj");
+    fs::create_dir_all(live.join(".git")).unwrap();
+    let new_id = "abcdef01-2345-4678-89ab-cdef01234567";
+    let new_dir = claude.join("projects/-synthetic-dev-live-proj");
+    fs::create_dir(&new_dir).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let file = new_dir.join(format!("{new_id}.jsonl"));
+    fs::write(
+        &file,
+        session_line(
+            new_id,
+            "2026-11-24T10:00:00.000Z",
+            &live,
+            "SYNTHETIC-LIVE-PROMPT",
+        ),
+    )
+    .unwrap();
+    let lp = s.wait_registered(&live).await;
+    assert_eq!(s.row(&lp.id).await.sources, ["session"]);
+
+    // Live: an append is parsed from the checkpoint.
+    let mut f = fs::OpenOptions::new().append(true).open(&file).unwrap();
+    use std::io::Write;
+    f.write_all(
+        session_line(
+            new_id,
+            "2026-11-24T12:00:00.000Z",
+            &live,
+            "SYNTHETIC-LIVE-2",
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    s.wait("append parsed", 10, || async {
+        s.session(new_id)
+            .await
+            .is_some_and(|x| x.aggregate.last_activity_at == Some(1_795_521_600))
+    })
+    .await;
+    let cp = s.session(new_id).await.unwrap().checkpoint;
+    assert_eq!(cp.offset, fs::metadata(&file).unwrap().len());
+
+    // A deleted session file leaves the index; its project stays.
+    fs::remove_file(claude.join(
+        "projects/-synthetic-dev-session-only-src/33333333-4444-4555-8666-777777777777.jsonl",
+    ))
+    .unwrap();
+    s.wait("session forgotten", 10, || async {
+        s.session("33333333-4444-4555-8666-777777777777")
+            .await
+            .is_none()
+    })
+    .await;
+    let kept = s.by_path(&home.join("dev/session-only")).await.unwrap();
+    assert!(
+        !kept.missing,
+        "projects persist after their sessions are gone"
+    );
+    assert_eq!(s.row(&kept.id).await.sessions.count, 0);
+
+    // Not one byte of prompt text, tool output or account data in the database.
+    s.writer.flush().await.unwrap();
+    let mut db = Vec::new();
+    for suffix in ["t.db", "t.db-wal"] {
+        db.extend(fs::read(data.join(suffix)).unwrap_or_default());
+    }
+    for canary in [
+        "SYNTHETIC first prompt",
+        "SYNTHETIC last prompt in alpha",
+        "SYNTHETIC-LIVE-PROMPT",
+        "SYNTHETIC tool output",
+        "SYNTHETIC queued text",
+        "SYNTHETIC-CANARY-API-BLOB",
+        "SYNTHETIC-CANARY-ACCOUNT",
+        "SYNTHETIC assistant reply",
+        "SYNTHETIC attachment body",
+        "SYNTHETIC wire input",
+    ] {
+        assert!(
+            !db.windows(canary.len()).any(|w| w == canary.as_bytes()),
+            "{canary} stored"
+        );
+    }
+    s.stop().await;
+}
+
+/// After the first launch's full marker scan, later reconciliations walk only the development
+/// roots (parents of session-discovered projects); "scan entire home" restores full scans.
+/// Projects persist when their marker is deleted.
+#[tokio::test]
+async fn after_the_first_full_scan_only_development_roots_are_walked() {
+    let _g = inotify_lock().lock().await;
+    let e = env();
+    let claude = e.home.join(".claude");
+    let app = e.home.join("dev/app");
+    fs::create_dir_all(app.join(".git")).unwrap();
+    let enc = claude.join("projects/-dev-app");
+    fs::create_dir_all(&enc).unwrap();
+    let sid = "0a0a0a0a-1b1b-4c2c-8d3d-4e4e4e4e4e4e";
+    fs::write(
+        enc.join(format!("{sid}.jsonl")),
+        session_line(sid, "2026-11-24T09:00:00.000Z", &app, "x"),
+    )
+    .unwrap();
+    let old = e.home.join("far/old");
+    marker(&old, "# old");
+    let opts = |full| Opts {
+        full_scan: full,
+        claude_dir: Some(claude.clone()),
+        ..Opts::default()
+    };
+    let clock = now_clock();
+    let Some(s) = Stack::start_with(&e.home, &e.data, clock.clone(), opts(false)).await else {
+        return;
+    };
+    s.wait_scans(1).await;
+    s.wait_registered(&app).await;
+    s.wait_registered(&old).await;
+    assert_eq!(
+        s.status.snapshot().scope,
+        "full",
+        "the first launch walks everything"
+    );
+    s.stop().await;
+
+    // While stopped: one marker project next to the session project, one far away.
+    let sibling = e.home.join("dev/sibling");
+    marker(&sibling, "# sibling");
+    let far = e.home.join("far/new");
+    marker(&far, "# new");
+    fs::remove_file(old.join("CLAUDE.md")).unwrap();
+
+    let Some(s) = Stack::start_with(&e.home, &e.data, clock.clone(), opts(false)).await else {
+        return;
+    };
+    s.wait_scans(1).await;
+    let st = s.status.snapshot();
+    assert_eq!(st.scope, "dev_roots");
+    assert_eq!(st.dev_roots, ["~/dev"]);
+    s.wait_registered(&sibling).await;
+    assert!(
+        s.by_path(&far).await.is_none(),
+        "outside the development roots"
+    );
+    let o = s.by_path(&old).await.unwrap();
+    assert!(!o.missing, "a project persists when its marker is deleted");
+    s.stop().await;
+
+    let Some(s) = Stack::start_with(&e.home, &e.data, clock, opts(true)).await else {
+        return;
+    };
+    s.wait_scans(1).await;
+    assert_eq!(s.status.snapshot().scope, "full");
+    s.wait_registered(&far).await;
     s.stop().await;
 }

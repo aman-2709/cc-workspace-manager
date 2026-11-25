@@ -114,6 +114,18 @@ pub struct Activity {
     pub path: Option<String>,
 }
 
+/// One parsed session file to store (REQUIREMENTS.md §7.3: aggregates only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStore {
+    pub id: String,
+    pub file_path: String,
+    /// The project the session belongs to; `None` with `unassigned` set when its cwd names none.
+    pub project_id: Option<String>,
+    pub unassigned: Option<&'static str>,
+    pub aggregate: crate::claude::parse::Aggregate,
+    pub checkpoint: crate::claude::parse::Checkpoint,
+}
+
 /// A freshly stored browser session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSession {
@@ -207,6 +219,41 @@ enum Cmd {
         ignored: bool,
         now: i64,
         reply: Reply<bool>,
+    },
+    /// Insert or update parsed sessions (aggregates and checkpoints; a stale prompt cache is
+    /// dropped); replies with the ids of the projects whose session summary changed.
+    StoreSessions {
+        sessions: Vec<SessionStore>,
+        reply: Reply<Vec<String>>,
+    },
+    /// Re-assign sessions (`(session id, project id, unassigned reason)`) without re-parsing.
+    AssignSessions {
+        assignments: Vec<(String, Option<String>, Option<&'static str>)>,
+        reply: Reply<Vec<String>>,
+    },
+    /// Forget sessions whose files are gone (by file path); replies with the affected projects.
+    DeleteSessions {
+        file_paths: Vec<String>,
+        reply: Reply<Vec<String>>,
+    },
+    /// "Clear session index": every session and checkpoint (never the session files).
+    ClearSessionIndex {
+        reply: Reply<Vec<String>>,
+    },
+    /// Cache (or with `None`, drop) the last prompt of one session (opt-in setting).
+    CachePrompt {
+        session_id: String,
+        prompt: Option<(String, Option<i64>)>,
+    },
+    /// Drop every cached prompt ("Store prompt text" turned off); replies with the count.
+    ClearPromptCache {
+        reply: Reply<u64>,
+    },
+    /// Clear `missing_since` of projects whose directory is back; replies with the changed ids.
+    Revive {
+        ids: Vec<String>,
+        now: i64,
+        reply: Reply<Vec<String>>,
     },
     Flush {
         reply: Reply<()>,
@@ -415,6 +462,44 @@ impl Writer {
         .await
     }
 
+    pub async fn store_sessions(&self, sessions: Vec<SessionStore>) -> Result<Vec<String>> {
+        self.call(|reply| Cmd::StoreSessions { sessions, reply })
+            .await
+    }
+
+    pub async fn assign_sessions(
+        &self,
+        assignments: Vec<(String, Option<String>, Option<&'static str>)>,
+    ) -> Result<Vec<String>> {
+        self.call(|reply| Cmd::AssignSessions { assignments, reply })
+            .await
+    }
+
+    pub async fn delete_sessions(&self, file_paths: Vec<String>) -> Result<Vec<String>> {
+        self.call(|reply| Cmd::DeleteSessions { file_paths, reply })
+            .await
+    }
+
+    pub async fn clear_session_index(&self) -> Result<Vec<String>> {
+        self.call(|reply| Cmd::ClearSessionIndex { reply }).await
+    }
+
+    /// Best effort (dropped when the queue is full): the cache only speeds up the detail panel.
+    pub fn cache_prompt(&self, session_id: &str, prompt: Option<(String, Option<i64>)>) {
+        let _ = self.tx.try_send(Cmd::CachePrompt {
+            session_id: session_id.to_string(),
+            prompt,
+        });
+    }
+
+    pub async fn clear_prompt_cache(&self) -> Result<u64> {
+        self.call(|reply| Cmd::ClearPromptCache { reply }).await
+    }
+
+    pub async fn revive(&self, ids: Vec<String>, now: i64) -> Result<Vec<String>> {
+        self.call(|reply| Cmd::Revive { ids, now, reply }).await
+    }
+
     /// Wait until everything queued before this call has been committed.
     pub async fn flush(&self) -> Result<()> {
         self.call(|reply| Cmd::Flush { reply }).await
@@ -493,7 +578,13 @@ fn fail(cmd: Cmd, err: &Error) {
             drop(reply.send(Err(e())))
         }
         Cmd::MoveProject { reply, .. } => drop(reply.send(Err(e()))),
-        Cmd::TouchSession { .. } => {}
+        Cmd::StoreSessions { reply, .. }
+        | Cmd::AssignSessions { reply, .. }
+        | Cmd::DeleteSessions { reply, .. }
+        | Cmd::ClearSessionIndex { reply }
+        | Cmd::Revive { reply, .. } => drop(reply.send(Err(e()))),
+        Cmd::ClearPromptCache { reply } => drop(reply.send(Err(e()))),
+        Cmd::TouchSession { .. } | Cmd::CachePrompt { .. } => {}
     }
 }
 
@@ -607,8 +698,221 @@ fn execute(tx: &rusqlite::Transaction<'_>, cmd: Cmd) -> Outcome {
             now,
             reply,
         } => run!(reply, |c| set_ignored(c, &path, ignored, now)),
+        Cmd::StoreSessions { sessions, reply } => run!(reply, |c| store_sessions(c, &sessions)),
+        Cmd::AssignSessions { assignments, reply } => {
+            run!(reply, |c| assign_sessions(c, &assignments))
+        }
+        Cmd::DeleteSessions { file_paths, reply } => {
+            run!(reply, |c| delete_sessions(c, &file_paths))
+        }
+        Cmd::ClearSessionIndex { reply } => run!(reply, clear_session_index),
+        Cmd::CachePrompt { session_id, prompt } => {
+            let _ = savepoint(tx, |c| {
+                c.execute(
+                    "UPDATE sessions SET prompt_text = ?2, prompt_at = ?3 WHERE id = ?1",
+                    params![
+                        session_id,
+                        prompt.as_ref().map(|p| p.0.as_str()),
+                        prompt.as_ref().and_then(|p| p.1)
+                    ],
+                )
+                .map(|_| ())
+                .map_err(|e| db_err("cache prompt", &e))
+            });
+            Box::new(|_| {})
+        }
+        Cmd::ClearPromptCache { reply } => run!(reply, |c| {
+            c.execute(
+                "UPDATE sessions SET prompt_text = NULL, prompt_at = NULL WHERE prompt_text IS NOT NULL OR prompt_at IS NOT NULL",
+                [],
+            )
+            .map(|n| n as u64)
+            .map_err(|e| db_err("clear prompt cache", &e))
+        }),
+        Cmd::Revive { ids, now, reply } => run!(reply, |c| revive(c, &ids, now)),
         Cmd::Flush { reply } | Cmd::Shutdown { reply } => run!(reply, |_c| Ok(())),
     }
+}
+
+/// Recompute `session_count` / `session_at` of `ids` (deduplicated, `None`s skipped).
+fn refresh_session_summary(c: &Connection, ids: &mut Vec<String>) -> Result<()> {
+    ids.sort();
+    ids.dedup();
+    let mut st = c
+        .prepare_cached(
+            "UPDATE projects SET
+               session_count = (SELECT count(*) FROM sessions WHERE project_id = ?1),
+               session_at = (SELECT max(last_activity_at) FROM sessions WHERE project_id = ?1)
+             WHERE id = ?1",
+        )
+        .map_err(|e| db_err("prepare session summary", &e))?;
+    for id in ids.iter() {
+        st.execute(params![id])
+            .map_err(|e| db_err("session summary", &e))?;
+    }
+    Ok(())
+}
+
+fn project_of_session(c: &Connection, id: &str) -> Result<Option<String>> {
+    c.query_row(
+        "SELECT project_id FROM sessions WHERE id = ?1",
+        params![id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(Option::flatten)
+    .map_err(|e| db_err("find session", &e))
+}
+
+fn store_sessions(c: &Connection, sessions: &[SessionStore]) -> Result<Vec<String>> {
+    let mut affected = Vec::new();
+    for s in sessions {
+        if let Some(old) = project_of_session(c, &s.id)? {
+            affected.push(old);
+        }
+        let a = &s.aggregate;
+        let derived = (!a.derived_from.is_empty())
+            .then(|| serde_json::to_string(&a.derived_from))
+            .transpose()
+            .map_err(|e| Error::new(format!("encode derived-from: {e}")))?;
+        // A project that no longer exists (purged meanwhile) leaves the session unassigned.
+        c.execute(
+            "INSERT INTO sessions (id, project_id, file_path, first_cwd, last_cwd, started_at,
+                                   last_activity_at, title, git_branch, version, entrypoint,
+                                   continued_in, derived_from, is_sidechain, unassigned)
+             VALUES (?1, (SELECT id FROM projects WHERE id = ?2), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                     ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(id) DO UPDATE SET
+               project_id = excluded.project_id, file_path = excluded.file_path,
+               first_cwd = excluded.first_cwd, last_cwd = excluded.last_cwd,
+               started_at = excluded.started_at, last_activity_at = excluded.last_activity_at,
+               title = excluded.title, git_branch = excluded.git_branch, version = excluded.version,
+               entrypoint = excluded.entrypoint, continued_in = excluded.continued_in,
+               derived_from = excluded.derived_from, is_sidechain = excluded.is_sidechain,
+               unassigned = excluded.unassigned, prompt_text = NULL, prompt_at = NULL",
+            params![
+                s.id,
+                s.project_id,
+                s.file_path,
+                a.first_cwd,
+                a.last_cwd,
+                a.started_at,
+                a.last_activity_at,
+                a.title,
+                a.git_branch,
+                a.version,
+                a.entrypoint,
+                a.continued_in,
+                derived,
+                a.is_sidechain,
+                s.unassigned,
+            ],
+        )
+        .map_err(|e| db_err("store session", &e))?;
+        let k = &s.checkpoint;
+        let n = &a.counts;
+        let int = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        c.execute(
+            "INSERT INTO session_file_checkpoints
+               (session_id, dev, ino, size, offset, mtime_ns, lines, malformed, oversized, unknown, foreign_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(session_id) DO UPDATE SET dev = excluded.dev, ino = excluded.ino,
+               size = excluded.size, offset = excluded.offset, mtime_ns = excluded.mtime_ns,
+               lines = excluded.lines, malformed = excluded.malformed, oversized = excluded.oversized,
+               unknown = excluded.unknown, foreign_id = excluded.foreign_id",
+            params![
+                s.id,
+                int(k.dev),
+                int(k.ino),
+                int(k.size),
+                int(k.offset),
+                k.mtime_ns,
+                int(n.lines),
+                int(n.malformed),
+                int(n.oversized),
+                int(n.unknown),
+                int(n.foreign)
+            ],
+        )
+        .map_err(|e| db_err("store checkpoint", &e))?;
+        if let Some(p) = project_of_session(c, &s.id)? {
+            affected.push(p);
+        }
+    }
+    refresh_session_summary(c, &mut affected)?;
+    Ok(affected)
+}
+
+fn assign_sessions(
+    c: &Connection,
+    assignments: &[(String, Option<String>, Option<&'static str>)],
+) -> Result<Vec<String>> {
+    let mut affected = Vec::new();
+    for (id, project, reason) in assignments {
+        if let Some(old) = project_of_session(c, id)? {
+            affected.push(old);
+        }
+        c.execute(
+            "UPDATE sessions SET project_id = (SELECT id FROM projects WHERE id = ?2), unassigned = ?3
+             WHERE id = ?1",
+            params![id, project, reason],
+        )
+        .map_err(|e| db_err("assign session", &e))?;
+        if let Some(p) = project_of_session(c, id)? {
+            affected.push(p);
+        }
+    }
+    refresh_session_summary(c, &mut affected)?;
+    Ok(affected)
+}
+
+fn delete_sessions(c: &Connection, file_paths: &[String]) -> Result<Vec<String>> {
+    let mut affected = Vec::new();
+    for path in file_paths {
+        let project: Option<Option<String>> = c
+            .query_row(
+                "SELECT project_id FROM sessions WHERE file_path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| db_err("find session", &e))?;
+        affected.extend(project.flatten());
+        c.execute("DELETE FROM sessions WHERE file_path = ?1", params![path])
+            .map_err(|e| db_err("delete session", &e))?;
+    }
+    refresh_session_summary(c, &mut affected)?;
+    Ok(affected)
+}
+
+fn clear_session_index(c: &Connection) -> Result<Vec<String>> {
+    let mut affected: Vec<String> = c
+        .prepare("SELECT DISTINCT project_id FROM sessions WHERE project_id IS NOT NULL")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()
+        })
+        .map_err(|e| db_err("list session projects", &e))?;
+    c.execute_batch("DELETE FROM session_file_checkpoints; DELETE FROM sessions;")
+        .map_err(|e| db_err("clear session index", &e))?;
+    refresh_session_summary(c, &mut affected)?;
+    Ok(affected)
+}
+
+fn revive(c: &Connection, ids: &[String], now: i64) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
+    for id in ids {
+        if c.execute(
+            "UPDATE projects SET missing_since = NULL, last_seen_at = ?2 WHERE id = ?1 AND missing_since IS NOT NULL",
+            params![id, now],
+        )
+        .map_err(|e| db_err("revive", &e))?
+            > 0
+        {
+            changed.push(id.clone());
+        }
+    }
+    Ok(changed)
 }
 
 fn savepoint<T>(

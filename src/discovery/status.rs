@@ -56,6 +56,29 @@ pub struct DiscoverySnapshot {
     pub next_scan_at: Option<i64>,
     /// Reconciliations finished since the daemon started (monotonic; `ccwm scan` waits on it).
     pub scans_finished: u64,
+    /// What the last marker scan covered: `full` (every root) or `dev_roots`.
+    pub scope: &'static str,
+    /// The development roots of the last `dev_roots` scan (`~/…` inside home).
+    pub dev_roots: Vec<String>,
+    pub sessions: SessionStatus,
+}
+
+/// The session integration's state (REQUIREMENTS.md §7).
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SessionStatus {
+    /// `ok`, `missing` (no `projects/` directory) or `unreadable`; `unknown` before the first look.
+    pub state: &'static str,
+    /// Top-level session files found.
+    pub files: u64,
+    /// Sessions in the index.
+    pub indexed: u64,
+    /// Entries in the session tree that are not sessions (subagent transcripts, memory, …).
+    pub skipped_entries: u64,
+    pub malformed_lines: u64,
+    pub oversized_lines: u64,
+    pub unknown_records: u64,
+    /// Sessions whose cwd names no project, by reason (`home`, `temporary`, `nonexistent`, …).
+    pub unassigned: std::collections::BTreeMap<&'static str, u64>,
 }
 
 #[derive(Debug, Clone, Default)]

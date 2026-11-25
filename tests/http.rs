@@ -754,15 +754,15 @@ async fn projects_query_validation_errors() {
         "limit=abc",
         "limit=",
         "sort=bogus",
-        "sort=session",
         "order=up",
         "activity=yesterday",
         "activity=TODAY",
         "dirty=yes",
         "include_missing=2",
         "include_ignored=x",
-        "has_sessions=1",
-        "privacy=1",
+        "has_sessions=yes",
+        "privacy=2",
+        "sort=sessions",
         "unknown=1",
         "cursor=!!!",
         "cursor=eyJzIjoibmFtZSJ9",
@@ -823,6 +823,7 @@ async fn stats_discovery_and_service_status_shapes() {
                 "unknown_activity": 2,
                 "uncommitted_changes": 0,
                 "missing": 0,
+                "total_sessions": 0,
             })
         )
     );
@@ -1387,7 +1388,9 @@ mod sockets {
             r#"{"type":"auth","token":"nope"}"#.to_string(),
             "garbage".to_string(),
             r#"{"type":"hello"}"#.to_string(),
-            format!(r#"{{"type":"auth","token":"{token}","privacy":true}}"#),
+            format!(r#"{{"type":"auth","token":"{token}","privacy":"yes"}}"#),
+            format!(r#"{{"type":"auth","token":"{token}","extra":1}}"#),
+            r#"{"type":"privacy","on":true}"#.to_string(),
             format!(r#"{{"type":"Auth","token":"{token}"}}"#),
         ] {
             let mut c = ws(srv.addr, Some(origin())).await.unwrap();

@@ -78,10 +78,16 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/auth/logout", post(routes::logout))
         .route("/projects", get(routes::projects))
         .route("/projects/{id}", get(routes::project))
+        .route("/projects/{id}/sessions", get(routes::project_sessions))
         .route(
             "/projects/{id}/ignore",
             put(routes::ignore).delete(routes::unignore),
         )
+        .route(
+            "/settings",
+            get(routes::settings).put(routes::update_settings),
+        )
+        .route("/session-index/clear", post(routes::clear_session_index))
         .route("/refresh", post(routes::refresh))
         .route("/ws", get(ws::upgrade))
         .route("/stats", get(routes::stats))

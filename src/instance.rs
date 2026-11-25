@@ -26,24 +26,56 @@ pub struct InstanceLock {
     _lock: Flock<File>,
 }
 
+/// A CLI probing the lock ([`lock_held`]) holds it (shared) for a moment: the daemon retries
+/// this often before concluding that another daemon holds it.
+const ACQUIRE_ATTEMPTS: u32 = 10;
+const ACQUIRE_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
+
 impl InstanceLock {
     pub fn acquire(dirs: &Dirs) -> Result<Self> {
         let path = dirs.lock_path();
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .mode(0o600)
             .open(&path)
             .map_err(|e| Error::io(format!("cannot open lock file {}", path.display()), &e))?;
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => Ok(Self { _lock: lock }),
-            Err((_, Errno::EWOULDBLOCK)) => Err(Error::new(format!(
-                "another ccwm daemon is already running (lock held on {}). Use `ccwm open` to reach it",
-                path.display()
-            ))),
-            Err((_, errno)) => Err(Error::new(format!("cannot lock {}: {errno}", path.display()))),
+        for attempt in 1..=ACQUIRE_ATTEMPTS {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return Ok(Self { _lock: lock }),
+                Err((f, Errno::EWOULDBLOCK)) if attempt < ACQUIRE_ATTEMPTS => {
+                    file = f;
+                    std::thread::sleep(ACQUIRE_RETRY);
+                }
+                Err((_, Errno::EWOULDBLOCK)) => break,
+                Err((_, errno)) => {
+                    return Err(Error::new(format!(
+                        "cannot lock {}: {errno}",
+                        path.display()
+                    )))
+                }
+            }
         }
+        Err(Error::new(format!(
+            "another ccwm daemon is already running (lock held on {}). Use `ccwm open` to reach it",
+            path.display()
+        )))
+    }
+}
+
+/// Is a daemon running or starting, i.e. does someone hold the instance lock? Probed with a
+/// shared, non-blocking lock on the existing file (never created); released at once.
+pub fn lock_held(dirs: &Dirs) -> bool {
+    let Ok(file) = File::open(dirs.lock_path()) else {
+        return false;
+    };
+    match Flock::lock(file, FlockArg::LockSharedNonblock) {
+        Ok(lock) => {
+            drop(lock);
+            false
+        }
+        Err((_, errno)) => errno == Errno::EWOULDBLOCK,
     }
 }
 

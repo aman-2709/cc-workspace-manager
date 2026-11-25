@@ -63,10 +63,10 @@ const {
 const storage = (v) => ({ getItem: (k) => (k === PREFS_KEY ? v : null) });
 
 test("view and theme preferences are read defensively", () => {
-  assert.deepStrictEqual(readPrefs(storage(null)), { view: "cards", theme: "system" });
-  assert.deepStrictEqual(readPrefs(storage('{"view":"table","theme":"dark"}')), { view: "table", theme: "dark" });
-  assert.deepStrictEqual(readPrefs(storage('{"view":"<img>","theme":"neon"}')), { view: "cards", theme: "system" });
-  assert.deepStrictEqual(readPrefs(storage("{")), { view: "cards", theme: "system" });
+  assert.deepStrictEqual(readPrefs(storage(null)), { view: "cards", theme: "system", privacy: null });
+  assert.deepStrictEqual(readPrefs(storage('{"view":"table","theme":"dark","privacy":true}')), { view: "table", theme: "dark", privacy: true });
+  assert.deepStrictEqual(readPrefs(storage('{"view":"<img>","theme":"neon","privacy":"yes"}')), { view: "cards", theme: "system", privacy: null });
+  assert.deepStrictEqual(readPrefs(storage("{")), { view: "cards", theme: "system", privacy: null });
 });
 
 test("buildQuery encodes search, sort and filters and nothing else", () => {
@@ -200,4 +200,81 @@ test("table pagination clamps the page", () => {
 test("reconnect back-off doubles up to 30 s and the socket URL is same-origin", () => {
   assert.deepStrictEqual([0, 1, 2, 3, 4, 5, 6, 20].map(reconnectDelay), [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
   assert.strictEqual(wsUrl({ host: "127.0.0.1:8765" }), "ws://127.0.0.1:8765/api/v1/ws");
+});
+
+// ---- M3 helpers -----------------------------------------------------------------------------------
+const {
+  withServerDefaults, privacySuffix, sessionSummary, resumeWarningText, durationText, promptStateText, describeScope, settingsPatch,
+} = require("../../web/app.js");
+
+test("buildQuery adds has_sessions and privacy only when set", () => {
+  const p = new URLSearchParams(buildQuery({ ...DEFAULT_QUERY, sessions: true, sort: "session" }, 10, null, true));
+  assert.deepStrictEqual([p.get("has_sessions"), p.get("privacy"), p.get("sort")], ["1", "1", "session"]);
+  const q = new URLSearchParams(buildQuery(DEFAULT_QUERY, 10, null, false));
+  assert.strictEqual(q.has("has_sessions") || q.has("privacy"), false);
+  assert.strictEqual(privacySuffix(true), "?privacy=1");
+  assert.strictEqual(privacySuffix(true, "&"), "&privacy=1");
+  assert.strictEqual(privacySuffix(false), "");
+});
+
+test("server defaults apply only to choices the browser has not made", () => {
+  const ui = { default_view: "table", theme: "dark", privacy: true };
+  assert.deepStrictEqual(withServerDefaults({ view: "cards", theme: "system", privacy: null }, ui, {}), { view: "table", theme: "dark", privacy: true });
+  assert.deepStrictEqual(
+    withServerDefaults({ view: "cards", theme: "light", privacy: false }, ui, { view: "cards", theme: "light", privacy: false }),
+    { view: "cards", theme: "light", privacy: false },
+  );
+  assert.deepStrictEqual(withServerDefaults({ view: "cards", theme: "system", privacy: null }, { default_view: "<x>", theme: "neon" }, {}), { view: "cards", theme: "system", privacy: null });
+  assert.deepStrictEqual(withServerDefaults({ view: "cards", theme: "system", privacy: null }, null, {}), { view: "cards", theme: "system", privacy: null });
+});
+
+test("session summaries: title, untitled, hidden title and no session", () => {
+  const now = Math.floor(new Date(2027, 0, 15, 12, 0, 0).getTime() / 1000); // local noon: same calendar day
+  assert.strictEqual(sessionSummary({ count: 0, latest: null }, now), "No Claude Code session recorded");
+  assert.strictEqual(sessionSummary(null, now), "No Claude Code session recorded");
+  assert.strictEqual(sessionSummary({ count: 2, latest: { title: "Fix it", title_source: "ai_title", last_activity_at: now - 30 } }, now), "Fix it · just now · 2 sessions");
+  assert.strictEqual(sessionSummary({ count: 1, latest: { title_source: null, last_activity_at: null } }, now), "Untitled session · time unknown · 1 session");
+  assert.strictEqual(sessionSummary({ count: 1, latest: { title_source: "ai_title", last_activity_at: now - 7200 } }, now), "Latest session 2 h ago · 1 session", "privacy mode: no title");
+});
+
+test("resume warnings, durations and prompt states read as sentences", () => {
+  assert.match(resumeWarningText("cwd_missing"), /no longer exists/);
+  assert.strictEqual(resumeWarningText("future_code"), "future_code");
+  assert.deepStrictEqual([durationText(40), durationText(600), durationText(3600), durationText(3660), durationText(200000), durationText(-1), durationText(null)],
+    ["40 s", "10 min", "1 h", "1 h 1 min", "2 days", "", ""]);
+  assert.strictEqual(promptStateText({ state: "found" }, "last prompt"), "");
+  assert.match(promptStateText({ state: "hidden" }, "last prompt"), /hidden in privacy mode/);
+  assert.match(promptStateText({ state: "none", whole_file: false }, "last prompt"), /4 MiB/);
+  assert.match(promptStateText({ state: "none", whole_file: true }, "first prompt"), /No first prompt recorded/);
+  assert.match(promptStateText({ state: "unreadable" }, "last prompt"), /could not be read/);
+});
+
+test("the discovery scope is explained in plain language, without hidden paths", () => {
+  const st = {
+    config: { discovery: { exclude: ["vendor/"], full_scan: false } },
+    effective: { roots: ["~"], default_exclusions: ["node_modules", "_build"], home_only_exclusions: ["snap"], max_depth: 10, same_file_system: true },
+  };
+  const text = describeScope(st).join("\n");
+  assert.match(text, /looks in: ~, up to 10 levels deep/);
+  assert.match(text, /node_modules, _build, snap \(directly in home\)/);
+  assert.match(text, /your exclusions\): vendor\//);
+  assert.match(text, /only in the parent folders of projects found from sessions/);
+  const priv = describeScope({ config: { discovery: { full_scan: true } }, effective: { default_exclusions: [], home_only_exclusions: [], max_depth: 3 } }).join("\n");
+  assert.match(priv, /hidden in privacy mode/);
+  assert.match(priv, /every root at every scan/);
+  assert.deepStrictEqual(describeScope(null), []);
+});
+
+test("the settings form becomes a partial patch: numbers parsed, path lists split, hidden ones left out", () => {
+  const p = settingsPatch({
+    roots: " /a \n\n/b c\n", exclude: null, full_scan: true, scan_interval_secs: "120", missing_retention_days: "",
+    max_depth: "4", same_file_system: false, budget: "0", inactive_after_days: "7", dormant_after_days: "30",
+    store_prompt_text: false, port: "8765", default_view: "table", theme: "dark", ui_privacy: true,
+  });
+  assert.deepStrictEqual(p.discovery, { roots: ["/a", "/b c"], scan_interval_secs: 120, max_depth: 4, full_scan: true, same_file_system: false });
+  assert.deepStrictEqual(p.watch, { budget: 0 });
+  assert.deepStrictEqual(p.server, { port: 8765 });
+  assert.deepStrictEqual(p.ui, { default_view: "table", theme: "dark", privacy: true });
+  assert.deepStrictEqual(p.sessions, { store_prompt_text: false });
+  assert.strictEqual("exclude" in p.discovery, false, "hidden in privacy mode: not sent");
 });

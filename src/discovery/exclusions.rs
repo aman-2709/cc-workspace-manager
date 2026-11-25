@@ -6,10 +6,11 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Directory names skipped everywhere (in addition to hidden `.*` directories).
-pub const DEFAULT_EXCLUDED_NAMES: [&str; 7] = [
+pub const DEFAULT_EXCLUDED_NAMES: [&str; 8] = [
     "node_modules",
     "target",
     "build",
+    "_build",
     "dist",
     "venv",
     "__pycache__",

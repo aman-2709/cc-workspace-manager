@@ -5,6 +5,10 @@
 //! the socket is closed with code 4401. Nothing is sent before authentication succeeds. The token
 //! is revalidated when sessions are revoked (logout, revoke-all) and every [`REVALIDATE`], so a
 //! token that expires or is rotated out (after its 60 s grace) closes the socket with 4401.
+//!
+//! Privacy mode (§10) is a subscription option: `{"type":"auth","token":…,"privacy":true}` or,
+//! later, `{"type":"privacy","on":true|false}`; the client then receives the privacy variant of
+//! every event (paths, titles and prompts already removed by the server).
 
 use super::AppState;
 use crate::api_error::{ApiError, Code};
@@ -22,13 +26,20 @@ use tokio::sync::broadcast::error::RecvError;
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REVALIDATE: Duration = Duration::from_secs(10);
 pub const CLOSE_UNAUTHORIZED: u16 = 4401;
-/// Client messages are tiny (the auth message only).
+/// Client messages are tiny (auth and the privacy option).
 const MAX_MESSAGE: usize = 4096;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
-    Auth { token: String },
+    Auth {
+        token: String,
+        #[serde(default)]
+        privacy: bool,
+    },
+    Privacy {
+        on: bool,
+    },
 }
 
 pub async fn upgrade(
@@ -62,8 +73,8 @@ async fn close(mut socket: WebSocket, code: u16, reason: &'static str) {
         .await;
 }
 
-/// Wait for the auth message; `Some(token)` if it was well-formed and valid.
-async fn authenticate(socket: &mut WebSocket, service: &Service) -> Option<String> {
+/// Wait for the auth message; `Some((token, privacy))` if it was well-formed and valid.
+async fn authenticate(socket: &mut WebSocket, service: &Service) -> Option<(String, bool)> {
     let first = tokio::time::timeout(AUTH_TIMEOUT, async {
         loop {
             match socket.recv().await? {
@@ -75,9 +86,11 @@ async fn authenticate(socket: &mut WebSocket, service: &Service) -> Option<Strin
     })
     .await
     .ok()??;
-    let ClientMsg::Auth { token } = serde_json::from_str(first.as_str()).ok()?;
+    let ClientMsg::Auth { token, privacy } = serde_json::from_str(first.as_str()).ok()? else {
+        return None;
+    };
     service.authenticate(&token).await.ok()?;
-    Some(token)
+    Some((token, privacy))
 }
 
 async fn session(mut socket: WebSocket, service: Arc<Service>) {
@@ -85,7 +98,7 @@ async fn session(mut socket: WebSocket, service: Arc<Service>) {
     // nothing is forwarded until authentication succeeded.
     let mut events = service.hub.subscribe();
     let mut revocations = service.auth_changes();
-    let Some(token) = authenticate(&mut socket, &service).await else {
+    let Some((token, mut private)) = authenticate(&mut socket, &service).await else {
         close(socket, CLOSE_UNAUTHORIZED, "unauthorized").await;
         return;
     };
@@ -98,12 +111,12 @@ async fn session(mut socket: WebSocket, service: Arc<Service>) {
     loop {
         let revalidate = tokio::select! {
             ev = events.recv() => {
-                let text = match ev {
-                    Ok(text) => text,
-                    Err(RecvError::Lagged(_)) => Arc::from(crate::events::resync().to_string()),
+                let text: Utf8Bytes = match ev {
+                    Ok(msg) => Utf8Bytes::from(msg.for_client(private)),
+                    Err(RecvError::Lagged(_)) => Utf8Bytes::from(crate::events::resync().to_string()),
                     Err(RecvError::Closed) => break,
                 };
-                if socket.send(Message::Text(Utf8Bytes::from(text.as_ref()))).await.is_err() {
+                if socket.send(Message::Text(text)).await.is_err() {
                     break;
                 }
                 false
@@ -117,7 +130,14 @@ async fn session(mut socket: WebSocket, service: Arc<Service>) {
             }
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => false,
-                // The client has nothing more to say; anything else ends the session.
+                Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(t.as_str()) {
+                    Ok(ClientMsg::Privacy { on }) => {
+                        private = on;
+                        false
+                    }
+                    // Anything else (a second auth, garbage) ends the session.
+                    _ => break,
+                },
                 _ => break,
             },
         };

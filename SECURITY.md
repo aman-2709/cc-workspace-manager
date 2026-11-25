@@ -114,6 +114,38 @@ still a real directory and drops the watch otherwise (tested with a regular file
 evaluate ignore rules in-process; ccwm never runs `git check-ignore`. ccwm's own directories are
 never watched, so its writes never count as activity.
 
+**Claude Code sessions (M3).** ccwm only reads Claude Code's session directory (`$CLAUDE_CONFIG_DIR` or
+`~/.claude`, `projects/*/<uuid>.jsonl`), never writes it; directories are listed by descriptor and files opened
+with `O_NOFOLLOW`. The parser declares only the fields it needs (REQUIREMENTS.md §7.1): tool results, API
+payloads, tool inputs, attachment bodies, queue contents and account/organization ids are skipped by the JSON
+parser without being materialized. ccwm stores aggregates only (times, first/last cwd, title, branch, version,
+continuation links); prompt text is read from the session file when you open a project's details (a bounded
+4 MiB window), redacted, cut to 2,000 characters and not stored — unless you turn on "Store prompt text", which
+caches the redacted last prompt in ccwm's database and deletes the cache when turned off. Session text is never
+logged and never rendered as HTML.
+
+**Redaction is best effort.** Titles and prompts are scanned for private key blocks, GitHub tokens (`ghp_`,
+`gho_`, `github_pat_`…), `sk-…` API keys, AWS access key ids, Slack tokens, JSON Web Tokens, `Bearer …`,
+`password=`/`token:`/`api_key=`-style assignments and credentials in URLs. Other secret formats are **not**
+recognised; treat what ccwm shows as sensitive.
+
+**Privacy mode** is enforced by the server: the browser never receives the hidden fields (paths, user names,
+remote URLs, session titles, prompts, cwds, resume commands, and the paths in the status and Settings payloads),
+for REST and WebSocket alike. It hides information from people looking at your screen; it is not access control.
+
+**Resume commands** are built from the session's first recorded cwd (POSIX single-quoted) and a strictly
+validated UUID, and are only shown for copying; ccwm never runs them. Running one starts Claude Code, which is
+outside ccwm's guarantees. **The `claude` CLI check** runs `claude --version` and `claude --help` (5 s each, once
+per binary version) as children of the sandboxed daemon: no TCP connect, no writes outside ccwm's directories;
+UDP and path-based Unix sockets are not confined (see below). ccwm sets `DISABLE_AUTOUPDATER`,
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` and `DISABLE_TELEMETRY` for these two calls as a best-effort request;
+their effect is Claude Code's, not verified by ccwm. Security acceptance test 5 allows exactly these two `claude`
+invocations.
+
+**Settings.** `PUT /settings` (session token + allowed Origin) rewrites the configuration file atomically with
+mode 0600; it can change discovery roots, so it is as sensitive as the file itself. Roots added there are read only
+after a restart (the sandbox's read set is fixed at startup).
+
 **Dependencies.** `cargo-deny` bans HTTP/TLS client and DNS resolver crates (`deny.toml`). Note:
 axum's WebSocket support enables the `connect` feature of `tokio-tungstenite` (a WebSocket *client*
 entry point). ccwm never calls it, it adds no crate to the tree, and Landlock denies TCP connect.

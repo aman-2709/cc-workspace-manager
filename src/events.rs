@@ -113,10 +113,27 @@ pub async fn next_batch(rx: &mut mpsc::Receiver<Change>) -> Option<Batch> {
     Some(b)
 }
 
+/// One outgoing message in both forms: for clients in privacy mode (§10) and for the others.
+#[derive(Debug)]
+pub struct Msg {
+    pub full: Arc<str>,
+    pub private: Arc<str>,
+}
+
+impl Msg {
+    pub fn for_client(&self, private: bool) -> &str {
+        if private {
+            &self.private
+        } else {
+            &self.full
+        }
+    }
+}
+
 /// Outgoing messages, serialized once and shared by every client.
 #[derive(Clone)]
 pub struct Hub {
-    tx: broadcast::Sender<Arc<str>>,
+    tx: broadcast::Sender<Arc<Msg>>,
 }
 
 impl Default for Hub {
@@ -128,12 +145,25 @@ impl Default for Hub {
 }
 
 impl Hub {
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<str>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<Msg>> {
         self.tx.subscribe()
     }
 
+    /// A message that holds nothing privacy mode hides.
     pub fn send(&self, msg: &serde_json::Value) {
-        let _ = self.tx.send(Arc::from(msg.to_string()));
+        let text: Arc<str> = Arc::from(msg.to_string());
+        let _ = self.tx.send(Arc::new(Msg {
+            full: Arc::clone(&text),
+            private: text,
+        }));
+    }
+
+    /// A message with a privacy-mode variant.
+    pub fn send_pair(&self, full: &serde_json::Value, private: &serde_json::Value) {
+        let _ = self.tx.send(Arc::new(Msg {
+            full: Arc::from(full.to_string()),
+            private: Arc::from(private.to_string()),
+        }));
     }
 
     pub fn clients(&self) -> usize {

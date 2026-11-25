@@ -324,7 +324,10 @@ async fn the_budget_goes_breadth_first_and_only_unwatched_subtrees_are_polled() 
     );
     assert_eq!(f.subtrees("b"), ["b/.git", "b/s1"]);
     let st = f.shared.snapshot();
-    assert!(st.degraded);
+    assert!(
+        !st.degraded,
+        "partly watched with nothing polled is normal operation, not degraded"
+    );
     assert_eq!(
         (st.watched_projects, st.partial_projects, st.polled_projects),
         (0, 2, 0)

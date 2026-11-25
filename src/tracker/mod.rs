@@ -1,7 +1,10 @@
-//! Keeps the project list and its activity, Git and monitoring state current (REQUIREMENTS.md §4.5,
-//! §5, §6): the reconciliation loop, the handling of the monitor's [`Signal`]s, and the Git
-//! refresh queue. The only component that combines discovery, the tree walk, Git and the watch
-//! engine; the transports reach it only through [`Control`] messages from the service.
+//! Keeps the project list and its activity, Git, session and monitoring state current
+//! (REQUIREMENTS.md §4.5, §5, §6, §7): the reconciliation loop, the handling of the monitor's
+//! [`Signal`]s, the Git refresh queue and the session ingest ([`sessions`]). The only component
+//! that combines discovery, the tree walk, Git, sessions and the watch engine; the transports
+//! reach it only through [`Control`] messages from the service.
+
+mod sessions;
 
 use crate::clock::Clock;
 use crate::db::queries::{self, Tracked};
@@ -9,7 +12,7 @@ use crate::db::reader::Reader;
 use crate::db::writer::{Activity, ActivityKind, ProjectUpsert, Source, Upserted, Writer};
 use crate::discovery::exclusions::Exclusions;
 use crate::discovery::status::SharedStatus;
-use crate::discovery::walk::{scan, scan_subtree, Candidate, ScanOptions, Subtree};
+use crate::discovery::walk::{scan_scope, scan_subtree, Candidate, ScanOptions, Scope, Subtree};
 use crate::error::Result;
 use crate::events::Notifier;
 use crate::git::Git;
@@ -34,10 +37,39 @@ pub enum Control {
 #[derive(Clone)]
 pub struct Settings {
     pub scan: ScanOptions,
+    /// Initial values of the settings that can change while running ([`Live`]).
     pub interval: Duration,
     pub retention_secs: i64,
     pub events_per_project: u32,
+    /// Walk every root at every reconciliation ("Scan entire home"); otherwise only the first
+    /// reconciliation ever walks everything, later ones only the development roots (§4.5).
+    pub full_scan: bool,
+    /// The session integration; `None` disables it (tests of the M2 machinery).
+    pub sessions: Option<SessionSettings>,
 }
+
+#[derive(Clone)]
+pub struct SessionSettings {
+    /// Claude Code's config directory (canonical); sessions are under `projects/`.
+    pub config_dir: PathBuf,
+    /// Temporary directories (see [`crate::discovery::resolve::temp_dirs`]).
+    pub temp_dirs: Vec<PathBuf>,
+    /// The `claude` CLI check, refreshed at each reconciliation.
+    pub claude: Option<Arc<crate::claude::cli::Verifier>>,
+}
+
+/// Settings `PUT /settings` changes without a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Live {
+    pub interval: Duration,
+    pub retention_secs: i64,
+    pub full_scan: bool,
+}
+
+/// Development roots are walked this many levels deep (configured roots and home: one level).
+pub const DEV_ROOT_DEPTH: usize = 3;
+/// `meta` key: the first full marker scan has completed.
+const FULL_SCAN_DONE: &str = "full_scan_done_at";
 
 /// Longest wait between failed reconciliations (exponential back-off from `interval`).
 const MAX_BACKOFF: Duration = Duration::from_secs(3600);
@@ -57,6 +89,9 @@ pub struct Tracker {
     progress: Mutex<(bool, u64)>,
     rescan_all: AtomicBool,
     cancel: Arc<AtomicBool>,
+    live: Mutex<Live>,
+    /// Session ingests never overlap (reconciliation and live session events).
+    session_lock: tokio::sync::Mutex<()>,
 }
 
 impl Tracker {
@@ -81,6 +116,11 @@ impl Tracker {
             clock: Arc::clone(&clock),
             notifier: notifier.clone(),
         });
+        let live = Live {
+            interval: settings.interval,
+            retention_secs: settings.retention_secs,
+            full_scan: settings.full_scan,
+        };
         Arc::new(Self {
             writer,
             reader,
@@ -95,7 +135,25 @@ impl Tracker {
             progress: Mutex::new((false, 0)),
             rescan_all: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
+            live: Mutex::new(live),
+            session_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    pub fn live(&self) -> Live {
+        self.live.lock().map(|l| *l).unwrap_or(Live {
+            interval: self.settings.interval,
+            retention_secs: self.settings.retention_secs,
+            full_scan: self.settings.full_scan,
+        })
+    }
+
+    /// Apply changed live settings; a new interval takes effect after the current wait.
+    pub fn set_live(&self, live: Live) {
+        if let Ok(mut l) = self.live.lock() {
+            *l = live;
+        }
+        self.refresh.notify_one();
     }
 
     /// Ask for a reconciliation soon; requests during a scan coalesce into one more scan.
@@ -133,7 +191,7 @@ impl Tracker {
     /// errors.
     pub async fn run_reconciler(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
         let mut first = true;
-        let mut delay = self.settings.interval;
+        let mut delay = self.live().interval;
         loop {
             if *stop.borrow() {
                 break;
@@ -144,7 +202,7 @@ impl Tracker {
             match outcome {
                 Ok(()) => {
                     first = false;
-                    delay = self.settings.interval;
+                    delay = self.live().interval;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "reconciliation failed; backing off");
@@ -164,16 +222,27 @@ impl Tracker {
 
     async fn reconcile(self: &Arc<Self>, first: bool) -> Result<()> {
         let rescan_all = self.rescan_all.swap(false, Ordering::Relaxed);
-        let (summary, rows) = self.scan_all().await?;
+        self.check_claude().await;
+        // Sessions first (the primary source): they also decide the development roots.
+        let mut rows = self.ingest_sessions(None).await?;
+        let full = self.live().full_scan || !self.full_scan_done().await?;
+        let (summary, scanned) = self.scan_markers(full).await?;
         if summary.cancelled {
             return Ok(());
         }
+        if full {
+            let _ = self
+                .writer
+                .set_meta(FULL_SCAN_DONE, &self.clock.now().to_string())
+                .await;
+        }
+        rows.extend(scanned);
         let now = self.clock.now();
         let tracked = self.tracked().await?;
 
-        // Missing: registered, present, not found, and not under a root that failed to scan
-        // (an unmounted disk must not make all its projects missing).
-        let found: HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        // Missing: a present project whose directory is gone, unless its root is unavailable (an
+        // unmounted disk must not make all its projects missing). Projects persist otherwise,
+        // even when their marker or their session files are deleted (§4.5).
         let failed: Vec<PathBuf> = self
             .status
             .snapshot()
@@ -182,19 +251,38 @@ impl Tracker {
             .filter(|r| r.state != "ok")
             .map(|r| std::fs::canonicalize(&r.path).unwrap_or_else(|_| PathBuf::from(&r.path)))
             .collect();
+        let unavailable = |t: &Tracked| failed.iter().any(|f| Path::new(&t.path).starts_with(f));
         let lost: Vec<String> = tracked
             .iter()
-            .filter(|t| !t.missing && !found.contains(t.id.as_str()))
-            .filter(|t| !failed.iter().any(|f| Path::new(&t.path).starts_with(f)))
+            .filter(|t| !t.missing && !is_dir(&t.path) && !unavailable(t))
             .map(|t| t.id.clone())
             .collect();
         for id in self.writer.mark_missing(lost, now).await? {
             self.unwatch(&id).await;
             self.notifier.project(&id);
         }
+        // Revived: a missing project whose directory is back.
+        let back: Vec<String> = tracked
+            .iter()
+            .filter(|t| t.missing && is_dir(&t.path))
+            .map(|t| t.id.clone())
+            .collect();
+        for id in self.writer.revive(back, now).await? {
+            self.notifier.project(&id);
+            rows.push(Upserted {
+                id,
+                canonical_path: String::new(),
+                inserted: false,
+                revived: true,
+            });
+        }
 
         // New and revived projects: walk, Git, move matching, watches.
-        let fresh: Vec<&Upserted> = rows.iter().filter(|r| r.inserted || r.revived).collect();
+        let mut seen = HashSet::new();
+        let fresh: Vec<&Upserted> = rows
+            .iter()
+            .filter(|r| (r.inserted || r.revived) && seen.insert(r.id.clone()))
+            .collect();
         if first {
             self.plan_all(&fresh).await?;
         } else {
@@ -204,7 +292,7 @@ impl Tracker {
             self.refresh_polled(rescan_all).await?;
         }
 
-        let retention = now - self.settings.retention_secs;
+        let retention = now - self.live().retention_secs;
         for id in self.writer.purge_missing(retention).await? {
             self.notifier.removed(&id);
         }
@@ -222,27 +310,138 @@ impl Tracker {
         tracing::info!(
             dirs = summary.dirs_visited,
             projects = summary.projects_found,
+            full,
             "reconciliation finished"
         );
         Ok(())
     }
 
-    /// The full discovery scan on a blocking thread; batches are stored as they arrive.
-    async fn scan_all(
+    async fn full_scan_done(&self) -> Result<bool> {
+        Ok(self
+            .reader
+            .with(|c| queries::get_meta(c, FULL_SCAN_DONE))
+            .await?
+            .is_some())
+    }
+
+    /// Present projects' canonical paths (the nested rule of scans and session resolution).
+    fn known_paths(tracked: &[Tracked]) -> HashSet<String> {
+        tracked
+            .iter()
+            .filter(|t| !t.missing)
+            .map(|t| t.path.clone())
+            .collect()
+    }
+
+    /// Canonical configured roots with their exclusion rules.
+    fn root_exclusions(&self) -> Vec<(PathBuf, Exclusions)> {
+        let s = &self.settings.scan;
+        s.roots
+            .iter()
+            .filter_map(|r| std::fs::canonicalize(r).ok())
+            .filter_map(|r| {
+                Exclusions::new(&r, &s.home, &s.exclude, &s.boundaries, &s.fuse_mounts)
+                    .ok()
+                    .map(|e| (r, e))
+            })
+            .collect()
+    }
+
+    /// The development roots (§4.5): parents of session-discovered projects inside a configured
+    /// root, walked [`DEV_ROOT_DEPTH`] levels deep (a configured root or home: one level).
+    async fn dev_roots(&self, tracked: &[Tracked]) -> Result<Vec<Subtree>> {
+        let parents = self.reader.with(queries::session_project_parents).await?;
+        let roots = self.root_exclusions();
+        let home = std::fs::canonicalize(&self.settings.scan.home)
+            .unwrap_or_else(|_| self.settings.scan.home.clone());
+        let mut out = Vec::new();
+        for p in parents {
+            let Ok(start) = std::fs::canonicalize(&p) else {
+                continue;
+            };
+            let Some((root, ex)) = roots
+                .iter()
+                .filter(|(r, _)| start.starts_with(r))
+                .max_by_key(|(r, _)| r.as_os_str().len())
+            else {
+                continue;
+            };
+            if ex.is_under_boundary(&start) {
+                continue;
+            }
+            let inside_project = tracked
+                .iter()
+                .any(|t| !t.missing && start.starts_with(&t.path) && start != Path::new(&t.path));
+            let max_rel_depth = Some(if start == *root || start == home {
+                1
+            } else {
+                DEV_ROOT_DEPTH
+            });
+            out.push(Subtree {
+                root: root.clone(),
+                start,
+                inside_project,
+                max_rel_depth,
+            });
+        }
+        out.dedup_by(|a, b| a.start == b.start);
+        Ok(out)
+    }
+
+    /// The marker scan: every root (`full`) or the development roots.
+    async fn scan_markers(
         self: &Arc<Self>,
+        full: bool,
     ) -> Result<(crate::discovery::walk::ScanSummary, Vec<Upserted>)> {
+        let tracked = self.tracked().await?;
+        let known = Self::known_paths(&tracked);
+        let dev = if full {
+            Vec::new()
+        } else {
+            self.dev_roots(&tracked).await?
+        };
+        let home = self.settings.scan.home.clone();
+        self.status.update(|s| {
+            s.scope = if full { "full" } else { "dev_roots" };
+            s.dev_roots = dev
+                .iter()
+                .map(|d| crate::view::display_path(&d.start.to_string_lossy(), &home))
+                .collect();
+        });
         let me = Arc::clone(self);
         let res = tokio::task::spawn_blocking(move || {
             let mut rows = Vec::new();
-            let summary = scan(&me.settings.scan, &me.cancel, &me.status, &mut |batch| {
-                me.store_candidates_blocking(batch, &mut rows)
-            });
+            let scope = if full {
+                Scope::Full
+            } else {
+                Scope::DevRoots(&dev)
+            };
+            let summary = scan_scope(
+                &me.settings.scan,
+                &known,
+                scope,
+                &me.cancel,
+                &me.status,
+                &mut |batch| me.store_candidates_blocking(batch, &mut rows),
+            );
             me.notifier.status();
             (summary, rows)
         })
         .await
         .map_err(|e| crate::error::Error::new(format!("scan task failed: {e}")))?;
         Ok(res)
+    }
+
+    async fn check_claude(&self) {
+        let Some(v) = self
+            .settings
+            .sessions
+            .as_ref()
+            .and_then(|s| s.claude.clone())
+        else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || v.refresh()).await;
     }
 
     fn store_candidates_blocking(&self, batch: Vec<Candidate>, rows: &mut Vec<Upserted>) -> bool {
@@ -415,18 +614,8 @@ impl Tracker {
 
     fn walk_context(&self, tracked: &[Tracked]) -> WalkContext {
         let s = &self.settings.scan;
-        let roots = s
-            .roots
-            .iter()
-            .filter_map(|r| std::fs::canonicalize(r).ok())
-            .filter_map(|r| {
-                Exclusions::new(&r, &s.home, &s.exclude, &s.boundaries, &s.fuse_mounts)
-                    .ok()
-                    .map(|e| (r, e))
-            })
-            .collect();
         WalkContext {
-            roots,
+            roots: self.root_exclusions(),
             others: tracked
                 .iter()
                 .filter(|t| !t.missing)
@@ -604,6 +793,14 @@ impl Tracker {
                 self.rescan_all.store(true, Ordering::Relaxed);
                 self.request_refresh();
             }
+            Signal::Sessions(dirs) => {
+                for row in self.ingest_sessions(Some(dirs)).await? {
+                    if row.inserted || row.revived {
+                        tracing::info!("new project registered from a session");
+                        self.enroll(&row.id, row.inserted).await?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -649,12 +846,14 @@ impl Tracker {
             root,
             start: dir.to_path_buf(),
             inside_project,
+            max_rel_depth: None,
         };
         let opts = s.clone();
         let cancel = Arc::clone(&self.cancel);
+        let known = Self::known_paths(&tracked);
         Ok(tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
-            scan_subtree(&opts, &sub, &cancel, &mut |b| {
+            scan_subtree(&opts, &sub, &known, &cancel, &mut |b| {
                 out.extend(b);
                 true
             });
@@ -711,6 +910,10 @@ impl Tracker {
         }
         Ok(())
     }
+}
+
+fn is_dir(path: &str) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 fn upsert_of(c: Candidate) -> ProjectUpsert {

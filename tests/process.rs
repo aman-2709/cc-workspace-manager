@@ -635,10 +635,10 @@ fn open_without_any_runtime_directory_explains_how_to_start_the_daemon() {
     );
 }
 
-/// `ccwm open` / `status` / `scan` wait (up to ~5 s) for a daemon that is still starting
-/// instead of failing at once; with no daemon at all they fail after the wait.
+/// `ccwm open` / `status` / `scan` wait (up to ~5 s) for a daemon only while it is starting,
+/// i.e. while the instance lock is held; with no lock holder they fail at once.
 #[test]
-fn cli_commands_wait_for_a_daemon_that_is_still_starting() {
+fn cli_commands_wait_only_for_a_daemon_that_holds_the_lock() {
     let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 1).unwrap();
     let started = Instant::now();
@@ -646,17 +646,31 @@ fn cli_commands_wait_for_a_daemon_that_is_still_starting() {
     let waited = started.elapsed();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
+    assert!(!err.contains("Waiting"), "no lock, no wait: {err}");
     assert!(
-        err.contains("Waiting up to 5 s") && err.contains("is the daemon running"),
+        err.contains("not running") || err.contains("is the daemon running"),
         "{err}"
     );
-    assert!(
-        waited >= Duration::from_secs(4) && waited < Duration::from_secs(10),
-        "{waited:?}"
-    );
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
 
-    // Started before the daemon: it waits and then succeeds.
+    // A starting daemon (simulated: the test holds the instance lock before the daemon runs).
+    let lock_path = env.runtime_dir.join("ccwm/ccwm.lock");
     for op in [&["status"][..], &["open", "--print"][..]] {
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            lock_path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let lock = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
         let cli = command(&env)
             .args(op)
             .stdout(Stdio::piped())
@@ -664,14 +678,13 @@ fn cli_commands_wait_for_a_daemon_that_is_still_starting() {
             .spawn()
             .unwrap();
         std::thread::sleep(Duration::from_millis(400));
+        drop(lock);
         let d = Daemon::start(&env, &[]);
         let out = cli.wait_with_output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success(),
-            "{op:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{op:?}: {err}");
+        assert!(err.contains("Waiting up to 5 s"), "{op:?}: {err}");
         assert!(
             text.contains("ccwm daemon") || text.contains("#bt="),
             "{op:?}: {text}"
@@ -1313,13 +1326,22 @@ fn git_subcommand(argv: &[String]) -> Option<&str> {
     None
 }
 
-/// `None` if the daemon may exec this: itself, or `git` (or a `git-<sub>` binary) running an
-/// allowlisted subcommand. Otherwise the reason it is a violation.
+/// `None` if the daemon may exec this: itself, `git` (or a `git-<sub>` binary) running an
+/// allowlisted subcommand, or `claude --version` / `claude --help` (the §8 CLI check).
+/// Otherwise the reason it is a violation.
 fn exec_violation(path: &str, argv: &[String], daemon: &str) -> Option<String> {
     if path == daemon {
         return None;
     }
     let name = Path::new(path).file_name()?.to_str()?.to_string();
+    if name == "claude" {
+        return match argv {
+            [_, flag] if flag == "--version" || flag == "--help" => None,
+            _ => Some(format!(
+                "{path} ran with arguments other than --version/--help: {argv:?}"
+            )),
+        };
+    }
     let sub = match name.as_str() {
         "git" => git_subcommand(argv).map(str::to_string),
         n => n.strip_prefix("git-").map(str::to_string),
@@ -1347,9 +1369,13 @@ fn the_exec_allowlist_admits_only_the_daemon_and_allowlisted_git_commands() {
 11 execve("/usr/bin/git", ["git", "--no-pager", "-c", "a=b", ...], 0x5 /* 8 vars */) = 0
 12 execve("/usr/lib/git-core/git-status", ["git-status"], 0x5 /* 8 vars */) = -1 ENOENT (No such file or directory)
 13 execve("/usr/bin/git", ["git", "say \"hi\"", "-c"], 0x5) = 0
+14 execve("/h/.local/bin/claude", ["/h/.local/bin/claude", "--version"], 0x5 /* 9 vars */) = 0
+15 execve("/h/.local/bin/claude", ["/h/.local/bin/claude", "--help"], 0x5 /* 9 vars */) = 0
+16 execve("/h/.local/bin/claude", ["/h/.local/bin/claude", "--resume", "x"], 0x5 /* 9 vars */) = 0
+17 execve("/h/.local/bin/claude", ["/h/.local/bin/claude"], 0x5 /* 9 vars */) = 0
 "#;
     let found = execs(log);
-    assert_eq!(found.len(), 13, "{found:#?}");
+    assert_eq!(found.len(), 17, "{found:#?}");
     assert_eq!(found[12].1[1], "say \"hi\"", "escapes are decoded");
     let bad: Vec<usize> = found
         .iter()
@@ -1357,7 +1383,7 @@ fn the_exec_allowlist_admits_only_the_daemon_and_allowlisted_git_commands() {
         .filter(|(_, (p, a))| exec_violation(p, a, "/x/target/debug/ccwm").is_some())
         .map(|(i, _)| i + 1)
         .collect();
-    assert_eq!(bad, [7, 8, 9, 10, 11, 13], "{found:#?}");
+    assert_eq!(bad, [7, 8, 9, 10, 11, 13, 16, 17], "{found:#?}");
 }
 
 /// Which isolation security acceptance test 5 can use on this host: a network namespace
@@ -1440,12 +1466,14 @@ fn fixture_git(dir: &Path, home: &Path, args: &[&str]) -> String {
 /// network namespace with only loopback. With strace, every `execve` must also be allowlisted:
 /// the daemon itself or `git` running a §6 subcommand; a `fetch`, `remote-*` helper, `sh` or `ssh`
 /// fails the test. Promisor partial clones (one per transport, `HEAD` object missing) must cause
-/// zero fetch children and run no helper (M2 review H1/L3). Skipped with a notice when neither
-/// isolation is available. (The session cycle joins in M3, when sessions are parsed.)
+/// zero fetch children and run no helper (M2 review H1/L3). The session cycle (ingest, a live
+/// session, on-demand prompt reads) and the `claude --version/--help` check (a fake `claude` on
+/// `PATH`) run too. Skipped with a notice when neither isolation is available.
 #[test]
 fn acceptance_5_no_external_network_connections() {
     let t = common::tempdir();
     let env = synth::generate(&t.path().join("e"), 3).unwrap();
+    let path_env = fake_claude(&env);
     let real_git = synth::init_git(&env).unwrap();
     let helpers = t.path().join("helpers");
     std::fs::create_dir(&helpers).unwrap();
@@ -1488,8 +1516,11 @@ fn acceptance_5_no_external_network_connections() {
         return;
     };
     eprintln!("NOTICE: security acceptance test 5 variant: {variant}");
-    let d = Daemon::start_wrapped(&env, &[], &[], &wrapper);
+    let d = Daemon::start_wrapped(&env, &[], &[("PATH", &path_env)], &wrapper);
     wait_scans_finished(&env, 1);
+    // Sessions: a live session file, then the detail panel's on-demand prompt reads.
+    add_live_session(&env);
+    std::thread::sleep(Duration::from_secs(3));
     // Live: an edit in a Git project (activity + Git refresh) and a new project.
     std::fs::write(env.home.join("dev/beta/CLAUDE.md"), "# beta, edited\n").unwrap();
     let fresh = env.home.join("dev/t5-new");
@@ -1500,9 +1531,22 @@ fn acceptance_5_no_external_network_connections() {
     // Reconciliation over the socket, then let the Git refreshes run.
     refresh_and_wait(&env);
     std::thread::sleep(Duration::from_secs(2));
+    let token = d.login(&env);
+    let page = d.get_json(&token, "/api/v1/projects?limit=200");
+    for name in ["alpha", "session-only", "t5-live"] {
+        let id = project_by_name(&page, name)["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        d.get_json(&token, &format!("/api/v1/projects/{id}/sessions?limit=10"));
+    }
+    assert_eq!(
+        socket_call(&env, "service.status")["claude"]["state"],
+        "verified",
+        "the fake claude was checked"
+    );
     if !promisors.is_empty() {
         // Each promisor project was inspected and degraded, not fetched.
-        let token = d.login(&env);
         wait_until("partial-clone Git states", 20, || {
             let list = d.get_json(&token, "/api/v1/projects?limit=200");
             promisors.iter().all(|(name, _)| {
@@ -1545,6 +1589,8 @@ fn acceptance_5_no_external_network_connections() {
             .filter(|(_, argv)| argv.iter().any(|a| a == "fetch"))
             .count();
         assert_eq!(fetches, 0, "promisor repositories started fetch children");
+        let claude_runs = all.iter().filter(|(p, _)| p.ends_with("/claude")).count();
+        assert_eq!(claude_runs, 2, "claude --version and --help, once each");
         if real_git {
             let git_runs = all
                 .iter()
@@ -1562,4 +1608,269 @@ fn acceptance_5_no_external_network_connections() {
             promisors.len()
         );
     }
+}
+
+// ---- M3: sessions, resume, privacy; security acceptance tests 2, 8 and 10 ----------------------
+
+/// A fake `claude` in `~/.local/bin` (inside the sandbox's read set; a hidden directory, so never
+/// walked) that only prints a version and a help text naming `--resume`, using shell built-ins
+/// only. Returns the `PATH` to run the daemon with.
+fn fake_claude(env: &SynthEnv) -> String {
+    let bin = env.home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let p = bin.join("claude");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\ncase \"$1\" in\n  --version) printf '9.9.9 (Synthetic Claude Code)\\n' ;;\n  --help) printf 'Usage: claude [options]\\n  -r, --resume [id]  Resume a conversation\\n' ;;\n  *) exit 2 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:/usr/bin:/bin", bin.display())
+}
+
+const LIVE_SESSION: &str = "abcdef01-2345-4678-89ab-cdef01234567";
+
+/// A new session (in a new project directory without `CLAUDE.md`) written while the daemon runs.
+fn add_live_session(env: &SynthEnv) {
+    let proj = env.home.join("dev/t5-live");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    let dir = env.claude_dir.join("projects/-synthetic-dev-t5-live");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(
+        dir.join(format!("{LIVE_SESSION}.jsonl")),
+        format!(
+            "{}\n",
+            serde_json::json!({"type": "user", "sessionId": LIVE_SESSION, "timestamp": "2026-11-24T10:00:00.000Z",
+                               "cwd": proj, "promptSource": "typed",
+                               "message": {"role": "user", "content": "SYNTHETIC-LIVE-PROMPT sk-ant-SYNTHETICCANARY0123456789"}})
+        ),
+    )
+    .unwrap();
+}
+
+fn db_files(env: &SynthEnv) -> Vec<std::path::PathBuf> {
+    ["ccwm.db", "ccwm.db-wal", "ccwm.db-shm"]
+        .iter()
+        .map(|n| env.data_home.join("ccwm").join(n))
+        .collect()
+}
+
+/// M3 acceptance in the synthetic environment: a project with sessions but no `CLAUDE.md`
+/// appears; the detail panel's data (last prompt read on demand, Git status, files, a correct
+/// resume command from the recorded cwd, escaped); no prompt text persisted by default; privacy
+/// mode removes the listed fields. Security acceptance tests **2** (session files unchanged by
+/// parsing and clearing the index), **8** (canary secrets in prompts, tokens and remote URLs
+/// never reach the trace log) and **10** (clearing the index and deleting the database leave
+/// project and Claude data byte-identical). `service uninstall --purge` arrives in M4.
+#[test]
+fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 2).unwrap();
+    let real_git = synth::init_git(&env).unwrap();
+    let path_env = fake_claude(&env);
+    let skip = env.ccwm_dirs().to_vec();
+    let claude_before = snapshot(&env.claude_dir);
+    let home_before = snapshot_excluding(&env.home, &skip);
+    let d = Daemon::start_with_env(&env, &[], &[("PATH", &path_env), ("CCWM_LOG", "trace")]);
+    let token = d.login(&env);
+    d.wait_scan_done(&token);
+    let page = d.get_json(&token, "/api/v1/projects?limit=200");
+
+    // A project with sessions but no CLAUDE.md appears.
+    let so = project_by_name(&page, "session-only");
+    assert_eq!(so["sources"], serde_json::json!(["session"]));
+    assert_eq!(so["sessions"]["count"], 1);
+    assert!(!env.home.join("dev/session-only/CLAUDE.md").exists());
+    let alpha = project_by_name(&page, "alpha");
+    assert_eq!(alpha["sources"], serde_json::json!(["marker", "session"]));
+    assert_eq!(
+        alpha["sessions"]["latest"]["title"],
+        "Alpha tests, continued"
+    );
+    assert_eq!(alpha["sessions"]["latest"]["title_source"], "ai_title");
+    let stats = d.get_json(&token, "/api/v1/stats");
+    assert_eq!(
+        stats["total_sessions"], 5,
+        "7 sessions minus 2 unassigned (home, vanished cwd)"
+    );
+
+    // The detail panel: last prompt on demand, resume command, warnings.
+    let alpha_id = alpha["id"].as_str().unwrap();
+    let sessions = d.get_json(
+        &token,
+        &format!("/api/v1/projects/{alpha_id}/sessions?limit=2"),
+    );
+    let latest = &sessions["items"][0];
+    assert_eq!(latest["id"], "22222222-3333-4444-8555-666666666666");
+    assert_eq!(
+        latest["last_prompt"]["text"],
+        "SYNTHETIC last prompt of the continuation"
+    );
+    let alpha_dir = env.home.join("dev/alpha");
+    assert_eq!(
+        latest["resume"]["command"],
+        format!(
+            "cd -- '{}' && claude --resume 22222222-3333-4444-8555-666666666666",
+            alpha_dir.display()
+        )
+        .as_str(),
+        "the first recorded cwd, not the last ({}/src)",
+        alpha_dir.display()
+    );
+    assert_eq!(
+        latest["resume"]["warnings"],
+        serde_json::json!([]),
+        "claude verified, cwd exists"
+    );
+    let older = &sessions["items"][1];
+    assert_eq!(
+        older["resume"]["session_id"], "22222222-3333-4444-8555-666666666666",
+        "continued in"
+    );
+    assert_eq!(older["resume"]["via_continuation"], true);
+    let so_id = so["id"].as_str().unwrap();
+    let s = d.get_json(&token, &format!("/api/v1/projects/{so_id}/sessions"));
+    let item = &s["items"][0];
+    assert_eq!(
+        item["last_prompt"]["text"], "SYNTHETIC suggestion the user accepted",
+        "task notifications and SDK input are not prompts"
+    );
+    assert_eq!(
+        item["first_prompt"]["text"],
+        "SYNTHETIC session-only prompt with a token [REDACTED] and password=[REDACTED]",
+        "untitled: the first prompt, redacted"
+    );
+    let detail = d.get_json(&token, &format!("/api/v1/projects/{so_id}"));
+    if real_git {
+        assert_eq!(detail["git"]["state"], "ok", "{detail}");
+        assert!(detail["git_detail"]["files"].is_object(), "{detail}");
+    }
+    let svc = d.get_json(&token, "/api/v1/service/status");
+    assert_eq!(svc["claude"]["state"], "verified", "{}", svc["claude"]);
+    assert_eq!(svc["claude"]["version"], "9.9.9 (Synthetic Claude Code)");
+    let disc = d.get_json(&token, "/api/v1/discovery/status");
+    assert_eq!(
+        disc["sessions"]["unassigned"],
+        serde_json::json!({"home": 1, "nonexistent": 1})
+    );
+
+    // Privacy mode: none of the listed fields reach the client.
+    let home = env.home.display().to_string();
+    for path in [
+        "/api/v1/projects?limit=200&privacy=1".to_string(),
+        format!("/api/v1/projects/{alpha_id}?privacy=1"),
+        format!("/api/v1/projects/{alpha_id}/sessions?limit=2&privacy=1"),
+        "/api/v1/discovery/status?privacy=1".to_string(),
+        "/api/v1/settings?privacy=1".to_string(),
+    ] {
+        let text = d.get_json(&token, &path).to_string();
+        for hidden in [
+            home.as_str(),
+            "Alpha tests",
+            "SYNTHETIC last prompt",
+            "claude --resume",
+            "Synthetic Author",
+        ] {
+            assert!(!text.contains(hidden), "{path} leaks {hidden}");
+        }
+    }
+
+    // Settings are saved under the sandbox; `--port 0` is a command-line override, not saved.
+    let settings = d.get_json(&token, "/api/v1/settings");
+    assert_eq!(
+        settings["config"]["server"]["port"], 8765,
+        "the file's value, not --port"
+    );
+    let origin = d.origin();
+    let (st, _, b) = d.http(
+        "PUT",
+        "/api/v1/settings",
+        &[
+            ("Origin", &origin),
+            ("Authorization", &format!("Bearer {token}")),
+            ("Content-Type", "application/json"),
+        ],
+        r#"{"discovery":{"scan_interval_secs":120}}"#,
+    );
+    assert_eq!(st, 200, "{b}");
+    let file = env.config_home.join("ccwm/config.toml");
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        saved.contains("scan_interval_secs = 120") && saved.contains("port = 8765"),
+        "{saved}"
+    );
+    assert_eq!(mode(&file), 0o600);
+
+    // Nothing of the prompts was stored; then clear the index (projects stay).
+    let (st, _, b) = d.http(
+        "POST",
+        "/api/v1/session-index/clear",
+        &[
+            ("Origin", &origin),
+            ("Authorization", &format!("Bearer {token}")),
+        ],
+        "",
+    );
+    assert_eq!(st, 200, "{b}");
+    let page = d.get_json(&token, "/api/v1/projects?limit=200");
+    assert_eq!(
+        project_by_name(&page, "session-only")["sessions"]["count"],
+        0
+    );
+    let bootstrap_like = d.open_url(&env);
+    let (code, log) = d.stop();
+    assert_eq!(code, Some(0), "{log}");
+    let mut db = Vec::new();
+    for f in db_files(&env) {
+        db.extend(std::fs::read(f).unwrap_or_default());
+    }
+    for canary in [
+        "SYNTHETIC first prompt",
+        "SYNTHETIC last prompt",
+        "SYNTHETIC suggestion",
+        "SYNTHETIC session-only prompt",
+        "SYNTHETIC tool output",
+        "SYNTHETIC-CANARY-API-BLOB",
+        "SYNTHETIC-CANARY-ACCOUNT",
+    ] {
+        assert!(
+            !db.windows(canary.len()).any(|w| w == canary.as_bytes()),
+            "{canary} stored"
+        );
+    }
+
+    // Test 8: the trace log holds no prompt, secret, token or credential.
+    assert!(log.contains("socket request"), "trace events were logged");
+    for canary in [
+        "SYNTHETIC first prompt",
+        "SYNTHETIC last prompt",
+        "SYNTHETIC session-only prompt",
+        "SYNTHETICCANARY",
+        "SYNTHETIC-CANARY-PW",
+        "SYNTHETIC-CANARY-ACCOUNT",
+        "SYNTHETIC-CANARY-ORG",
+        "SYNTHETIC-CANARY-API-BLOB",
+        "synthetic-password",
+        "Alpha tests, continued",
+        token.as_str(),
+        bootstrap_like.split("#bt=").nth(1).unwrap(),
+    ] {
+        assert!(!log.contains(canary), "{canary:?} reached the log");
+    }
+
+    // Test 10: delete the database; tests 2 and 10: project and Claude data byte-identical.
+    for f in db_files(&env) {
+        let _ = std::fs::remove_file(f);
+    }
+    assert_eq!(
+        snapshot(&env.claude_dir),
+        claude_before,
+        "session files changed"
+    );
+    assert_eq!(
+        snapshot_excluding(&env.home, &skip),
+        home_before,
+        "project data changed"
+    );
 }

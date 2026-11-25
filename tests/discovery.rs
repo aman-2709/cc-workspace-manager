@@ -5,6 +5,7 @@ mod common;
 use cc_workspace_manager::discovery::status::{Phase, SharedStatus};
 use cc_workspace_manager::discovery::walk::{scan, Candidate, ScanOptions, ScanSummary};
 use common::snapshot;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -456,7 +457,7 @@ fn the_synthetic_environment_yields_exactly_the_expected_projects() {
         },
     );
     found.sort();
-    assert_eq!(found, env.expected_projects(25));
+    assert_eq!(found, env.expected_marker_projects(25));
     assert!(
         s.skipped.rejected_markers >= 2,
         "escaping symlinked markers are rejected: {:?}",
@@ -592,7 +593,7 @@ fn the_inside_home_synthetic_layout_yields_exactly_the_expected_projects() {
         },
     );
     found.sort();
-    assert_eq!(found, env.expected_projects(3));
+    assert_eq!(found, env.expected_marker_projects(3));
     assert_eq!(snapshot(&env.root), before);
 }
 
@@ -653,4 +654,51 @@ fn a_directory_swapped_for_a_symlink_during_the_walk_is_never_followed() {
     let swaps = swapper.join().unwrap();
     assert!(swaps > 0, "the swapper never ran");
     eprintln!("swaps={swaps} changed-directory skips observed={changed}");
+}
+
+/// Projects already registered (e.g. found from a session, without a marker) make the markers
+/// below them nested instruction files unless they have their own Git root (§4.4).
+#[test]
+fn known_projects_make_markers_below_them_nested() {
+    use cc_workspace_manager::discovery::walk::{scan_scope, Scope};
+    let t = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(t.path()).unwrap();
+    let app = home.join("app");
+    fs::create_dir_all(app.join("tools/gen")).unwrap();
+    fs::write(app.join("tools/gen/CLAUDE.md"), "nested").unwrap();
+    fs::create_dir_all(app.join("vendor/lib/.git")).unwrap();
+    fs::write(app.join("vendor/lib/CLAUDE.md"), "own repo").unwrap();
+    let opts = ScanOptions {
+        roots: vec![home.clone()],
+        exclude: vec![],
+        max_depth: 10,
+        same_file_system: true,
+        home: home.join("not-home"),
+        boundaries: vec![],
+        fuse_mounts: vec![],
+    };
+    let run = |known: &HashSet<String>| {
+        let mut found = Vec::new();
+        scan_scope(
+            &opts,
+            known,
+            Scope::Full,
+            &AtomicBool::new(false),
+            &SharedStatus::default(),
+            &mut |b| {
+                found.extend(b.into_iter().map(|c| c.canonical_path));
+                true
+            },
+        );
+        found.sort();
+        found
+    };
+    let p = |r: &str| app.join(r).to_string_lossy().into_owned();
+    assert_eq!(run(&HashSet::new()), [p("tools/gen"), p("vendor/lib")]);
+    let known: HashSet<String> = [app.to_string_lossy().into_owned()].into();
+    assert_eq!(
+        run(&known),
+        [p("vendor/lib")],
+        "tools/gen belongs to the known project"
+    );
 }

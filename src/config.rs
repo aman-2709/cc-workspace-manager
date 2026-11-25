@@ -2,13 +2,13 @@
 
 use crate::error::{Error, Result};
 use crate::paths::Owner;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_PORT: u16 = 8765;
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -16,9 +16,11 @@ pub struct Config {
     pub watch: WatchConfig,
     pub activity: ActivityConfig,
     pub git: GitConfig,
+    pub sessions: SessionsConfig,
+    pub ui: UiConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     /// 0 (ephemeral, for tests) or 1024..=65535.
@@ -31,7 +33,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct DiscoveryConfig {
     /// Absolute directories; empty means the user's home directory.
@@ -44,6 +46,9 @@ pub struct DiscoveryConfig {
     pub scan_interval_secs: u64,
     /// Missing projects are purged after this many days (§4.5).
     pub missing_retention_days: u32,
+    /// "Scan entire home": walk every root at every reconciliation. Off: the first
+    /// reconciliation ever walks everything, later ones only the development roots (§4.5).
+    pub full_scan: bool,
 }
 
 impl Default for DiscoveryConfig {
@@ -55,11 +60,12 @@ impl Default for DiscoveryConfig {
             same_file_system: true,
             scan_interval_secs: 600,
             missing_retention_days: 30,
+            full_scan: false,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct WatchConfig {
     /// Maximum inotify watches; 0 = automatic: 25 % of `max_user_watches` (§5.1).
@@ -77,7 +83,7 @@ impl Default for WatchConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ActivityConfig {
     /// Calendar days since the last modification from which a project is *inactive* (§5.3).
@@ -98,12 +104,45 @@ impl Default for ActivityConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct GitConfig {
     /// Run worktree `git status` even when Git is too old (< 2.41.0) to pass `--attr-source`,
     /// i.e. without the filter-driver protection of §6. Off by default.
     pub allow_unhardened_status: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SessionsConfig {
+    /// Claude Code's config directory (sessions are under `projects/`). Unset:
+    /// `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+    /// Cache the last prompt (redacted) in ccwm's database. Off by default: prompts are read
+    /// from the session file each time the detail panel opens (§7.3).
+    pub store_prompt_text: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct UiConfig {
+    /// `cards` or `table` (a browser's own choice wins).
+    pub default_view: String,
+    /// `system`, `light` or `dark` (a browser's own choice wins).
+    pub theme: String,
+    /// Privacy mode for browsers that have not chosen yet.
+    pub privacy: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            default_view: "cards".into(),
+            theme: "system".into(),
+            privacy: false,
+        }
+    }
 }
 
 pub fn validate_port(port: u16) -> Result<()> {
@@ -116,6 +155,37 @@ pub fn validate_port(port: u16) -> Result<()> {
 }
 
 impl Config {
+    /// The file as `PUT /settings` writes it: TOML with a header (comments are not preserved).
+    pub fn to_toml(&self) -> Result<String> {
+        let body =
+            toml::to_string_pretty(self).map_err(|e| Error::new(format!("encode config: {e}")))?;
+        Ok(format!(
+            "# CC Workspace Manager configuration, written by the Settings page.\n# See config.example.toml for every key; comments are not preserved.\n\n{body}"
+        ))
+    }
+
+    /// Write `path` atomically (`<path>.tmp`, mode 0600, fsync, rename).
+    pub fn save(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let text = self.to_toml()?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| Error::io(format!("cannot write {}", tmp.display()), &e))?;
+        f.write_all(text.as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(|e| Error::io(format!("cannot write {}", tmp.display()), &e))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| Error::io(format!("cannot replace {}", path.display()), &e))
+    }
+
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: Config =
             toml::from_str(text).map_err(|e| Error::new(format!("invalid config: {e}")))?;
@@ -151,7 +221,7 @@ impl Config {
         Self::parse(&text).map_err(|e| Error::new(format!("{} ({})", e, path.display())))
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         validate_port(self.server.port)?;
         let d = &self.discovery;
         if !(1..=64).contains(&d.max_depth) {
@@ -207,6 +277,17 @@ impl Config {
                 "activity.events_per_project must be between 1 and 10000",
             ));
         }
+        if let Some(dir) = &self.sessions.dir {
+            if !dir.is_absolute() {
+                return Err(Error::new("sessions.dir must be an absolute path"));
+            }
+        }
+        if !["cards", "table"].contains(&self.ui.default_view.as_str()) {
+            return Err(Error::new("ui.default_view must be cards or table"));
+        }
+        if !["system", "light", "dark"].contains(&self.ui.theme.as_str()) {
+            return Err(Error::new("ui.theme must be system, light or dark"));
+        }
         Ok(())
     }
 }
@@ -238,6 +319,52 @@ mod tests {
             (7, 30, 200)
         );
         assert!(!c.git.allow_unhardened_status);
+        assert!(!c.discovery.full_scan);
+        assert_eq!(c.sessions, SessionsConfig::default());
+        assert!(!c.sessions.store_prompt_text && c.sessions.dir.is_none());
+        assert_eq!(
+            (
+                c.ui.default_view.as_str(),
+                c.ui.theme.as_str(),
+                c.ui.privacy
+            ),
+            ("cards", "system", false)
+        );
+    }
+
+    #[test]
+    fn saving_round_trips_and_is_private_and_atomic() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = crate::paths::private_tempdir();
+        let p = t.path().join("config.toml");
+        let mut c = Config::default();
+        c.discovery.roots = vec![
+            PathBuf::from("/srv/code"),
+            PathBuf::from("/home/u/it's here"),
+        ];
+        c.discovery.exclude = vec!["vendor/".into()];
+        c.discovery.full_scan = true;
+        c.sessions.store_prompt_text = true;
+        c.sessions.dir = Some(PathBuf::from("/home/u/.claude-work"));
+        c.ui.theme = "dark".into();
+        c.save(&p).unwrap();
+        assert_eq!(Config::load(&p, &me()).unwrap(), c);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            format!("{}.tmp", crate::paths::CONFIG_NAME),
+            crate::paths::CONFIG_TMP_NAME,
+            "the staged name the hygiene test checks"
+        );
+        assert!(!t.path().join(crate::paths::CONFIG_TMP_NAME).exists());
+        assert!(std::fs::read_to_string(&p)
+            .unwrap()
+            .starts_with("# CC Workspace Manager"));
+        // The default config also round-trips (an absent sessions.dir stays absent).
+        Config::default().save(&p).unwrap();
+        assert_eq!(Config::load(&p, &me()).unwrap(), Config::default());
     }
 
     #[test]
@@ -311,6 +438,10 @@ mod tests {
             "[activity]\ninactive_after_days = 30",
             "[activity]\ndormant_after_days = 5000",
             "[activity]\nevents_per_project = 0",
+            "[sessions]\ndir = \"relative\"",
+            "[sessions]\nstore = true",
+            "[ui]\ndefault_view = \"grid\"",
+            "[ui]\ntheme = \"blue\"",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }

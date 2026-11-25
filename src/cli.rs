@@ -59,35 +59,46 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// The daemon's socket after verifying the runtime directory (no TCP, ever).
-fn daemon_socket() -> Result<(std::path::PathBuf, u32)> {
+fn daemon_dirs() -> Result<(Dirs, u32)> {
     let uid = nix::unistd::geteuid().as_raw();
     let home = current_home(uid)?;
-    let dirs = Dirs::resolve(&EnvVars::from_process(), &home);
+    Ok((Dirs::resolve(&EnvVars::from_process(), &home), uid))
+}
+
+/// The daemon's socket after verifying the runtime directory (no TCP, ever).
+fn daemon_socket() -> Result<(std::path::PathBuf, u32)> {
+    let (dirs, uid) = daemon_dirs()?;
     dirs.verify_runtime(&Owner::current(uid))?;
     Ok((dirs.socket_path(), uid))
 }
 
-/// How long the CLI waits for a daemon that is still starting (runtime directory or socket not
-/// there yet, or not accepting yet).
+/// How long the CLI waits for a daemon that is still starting (it holds the instance lock, but
+/// its socket is not accepting yet).
 pub const STARTUP_WAIT: Duration = Duration::from_secs(5);
 
-/// The first request of a command: retried while the daemon is not running yet, up to `wait`.
-/// Every other error (wrong owner, impostor, protocol) fails at once.
+/// The first request of a command. If the daemon is not reachable, the CLI waits (up to
+/// [`STARTUP_WAIT`]) only when the instance lock is held, i.e. a daemon is starting; with no
+/// lock holder it fails at once. Every other error (wrong owner, impostor, protocol) fails at
+/// once too.
 fn first_call(op: &str) -> Result<(std::path::PathBuf, u32, serde_json::Value)> {
-    let mut told = false;
-    retry_while_starting(STARTUP_WAIT, Duration::from_millis(100), || {
-        let r = daemon_socket()
-            .and_then(|(socket, uid)| client::call(&socket, uid, op).map(|v| (socket, uid, v)));
-        if r.as_ref().is_err_and(Error::is_not_running) && !told {
+    let call = || {
+        daemon_socket()
+            .and_then(|(socket, uid)| client::call(&socket, uid, op).map(|v| (socket, uid, v)))
+    };
+    match call() {
+        Err(e) if e.is_not_running() => {
+            let starting = daemon_dirs().is_ok_and(|(d, _)| crate::instance::lock_held(&d));
+            if !starting {
+                return Err(e);
+            }
             eprintln!(
                 "Waiting up to {} s for the ccwm daemon to start…",
                 STARTUP_WAIT.as_secs()
             );
-            told = true;
+            retry_while_starting(STARTUP_WAIT, Duration::from_millis(100), call)
         }
-        r
-    })
+        other => other,
+    }
 }
 
 /// Run `attempt` until it succeeds, fails with anything but "not running", or `wait` is over
@@ -114,6 +125,7 @@ fn status() -> Result<()> {
     let (socket, uid, st) = first_call("service.status")?;
     print!("{}", format_status(&st));
     if let Ok(d) = client::call(&socket, uid, "discovery.status") {
+        print!("{}", format_sessions(&d));
         print!("{}", format_unreadable(&d));
     }
     if let Some(warning) = commit_mismatch(st.get("commit").and_then(|v| v.as_str())) {
@@ -203,6 +215,12 @@ pub fn format_status(v: &serde_json::Value) -> String {
         s(v, "/git/hardened_status")
     ));
     out.push_str(&format!(
+        "  claude: {} {} (resume supported: {})\n",
+        s(v, "/claude/state"),
+        s(v, "/claude/version"),
+        s(v, "/claude/resume_supported")
+    ));
+    out.push_str(&format!(
         "  sandbox: {} (abi {}, filesystem {}, network {})\n",
         s(v, "/sandbox/status"),
         s(v, "/sandbox/abi"),
@@ -216,6 +234,47 @@ pub fn format_status(v: &serde_json::Value) -> String {
 /// `n folder` / `n folders`.
 pub fn folders(n: u64) -> String {
     format!("{n} folder{}", if n == 1 { "" } else { "s" })
+}
+
+/// The session index and the marker scan's scope (from `discovery.status`).
+pub fn format_sessions(d: &serde_json::Value) -> String {
+    let unassigned: Vec<String> = d
+        .pointer("/sessions/unassigned")
+        .and_then(|u| u.as_object())
+        .map(|o| {
+            o.iter()
+                .map(|(k, n)| format!("{n} {}", k.replace('_', " ")))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = format!(
+        "  sessions: {} ({} files, {} indexed{})\n",
+        s(d, "/sessions/state"),
+        s(d, "/sessions/files"),
+        s(d, "/sessions/indexed"),
+        if unassigned.is_empty() {
+            String::new()
+        } else {
+            format!("; not in a project: {}", unassigned.join(", "))
+        }
+    );
+    let dev_roots: Vec<&str> = d
+        .get("dev_roots")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    out.push_str(&match s(d, "/scope").as_ref() {
+        "dev_roots" if dev_roots.is_empty() => {
+            "  marker scan: development roots (none yet)\n".to_string()
+        }
+        "dev_roots" => format!(
+            "  marker scan: development roots {}\n",
+            dev_roots.join(", ")
+        ),
+        "full" => "  marker scan: every root\n".to_string(),
+        _ => String::new(),
+    });
+    out
 }
 
 /// The folders the last scan could not read (from `discovery.status`), or nothing.
@@ -406,6 +465,30 @@ mod status_tests {
         ] {
             assert!(t.contains(want), "{want} in {t}");
         }
+    }
+
+    #[test]
+    fn sessions_and_scan_scope_are_summarized() {
+        let d = serde_json::json!({
+            "scope": "dev_roots", "dev_roots": ["~/dev", "~/work"],
+            "sessions": {"state": "ok", "files": 9, "indexed": 9,
+                         "unassigned": {"home": 1, "outside_roots": 2}}
+        });
+        let text = format_sessions(&d);
+        assert!(
+            text.contains(
+                "sessions: ok (9 files, 9 indexed; not in a project: 1 home, 2 outside roots)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("development roots ~/dev, ~/work"), "{text}");
+        let full = format_sessions(
+            &serde_json::json!({"scope": "full", "sessions": {"state": "missing", "files": 0, "indexed": 0, "unassigned": {}}}),
+        );
+        assert!(
+            full.contains("sessions: missing (0 files, 0 indexed)") && full.contains("every root"),
+            "{full}"
+        );
     }
 
     #[test]

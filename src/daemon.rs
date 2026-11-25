@@ -62,6 +62,9 @@ struct Prepared {
     uid: u32,
     dirs: Dirs,
     config: Config,
+    /// The configuration file as loaded (without command-line overrides): what Settings edits.
+    file_config: Config,
+    config_path: PathBuf,
     roots: Vec<PathBuf>,
     home: PathBuf,
     session_dir: PathBuf,
@@ -89,6 +92,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     // Read before the sandbox exists, so the config's directory is never granted (M1.1, M2).
     let config_path = args.config.clone().unwrap_or_else(|| dirs.config_file());
     let mut config = Config::load(&config_path, &owner)?;
+    let file_config = config.clone();
     if let Some(port) = args.port {
         validate_port(port)?;
         config.server.port = port;
@@ -101,7 +105,11 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
 
     // Canonical directories for the sandbox and the discovery boundaries (they exist now).
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let session_dir = paths::session_dir(&env, &home);
+    let session_dir = config
+        .sessions
+        .dir
+        .clone()
+        .unwrap_or_else(|| paths::session_dir(&env, &home));
     let policy = sandbox::daemon_policy(
         &roots.iter().map(|r| canon(r)).collect::<Vec<_>>(),
         &canon(&session_dir),
@@ -128,6 +136,8 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         uid,
         dirs,
         config,
+        file_config,
+        config_path,
         roots,
         home,
         session_dir,
@@ -155,6 +165,8 @@ async fn run(p: Prepared) -> Result<()> {
         uid,
         dirs,
         config,
+        file_config,
+        config_path,
         roots,
         home,
         session_dir,
@@ -221,7 +233,13 @@ async fn run(p: Prepared) -> Result<()> {
             None
         }
     };
-    let boundaries = dirs.hard_boundaries(&session_dir);
+    let canonical_session_dir =
+        std::fs::canonicalize(&session_dir).unwrap_or_else(|_| session_dir.clone());
+    let mut boundaries = dirs.hard_boundaries(&session_dir);
+    if !boundaries.contains(&canonical_session_dir) {
+        boundaries.push(canonical_session_dir.clone());
+    }
+    let claude = Arc::new(crate::claude::cli::Verifier::new(std::env::var_os("PATH")));
     let fuse_mounts = current_fuse_mount_points();
     let max_user_watches = watch_engine::read_max_user_watches();
     let budget = match config.watch.budget {
@@ -233,7 +251,7 @@ async fn run(p: Prepared) -> Result<()> {
         .filter_map(|r| std::fs::canonicalize(r).ok())
         .collect();
     let scan_opts = ScanOptions {
-        roots,
+        roots: roots.clone(),
         exclude: config.discovery.exclude.clone(),
         max_depth: config.discovery.max_depth,
         same_file_system: config.discovery.same_file_system,
@@ -255,6 +273,14 @@ async fn run(p: Prepared) -> Result<()> {
             interval: Duration::from_secs(config.discovery.scan_interval_secs),
             retention_secs: i64::from(config.discovery.missing_retention_days) * 86_400,
             events_per_project: config.activity.events_per_project,
+            full_scan: config.discovery.full_scan,
+            sessions: Some(crate::tracker::SessionSettings {
+                config_dir: canonical_session_dir.clone(),
+                temp_dirs: crate::discovery::resolve::temp_dirs(
+                    std::env::var_os("TMPDIR").as_deref(),
+                ),
+                claude: Some(Arc::clone(&claude)),
+            }),
         },
     );
     let monitor = Monitor::new(
@@ -291,6 +317,11 @@ async fn run(p: Prepared) -> Result<()> {
         monitor: monitor_state,
         notifier,
         tracker: Some(Arc::clone(&tracker)),
+        config: file_config,
+        config_path: Some(config_path),
+        session_dir: canonical_session_dir,
+        roots,
+        claude: Some(claude),
     }));
     let socket = crate::ipc::server::bind(&dirs.socket_path(), uid)?;
     write_instance(

@@ -225,6 +225,20 @@ impl DirHandle {
         Some((buf, u64::try_from(st.st_size).unwrap_or(0)))
     }
 
+    /// Open the regular file `name` in this directory for reading, never through a symlink
+    /// (`O_NOFOLLOW`); FIFOs, devices and directories are refused.
+    pub fn open_regular(&self, name: &OsStr) -> Option<std::fs::File> {
+        let fd = openat(
+            self.dir.as_fd(),
+            name,
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .ok()?;
+        let st = fstat(&fd).ok()?;
+        is(&st, SFlag::S_IFREG).then(|| std::fs::File::from(fd))
+    }
+
     /// SHA-256 of the marker file `name` (at most [`MAX_MARKER_BYTES`] are read; a larger file
     /// hashes its first bytes and its size). A symlinked marker must resolve beneath this
     /// directory (see [`Self::read_regular`]).

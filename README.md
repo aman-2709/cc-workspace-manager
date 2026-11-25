@@ -4,13 +4,15 @@ Discover, track, and resume your Claude Code projects.
 
 CC Workspace Manager is an **independent, unofficial** open-source project. Claude and Claude Code are trademarks of Anthropic, PBC. This project is independent and not affiliated with or endorsed by Anthropic.
 
-`ccwm` is a small local daemon with a browser dashboard. It finds the folders on your machine that are Claude Code projects (they contain a `CLAUDE.md`), shows which ones you worked on recently and what their Git state is, and keeps that list current as you work. It is a project-centric workspace manager, not a token or cost dashboard.
+`ccwm` is a small local daemon with a browser dashboard. It finds the folders on your machine that are Claude Code projects (from your Claude Code sessions, and folders that contain a `CLAUDE.md`), shows which ones you worked on recently, what their Git state is and where you left off, and gives you the command to resume the last session. It is a project-centric workspace manager, not a token or cost dashboard.
 
-> **Status: pre-release (milestone M2 of 4).** Discovery, live activity tracking, Git status, the card and table views and live updates work. Session integration, resume commands, privacy mode and Settings arrive in M3; packaging, the systemd unit and release binaries in M4. Only Linux x86_64 (Ubuntu 24.04) has been tested.
+> **Status: pre-release (milestone M3 of 4).** Discovery from sessions and `CLAUDE.md` files, live activity tracking, Git status, session titles, the last prompt and resume commands, privacy mode and Settings work. Packaging, the systemd unit and release binaries arrive in M4. Only Linux x86_64 (Ubuntu 24.04) has been tested.
 
 ## What it does today
 
-- Finds every directory with a `CLAUDE.md` under your home directory (configurable roots), skipping hidden, generated and dependency folders.
+- Finds projects from your Claude Code sessions (the folder each session started in, resolved to its Git repository) and from `CLAUDE.md` files under your home directory (configurable roots), skipping hidden, generated and dependency folders.
+- Shows each project's latest session (its AI title as recorded by Claude Code), the last prompt (read from the session file when you open the details, redacted, not stored) and a resume command to copy (`cd -- '<folder>' && claude --resume <id>`); ccwm never runs it.
+- Privacy mode hides paths, user names, remote URLs, titles, prompts and commands (enforced by the server); a Settings page edits the configuration.
 - Tracks the latest meaningful file change per project, live (inotify, non-recursive watches, a watch budget) with a fallback to periodic checks; `.gitignore`d files and `.git/` do not count.
 - Shows branch, ahead/behind, staged/modified/untracked counts and the latest commit, read with hardened, allowlisted Git commands.
 - Card and table views with search, sort and filters; projects that disappear are marked missing, never silently deleted; projects can be ignored.

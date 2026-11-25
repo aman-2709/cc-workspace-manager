@@ -35,6 +35,7 @@ fn runtime_names() -> Vec<&'static str> {
         paths::INSTANCE_NAME,
         paths::INSTANCE_TMP_NAME,
         paths::CONFIG_NAME,
+        paths::CONFIG_TMP_NAME,
     ]
 }
 
@@ -57,9 +58,10 @@ fn every_runtime_file_name_is_ignored_wherever_it_appears() {
     assert_eq!(paths::DB_SHM_NAME, format!("{}-shm", paths::DB_NAME));
     let mut visible = Vec::new();
     for name in runtime_names() {
-        // `config.toml` is a common name (`.cargo/config.toml` must stay committable): it is
-        // ignored at the root and inside any `ccwm/` directory, where ccwm keeps it.
-        let dirs: &[&str] = if name == paths::CONFIG_NAME {
+        // `config.toml` is a common name (`.cargo/config.toml` must stay committable): it (and
+        // its staged `.tmp`) is ignored at the root and inside any `ccwm/` directory, where ccwm
+        // keeps it.
+        let dirs: &[&str] = if name == paths::CONFIG_NAME || name == paths::CONFIG_TMP_NAME {
             &["", "ccwm/", ".config/ccwm/", "x/ccwm/"]
         } else {
             &["", "data/ccwm/", "x/y/", ".config/ccwm/", "run/ccwm/"]

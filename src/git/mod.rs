@@ -188,13 +188,7 @@ pub struct GitSummary {
 
 /// First executable `git` on `path` (absolute entries only).
 pub fn find_on_path(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::split_paths(path?)
-        .filter(|d| d.is_absolute())
-        .map(|d| d.join("git"))
-        .find(|p| {
-            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
+    crate::paths::find_executable("git", path)
 }
 
 impl Git {

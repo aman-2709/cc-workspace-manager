@@ -22,6 +22,9 @@ pub const LOCK_NAME: &str = "ccwm.lock";
 pub const INSTANCE_NAME: &str = "instance.json";
 pub const DB_NAME: &str = "ccwm.db";
 pub const CONFIG_NAME: &str = "config.toml";
+/// Where `PUT /settings` stages the new configuration before renaming it over [`CONFIG_NAME`]
+/// (`Config::save` writes `<config file>.tmp`).
+pub const CONFIG_TMP_NAME: &str = "config.toml.tmp";
 /// Written next to `instance.json` and renamed over it (atomic replace).
 pub const INSTANCE_TMP_NAME: &str = "instance.json.tmp";
 /// SQLite's companion files next to the database.
@@ -59,6 +62,15 @@ impl EnvVars {
 /// otherwise `~/.claude`.
 pub fn session_dir(env: &EnvVars, home: &Path) -> PathBuf {
     xdg_absolute(&env.claude_config_dir).unwrap_or_else(|| home.join(DEFAULT_CLAUDE_DIR))
+}
+
+/// First executable regular file `name` on `path` (a `PATH` value; absolute entries only).
+pub fn find_executable(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path?)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
 /// Per the XDG spec, relative or empty values are invalid and ignored.

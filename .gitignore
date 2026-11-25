@@ -58,7 +58,9 @@ credentials.json
 
 # ---- Local configuration (commit only config.example.toml) ----
 /config.toml
+/config.toml.tmp
 **/ccwm/config.toml
+**/ccwm/config.toml.tmp
 config.local.toml
 *.local.toml
 .claude/settings.local.json

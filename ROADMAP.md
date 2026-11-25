@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **M2.1 (M2 security fixes + real-home defects) complete — waiting for the maintainer's go-ahead for M3.**
+Current position: **M3 (development continuity) complete — waiting for the maintainer's review and go-ahead for M4.**
 
 ---
 
@@ -93,13 +93,21 @@ status, files, correct resume command (first recorded cwd, escaped); no prompt t
 privacy mode removes the listed fields; security acceptance tests **2, 8, 10** pass. Built from the
 maintainer's pasted §19 script output + synthetic fixtures only.
 
-- [ ] Synthetic versioned fixture corpus; session locator (`CLAUDE_CONFIG_DIR`); top-level files only; non-recursive watches
-- [ ] Incremental parser (checkpoints, partial line, truncation/rotation, 8 MiB cap, counters); min/max timestamps; first/last cwd; `ai-title`
-- [ ] Prompt classifier (`typed`/`queued`; `sdk`/`system` excluded; classifier otherwise); on-demand bounded (4 MiB) read, 2,000-char cap, redaction; opt-in "Store prompt text"
-- [ ] Session-based discovery + cwd → root, unassigned-home counter
-- [ ] Resume command (UUID validation, POSIX quoting + adversarial tests), `claude` CLI verification (5 s, cached by path+mtime)
-- [ ] Privacy mode (server-side omission, search ignores hidden fields); Settings page + `GET/PUT /settings`; clear session index
-- [ ] fmt/clippy/test; docs; commit
+Pre-M3 maintainer decisions (2026-11-24): O5 and the `notify` license exceptions approved (now per crate in
+`deny.toml`); schema output pasted (ARCHITECTURE.md §11); parser, title, prompt, resume and discovery-redesign
+decisions recorded in REQUIREMENTS.md §4, §7, §8; `_build` excluded; DEGRADED only for real failures; privacy also
+hides unreadable-folder paths; the CLI waits only while the instance lock is held.
+
+- [x] Synthetic versioned fixture corpus (`tests/fixtures/sessions/{2.1.331,2.1.220}`, embedded by `synth`); session locator (`CLAUDE_CONFIG_DIR` / `sessions.dir`, fd-based, top-level files only, others counted); non-recursive, debounced session-directory watches (first in the budget)
+- [x] Allowlist parser (lenient fields; skipped payloads never materialized); incremental checkpoints (partial line, truncation, rotation, same-size rewrite, 8 MiB cap, counters); min/max timestamps; first/last cwd; latest `ai-title` (redacted); `continued-in` / `derived-from`
+- [x] Prompt classifier (`typed`/`queued`/`suggestion_accepted`; `sdk`/`system` excluded; older records via the classifier; all 31 schema signatures tested); on-demand bounded (4 MiB) reads, 2,000-char cap, redaction; opt-in "Store prompt text" (off deletes the cache)
+- [x] Session-based discovery: cwd → nearest Git root / marker (never home), nested rule, unassigned reasons counted; full marker scan on first launch, then development roots; "Scan entire home"; projects persist (missing = directory gone)
+- [x] Resume command (UUID validation, POSIX quoting + adversarial shell test, first cwd, latest continuation, warnings); `claude` CLI verification (5 s, cached by path+size+mtime, in `ccwm status` and `/service/status`)
+- [x] Detail panel (Git, files, latest session, last/first prompt, resume + copy); table "Copy resume"; card/table session info; `sort=session`, `has_sessions`
+- [x] Privacy mode (server-side omission in REST and WebSocket, search ignores hidden fields, also status/settings paths); Settings page + `GET/PUT /settings` (atomic 0600 write, live vs restart); clear session index
+- [x] `_build` exclusion; DEGRADED/banner only for real failures; CLI waits only while the instance lock is held
+- [x] Security acceptance tests 2, 8, 10 (process level; `service uninstall --purge` part in M4); test 5 with the session cycle and the `claude` check
+- [x] fmt / clippy / test (`CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_INOTIFY=1`) / cargo deny green; synthetic daemon + real browser check; docs; local commit
 
 ## M4 — Release readiness
 Accept: a fresh user account installs from the release archive; service starts at login (and at boot with
@@ -115,6 +123,9 @@ cargo-deny bans) green; benchmarks documented.
 - [ ] Seccomp filter denying `socket()` after the TCP and Unix listeners are bound (deferred from M1.1; needs a dependency justified in ARCHITECTURE §4 first) — closes UDP and path-based Unix-socket connect
 - [x] Security acceptance test 5 fallback where `unshare -rn` is unavailable (done before M2: strace variant)
 - [ ] Test 5 in CI on a runner with unprivileged user namespaces (network-namespace variant has not run anywhere yet)
+- [ ] `ccwm doctor`: the `claude` check and the session directory (built in M3, reported in `ccwm status`)
+- [ ] Security acceptance tests 2 and 10 extended to `ccwm service uninstall --purge`
+- [ ] If approved (O1): live reconfiguration of roots/exclusions/budget (in-process tracker + monitor restart)
 - [ ] Security + performance pass with measured numbers; docs (README, SECURITY, CONTRIBUTING, CHANGELOG, LICENSE, config reference, discovery semantics, inotify troubleshooting, retention, service mgmt)
 - [ ] CI (fmt, clippy, test, cargo-deny, gitleaks, hygiene; SHA-pinned; least privilege) + release workflow (musl)
 - [ ] History/secret audit before first publication; naming-conflict check (needs maintainer OK)
@@ -137,3 +148,5 @@ cargo-deny bans) green; benchmarks documented.
 - [ ] ARM64 (aarch64-musl) release binaries on native runners
 - [ ] Additional AI coding assistants (introduce the provider abstraction then)
 - [ ] macOS and Windows support
+- [ ] Git `core.excludesFile` (the user's global ignore file) in the activity rules (maintainer request, post-v0.1)
+- [ ] Display of `pr-link` records (the session's pull request) in the detail panel (maintainer request, post-v0.1)

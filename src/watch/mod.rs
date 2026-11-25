@@ -102,6 +102,9 @@ pub enum Cmd {
     },
     /// The reconciliation triggered by an overflow has finished.
     OverflowRecovered,
+    /// Watch exactly these session directories (Claude Code's `projects/` first, then its
+    /// `<encoded-dir>` children), non-recursively; others watched for sessions are dropped.
+    WatchSessions(Vec<PathBuf>),
     /// Internal: a walk of a directory created at runtime finished.
     Walked {
         owner: Owner,
@@ -133,6 +136,9 @@ pub enum Signal {
     Moved { from: PathBuf, to: PathBuf },
     /// Events were lost (`IN_Q_OVERFLOW` or our queue was full): reconcile everything.
     Rescan,
+    /// Session files changed in these `<encoded-dir>` directories (debounced); Claude Code's
+    /// `projects/` directory itself in the list means "every session".
+    Sessions(Vec<PathBuf>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +146,8 @@ pub enum Owner {
     Project(String),
     /// Sibling detection: the parent of a project (level 0) or a directory created below one.
     Parent(u8),
+    /// Claude Code's session directories (`projects/` and its children).
+    Sessions,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -159,6 +167,10 @@ pub struct MonitorStatus {
     pub recovering_overflow: bool,
     /// Projects with debounced events not yet recorded.
     pub pending_projects: usize,
+    /// Session directories watched (live session updates; otherwise found at each scan).
+    pub session_watches: usize,
+    /// Real failures only: no inotify instance, a queue overflow being recovered, or projects
+    /// without any watch (polled). Partly watched projects are normal operation (§5.1).
     pub degraded: bool,
     /// Guidance (shown by the UI banner and `ccwm doctor`); never applied automatically.
     pub advice: Vec<String>,
@@ -369,6 +381,10 @@ pub struct Monitor {
     last_summary: Option<Summary>,
     /// Projects, watches or degraded state changed since the last full publication.
     dirty: bool,
+    /// Claude Code's `projects/` directory (from the last `WatchSessions`).
+    sessions_root: Option<PathBuf>,
+    /// Session directories with changes not yet signalled, and when the first one came.
+    session_pending: Option<(Instant, HashSet<PathBuf>)>,
 }
 
 impl Monitor {
@@ -415,6 +431,8 @@ impl Monitor {
             notifier,
             last_summary: None,
             dirty: true,
+            sessions_root: None,
+            session_pending: None,
         };
         let mut m = m;
         m.publish();
@@ -458,10 +476,11 @@ impl Monitor {
             .values()
             .map(|r| r.since + RENAME_PAIRING)
             .min();
-        match (debounce, rename) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let sessions = self
+            .session_pending
+            .as_ref()
+            .map(|(t, _)| *t + self.settings.debounce);
+        [debounce, rename, sessions].into_iter().flatten().min()
     }
 
     // ---- commands -------------------------------------------------------------------------------
@@ -482,7 +501,29 @@ impl Monitor {
             Cmd::Remove(id) => self.remove_project(&id),
             Cmd::Retry { id, roots, dirs } => self.retry(&id, &roots, &dirs),
             Cmd::OverflowRecovered => self.recovering = false,
+            Cmd::WatchSessions(dirs) => self.watch_sessions(dirs),
             Cmd::Walked { owner, tree } => self.watch_new_tree(&owner, &tree),
+        }
+    }
+
+    /// Session watches come before project watches in the budget: they are few (one per
+    /// project directory of Claude Code) and make new sessions appear live.
+    fn watch_sessions(&mut self, dirs: Vec<PathBuf>) {
+        self.sessions_root = dirs.first().cloned();
+        let wanted: HashSet<&PathBuf> = dirs.iter().collect();
+        let stale: Vec<PathBuf> = self
+            .watches
+            .iter()
+            .filter(|(d, o)| **o == Owner::Sessions && !wanted.contains(d))
+            .map(|(d, _)| d.clone())
+            .collect();
+        for d in stale {
+            self.drop_watch(&d);
+        }
+        for d in &dirs {
+            if self.add_watch(d, Owner::Sessions).is_err() {
+                break; // a limit: the rest is found at each reconciliation
+            }
         }
     }
 
@@ -853,11 +894,52 @@ impl Monitor {
         if path.to_str().is_none() {
             return; // non-UTF-8 names are never tracked
         }
+        if self.on_session_change(&path, &change) {
+            return;
+        }
         match self.project_of(&path) {
             Some((id, root)) if path == root => self.on_project_root(&id, &change),
             Some((id, root)) => self.on_in_project(&id, &root, &path, &change),
             None => self.on_parent_area(&path, &change),
         }
+    }
+
+    /// A change in a watched session directory: debounce it into a [`Signal::Sessions`].
+    /// `true` if the path belongs to the session tree (and nothing else may handle it).
+    fn on_session_change(&mut self, path: &Path, change: &Change) -> bool {
+        let Some(root) = self.sessions_root.clone() else {
+            return false;
+        };
+        if !path.starts_with(&root) {
+            return false;
+        }
+        let parent = path.parent().unwrap_or(path);
+        let dir = if path == root {
+            root.clone() // the directory itself (removed or replaced): everything
+        } else if parent == root {
+            match change {
+                // A new `<encoded-dir>`: watch it now, then ingest it.
+                Change::Created { dir: true, .. } => {
+                    let _ = self.add_watch(path, Owner::Sessions);
+                    path.to_path_buf()
+                }
+                Change::Removed(_) => {
+                    self.forget_below(path);
+                    root.clone()
+                }
+                _ => return true,
+            }
+        } else if self.watches.get(parent) == Some(&Owner::Sessions) {
+            parent.to_path_buf()
+        } else {
+            return true; // deeper (subagent transcripts…): not sessions in v0.1
+        };
+        let now = Instant::now();
+        self.session_pending
+            .get_or_insert_with(|| (now, HashSet::new()))
+            .1
+            .insert(dir);
+        true
     }
 
     fn on_project_root(&mut self, id: &str, change: &Change) {
@@ -1036,6 +1118,17 @@ impl Monitor {
     pub fn flush_due(&mut self, now: Instant) {
         self.expire_renames(now);
         let debounce = self.settings.debounce;
+        if self
+            .session_pending
+            .as_ref()
+            .is_some_and(|(first, _)| now >= *first + debounce)
+        {
+            if let Some((_, dirs)) = self.session_pending.take() {
+                let mut dirs: Vec<PathBuf> = dirs.into_iter().collect();
+                dirs.sort();
+                self.signal(Signal::Sessions(dirs));
+            }
+        }
         let due: Vec<String> = self
             .pending
             .iter()
@@ -1155,7 +1248,12 @@ impl Monitor {
             overflows: self.overflows,
             recovering_overflow: self.recovering,
             pending_projects: self.pending.len(),
-            degraded: !has_backend || partial > 0 || polled > 0 || self.recovering,
+            session_watches: self
+                .watches
+                .values()
+                .filter(|o| **o == Owner::Sessions)
+                .count(),
+            degraded: !has_backend || polled > 0 || self.recovering,
             advice,
             projects,
             poll_targets,

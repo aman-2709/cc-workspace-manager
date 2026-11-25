@@ -7,20 +7,21 @@ Independent, unofficial tool to discover, track and resume Claude Code projects.
 2. `ARCHITECTURE.md` (modules, data flow, schema, contracts, verified findings), `ROADMAP.md` (checklists + §18 backlog). Keep all three current. §18 items are **not** v0.1.
 
 ## Current status
-**M1, M1.1, M2, M2.1 (M2 security review fixes + real-home defects): complete (local commits, not pushed).** Waiting for the maintainer's go-ahead before M3. Implement only the approved milestone; after it, stop, report, and wait.
+**M1, M1.1, M2, M2.1, M3 (development continuity): complete (local commits, not pushed).** Waiting for the maintainer's review of M3 (and the spec changes needing approval) and the go-ahead for M4. Implement only the approved milestone; after it, stop, report, and wait.
 
-## Session handoff (2026-11-24, after M2.1)
-- **State:** M2.1 in one local commit: Git transport hardening (H1: `GIT_ALLOW_PROTOCOL=`, `GIT_NO_LAZY_FETCH=1`, per-protocol `-c …allow=never`, `partial_clone` state), test 4 promisor vectors, test 5 exec allowlist, L2 directory check, breadth-first watches with *partly watched* projects, 25 % budget, calendar-day relative time, UI/CLI fixes. Spec changes approved and applied (Appendix A rows "M2.1").
-- **Next:** M3, only after the maintainer's go-ahead. M3 needs the maintainer's pasted output of `scripts/inspect-session-schema.py` (§19). The M2 spec changes (Appendix A "M2"/"pre-M2", ARCHITECTURE O5) were never explicitly approved.
+## Session handoff (2026-11-24, after M3)
+- **State:** M3 in one local commit: `claude/` (allowlist parser, incremental checkpoints, prompt classifier + on-demand bounded reads, redaction, resume commands, `claude` CLI check), sessions as the primary discovery source (`discovery/resolve.rs`, `tracker/sessions.rs`, dev-root marker scans after the first full scan, missing = directory gone), session-directory watches, migration 4, sessions/settings/clear-index endpoints, server-side privacy mode (REST + WebSocket), detail panel, Settings page, CLI waits only while the lock is held, `_build`, DEGRADED only for real failures, per-crate license exceptions. Fixture corpus `tests/fixtures/sessions/` (synthetic, from the maintainer's §19 output of 2026-11-24).
+- **Next:** M4, only after the maintainer's go-ahead. First the maintainer validates M3 against the real home in a browser.
+- **Needs approval (ARCHITECTURE §14):** O1 (roots/exclusions/depth/budget/port/session dir need a restart), O7 (`<pasted_content>` is user text; privacy also hides status/settings paths; cwd walk-up also stops at a `CLAUDE.md`).
 - **Open items:**
-  - Test 5 ran as the **strace** variant only; the network-namespace variant (`unshare --user --map-current-user --net`) has never run (AppArmor blocks it here) — needs a CI runner.
-  - `GIT_NO_LAZY_FETCH` is honored by this host's Ubuntu git (CVE-2024-32465 backport); upstream releases before 2.45.0 without that backport ignore it (the other two blocks still apply; test 5's zero-fetch assertion would then fail by design).
+  - Test 5 ran as the **strace** variant only; the network-namespace variant has never run (AppArmor blocks it here) — needs a CI runner (M4).
+  - `GIT_NO_LAZY_FETCH` is honored by this host's Ubuntu git (CVE-2024-32465 backport); older upstream ignores it (the other two blocks still apply).
   - Watches are still added by path (L2 residual); only a swap to a non-directory is caught.
-  - New licenses ISC, CC0-1.0, BSL-1.0 (through `notify`) allowed in `deny.toml`, pending maintainer review.
-  - axum's `ws` enables `tokio-tungstenite`'s `connect` feature (unused WebSocket client code); documented in SECURITY.md.
-  - M4 additions: `sock_diag` peer lookup, daemon-level write/connect probes, manual two-user check, `cargo-about`.
-  - Seccomp `socket()` deny still M4; `cargo-deny` lives in `target/tools/` (reinstall after `cargo clean`, command in `deny.toml`).
-- **Build / test / run (synthetic environment only):** see **Commands** below.
+  - axum's `ws` enables `tokio-tungstenite`'s `connect` feature (unused); documented in SECURITY.md.
+  - M4: `ccwm doctor` (incl. the `claude` check and session dir), `sock_diag`, daemon-level write/connect probes, two-user check, `cargo-about`, seccomp `socket()` deny, tests 2/10 with `service uninstall --purge`.
+  - Cold-parse cost of the maintainer's ~500 MB of sessions is unmeasured (M4 benchmarks).
+  - `cargo-deny` lives in `target/tools/` (reinstall after `cargo clean`, command in `deny.toml`).
+- **Build / test / run (synthetic environment only):** see **Commands** below. For a verified `claude` in a manual run, put a fake `claude` script in `<synth>/home/.local/bin` and start the daemon with `PATH=<that dir>:/usr/bin:/bin` (never let it find the real `claude`).
 
 ## Hard rules
 - **Never** push, add remotes, tag, publish, run `sudo`, or run `loginctl enable-linger`. Never write outside this repo except cargo's normal `~/.cargo` cache and `/tmp` synthetic environments. Never modify `~/.claude` or monitored projects.
@@ -45,7 +46,7 @@ Tests: `cargo test` (unit + `tests/*.rs`; `tests/watch.rs` uses a fake watch bac
 
 ## Conventions
 - Rust stable, `rust-version = "1.94"` (only tested toolchain). `Cargo.lock` committed. New dependency ⇒ justify in ARCHITECTURE.md §4 first; HTTP/DNS client crates are **banned** (`deny.toml`).
-- Module boundaries: only `git/` spawns git (via `Git::command`: empty env + the six §6 vars, `BASE_ARGS`); only `watch/` touches notify; only `tracker` combines discovery, tree walk, Git and watches; only `claude/` knows Claude formats; only `db/writer.rs` writes SQLite; no `rusqlite` on Tokio workers; bounded queues; transports (HTTP, Unix socket) call `service.rs` only.
+- Module boundaries: only `git/` spawns git (via `Git::command`: empty env + the eight §6 vars, `BASE_ARGS`); `claude/cli.rs` spawns only `claude --version|--help` (via `child_command` and `git::run::run`); only `watch/` touches notify; only `tracker` combines discovery, tree walk, Git and watches; only `claude/` knows Claude formats; only `db/writer.rs` writes SQLite; no `rusqlite` on Tokio workers; bounded queues; transports (HTTP, Unix socket) call `service.rs` only.
 - **Landlock is applied in `main` before any other thread exists.** Report what is active, never what was requested.
 - Security: bind `127.0.0.1` only; every TCP connection's peer UID verified (`http/peer.rs`) before anything is read; Host + Origin checks; tokens hashed (SHA-256), constant-time compared, never logged; parameterized SQL; clients never pass paths (opaque ids); session text never logged or rendered as HTML; CLI ↔ daemon only over the Unix socket with `SO_PEERCRED` verified on both sides; a TCP `/health` is never identity.
 - Every child process of the daemon is built with `sandbox::child_command` (drops session-IPC env vars). Directories are walked by descriptor (`discovery/dirfd.rs`), never re-opened by path. Paths ccwm trusts (config file, ancestors of its dirs) go through `paths::Owner::verify_trusted`.
@@ -85,9 +86,16 @@ Ubuntu 24.04, rustc/cargo 1.94.0, git 2.43.0 (needs ≥2.41.0 for `--attr-source
 - notify 9 requests `IN_ONLYDIR` but retries **without** it on `ENOTDIR`: check `is_dir` after adding a watch.
 - strace abbreviates arrays/strings at 32 by default (`...`): use `-s 256` when parsing `execve` argv.
 - Changing a CSS grid template does not resize its container: a `ResizeObserver` on the container does not fire (test path fitting with a real width change).
+- `pkill -f '[x]yz…'` still kills the invoking shell if the plain text `xyz…` appears **elsewhere** in the same command line (e.g. a restart after the kill): stop a daemon by the pid in `instance.json` instead.
+- A browser navigation that changes only the URL fragment does not reload the page: `location.reload()` after navigating to a new `#bt=` link.
+- The daemon's `Config` includes command-line overrides (`--port`): Settings must keep the **file's** config, or a save writes the override into `config.toml`.
+- `ai-title` records carry no timestamp: "latest" title = last in file order.
+- The synthetic home lives under `/tmp`: the "temporary directory" rule for session cwds exempts cwds inside home.
+- `.session-aliases` is gitignored: fixtures that need it are created by `synth::install_sessions`.
+- Privacy is a server concern: never strip fields in `app.js`; add the field to `view::Privacy` / the status/settings strippers in `service.rs` and to the canary test in `tests/sessions_api.rs`.
 
 ## Module status
-M1: `paths config clock error api_error sandbox instance db/{mod,writer,reader,queries} discovery/{walk,dirfd,exclusions,mounts,status} auth/{tokens,bootstrap,sessions} service ipc/{protocol,server} client http/{mod,peer,middleware,extract,routes,assets,error} daemon cli synth bin/ccwm-synth` + `web/*` + `scripts/inspect-session-schema.py` + `deny.toml` + `SECURITY.md`. M2: `activity git/{mod,run,parse} watch/{mod,tree} tracker events view http/ws build.rs` + migration 3 + README/CONTRIBUTING. M2.1: no new modules. Not built yet: `claude privacy` (M3).
+M1: `paths config clock error api_error sandbox instance db/{mod,writer,reader,queries} discovery/{walk,dirfd,exclusions,mounts,status} auth/{tokens,bootstrap,sessions} service ipc/{protocol,server} client http/{mod,peer,middleware,extract,routes,assets,error} daemon cli synth bin/ccwm-synth` + `web/*` + `scripts/inspect-session-schema.py` + `deny.toml` + `SECURITY.md`. M2: `activity git/{mod,run,parse} watch/{mod,tree} tracker events view http/ws build.rs` + migration 3 + README/CONTRIBUTING. M2.1: no new modules. M3: `claude/{locate,record,parse,prompt,redact,resume,cli}` `discovery/resolve` `tracker/{mod,sessions}` (was `tracker.rs`) + migration 4 + `tests/fixtures/sessions/` + `tests/sessions_api.rs`.
 
 ## Open items
-See ARCHITECTURE.md §14 (O1–O4).
+See ARCHITECTURE.md §14 (O1, O2, O3, O4, O7).

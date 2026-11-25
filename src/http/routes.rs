@@ -4,9 +4,11 @@ use super::extract::{ApiJson, ApiQuery, Bearer, SessionAuth};
 use super::AppState;
 use crate::api_error::ApiError;
 use crate::auth::sessions::IssuedSession;
-use crate::discovery::status::DiscoverySnapshot;
-use crate::service::{Accepted, Health, ProjectsPage, ProjectsQuery, ServiceStatus, Stats};
-use crate::view::{ProjectDetail, ProjectView};
+use crate::service::{
+    Accepted, Cleared, Health, PrivacyQuery, ProjectsPage, ProjectsQuery, SessionsQuery,
+    SettingsView, Stats,
+};
+use crate::view::{ProjectDetail, ProjectView, SessionList};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -63,8 +65,42 @@ pub async fn project(
     State(s): St,
     _auth: SessionAuth,
     p: Id,
+    ApiQuery(q): ApiQuery<PrivacyQuery>,
 ) -> Result<Json<ProjectDetail>, ApiError> {
-    Ok(Json(s.service.project(&id(p)?).await?))
+    Ok(Json(s.service.project(&id(p)?, q.privacy()?).await?))
+}
+
+/// Reads the last prompt from the session file on demand (§7.3).
+pub async fn project_sessions(
+    State(s): St,
+    _auth: SessionAuth,
+    p: Id,
+    ApiQuery(q): ApiQuery<SessionsQuery>,
+) -> Result<Json<SessionList>, ApiError> {
+    Ok(Json(s.service.project_sessions(&id(p)?, &q).await?))
+}
+
+pub async fn settings(
+    State(s): St,
+    _auth: SessionAuth,
+    ApiQuery(q): ApiQuery<PrivacyQuery>,
+) -> Result<Json<SettingsView>, ApiError> {
+    Ok(Json(s.service.settings(q.privacy()?).await?))
+}
+
+pub async fn update_settings(
+    State(s): St,
+    _auth: SessionAuth,
+    ApiJson(body): ApiJson<serde_json::Value>,
+) -> Result<Json<SettingsView>, ApiError> {
+    Ok(Json(s.service.update_settings(body).await?))
+}
+
+pub async fn clear_session_index(
+    State(s): St,
+    _auth: SessionAuth,
+) -> Result<Json<Cleared>, ApiError> {
+    Ok(Json(s.service.clear_session_index().await?))
 }
 
 pub async fn ignore(
@@ -94,10 +130,18 @@ pub async fn stats(State(s): St, _auth: SessionAuth) -> Result<Json<Stats>, ApiE
     Ok(Json(s.service.stats().await?))
 }
 
-pub async fn discovery_status(State(s): St, _auth: SessionAuth) -> Json<DiscoverySnapshot> {
-    Json(s.service.discovery_status())
+pub async fn discovery_status(
+    State(s): St,
+    _auth: SessionAuth,
+    ApiQuery(q): ApiQuery<PrivacyQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(s.service.discovery_json(q.privacy()?)))
 }
 
-pub async fn service_status(State(s): St, _auth: SessionAuth) -> Json<ServiceStatus> {
-    Json(s.service.service_status())
+pub async fn service_status(
+    State(s): St,
+    _auth: SessionAuth,
+    ApiQuery(q): ApiQuery<PrivacyQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(s.service.service_json(q.privacy()?)))
 }

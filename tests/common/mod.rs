@@ -113,6 +113,10 @@ pub struct Env {
     pub clock: Arc<FakeClock>,
     pub writer: Arc<Writer>,
     pub router: Router,
+    /// The database file (its WAL and SHM sit next to it).
+    pub db: std::path::PathBuf,
+    /// The configuration file `PUT /settings` writes.
+    pub config_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -135,6 +139,11 @@ pub async fn env() -> Env {
         monitor: SharedMonitor::default(),
         notifier,
         tracker: None,
+        config: cc_workspace_manager::config::Config::default(),
+        config_path: Some(dir.path().join("config.toml")),
+        session_dir: std::path::PathBuf::from(HOME).join(".claude"),
+        roots: vec![std::path::PathBuf::from(HOME)],
+        claude: None,
     }));
     let router = http::router(service.clone());
     Env {
@@ -142,6 +151,8 @@ pub async fn env() -> Env {
         clock,
         writer,
         router,
+        config_path: dir.path().join("config.toml"),
+        db,
         _dir: dir,
     }
 }
@@ -172,6 +183,39 @@ impl Env {
 
     pub async fn send(&self, req: Request<Body>) -> Response<Body> {
         self.router.clone().oneshot(req).await.unwrap()
+    }
+
+    /// Every byte the database holds (main file, WAL, SHM), for "nothing was stored" checks.
+    pub fn db_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = self.db.as_os_str().to_owned();
+            p.push(suffix);
+            if let Ok(b) = fs::read(&p) {
+                out.extend(b);
+            }
+        }
+        out
+    }
+
+    /// A request with correct Host and Origin, a JSON body and a bearer token.
+    pub async fn send_json(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: &str,
+    ) -> Response<Body> {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", format!("127.0.0.1:{PORT}"))
+            .header("origin", format!("http://127.0.0.1:{PORT}"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        self.send(req).await
     }
 
     /// GET with correct Host (no Origin), optional bearer token.

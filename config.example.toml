@@ -21,6 +21,10 @@ scan_interval_secs = 600
 # Projects that are not found are marked missing and deleted from ccwm's index after this many
 # days (1-3650). Your files are never touched.
 missing_retention_days = 30
+# Projects are found mainly from Claude Code sessions (their recorded working directories). The
+# CLAUDE.md marker walk covers every root once (the first launch), then only the "development
+# roots": the parent folders of projects found from sessions. true walks every root at every scan.
+full_scan = false
 
 [watch]
 # Maximum inotify watches ccwm uses. 0 = automatic: 25 % of fs.inotify.max_user_watches
@@ -43,3 +47,18 @@ events_per_project = 200
 # Git older than 2.41.0 cannot be hardened against filter drivers (no --attr-source), so worktree
 # status is disabled there. true re-enables it WITHOUT that protection. Not recommended.
 allow_unhardened_status = false
+
+[sessions]
+# Claude Code's config directory, which holds the session files (projects/). Unset (the default):
+# $CLAUDE_CONFIG_DIR, else ~/.claude. Must be an absolute path.
+# dir = "/home/you/.claude"
+# Cache the last prompt (redacted) in ccwm's database for a faster detail panel. Off: prompts are
+# read from the session file only when you open a project's details, and never stored.
+store_prompt_text = false
+
+[ui]
+# Defaults for browsers that have not chosen yet: view (cards or table), theme (system, light,
+# dark) and privacy mode (hides paths, user names, remote URLs, session titles and prompts).
+default_view = "cards"
+theme = "system"
+privacy = false

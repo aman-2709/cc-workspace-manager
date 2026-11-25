@@ -77,6 +77,11 @@ impl Classifier {
         }
     }
 
+    /// The same time zone with new thresholds (`PUT /settings`).
+    pub fn with_thresholds(&self, cfg: &ActivityConfig) -> Self {
+        Self::new(self.tz.clone(), cfg)
+    }
+
     /// The system time zone (`TZ`, `/etc/localtime`), UTC if it cannot be determined.
     pub fn system(cfg: &ActivityConfig) -> Self {
         Self::new(TimeZone::try_system().unwrap_or(TimeZone::UTC), cfg)
