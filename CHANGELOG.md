@@ -3,7 +3,7 @@
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] — unreleased
+## [0.1.0] — 2026-11-25
 
 The first release. CC Workspace Manager (`ccwm`) is an independent, unofficial project, not affiliated
 with or endorsed by Anthropic. Tested on Linux x86_64 only: Ubuntu 24.04, kernel 7.0, systemd 255,
@@ -85,9 +85,10 @@ These never shipped; they are listed because the review is part of the repositor
 
 ### Known limitations
 - Linux x86_64 only, and only the environments above were tested. Not yet run: the release workflow, a
-  fresh-account install from the archive, and the two-user check. The real `claude` binary
-  has not been run under the seccomp filter (the tests use a stand-in): if its `--version` needs a
-  socket, `ccwm doctor` reports the check as failed.
+  fresh-account install from the archive, and the two-user check. The tests use a stand-in for
+  `claude`; under the seccomp filter the real binary was checked by hand with Claude Code 2.1.332 only
+  (`ccwm doctor` reports its check ok). If another version needs a socket for `--version`, `ccwm doctor`
+  reports the check as failed.
 - The ignore-file limits apply per project, not across projects. The directory trust check does not read
   POSIX ACLs. State that another local user's process leaves in the browser for the dashboard's origin
   while ccwm is not running persists until you clear that site data (see SECURITY.md).

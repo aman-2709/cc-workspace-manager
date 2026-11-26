@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **M4 (release readiness) complete locally — waiting for the maintainer's review, the "M4, needs approval" spec changes and the owner actions (push/CI, fresh-account install, two-user check, release).** The "Claude running" indicator is v0.2 (ARCHITECTURE §14).
+Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); next is v0.1.1 (below; not started).** The session activity indicator is the v0.2 headline (ARCHITECTURE §14).
 
 ---
 
@@ -178,7 +178,8 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
 - [ ] Manual two-user check (owner; procedure in docs/two-user-verification.md)
 - [ ] History/secret audit sign-off, repository recreation, naming-conflict check (O3), tag + release (owner;
   docs/release-checklist.md)
-- [ ] Spec changes "M4, needs approval" (REQUIREMENTS.md Appendix A)
+- [x] Spec changes "M4, needs approval" (REQUIREMENTS.md Appendix A): all approved by the maintainer on 2026-11-26,
+  the seccomp and probe rows as amended by the fix pass
 
 ### v0.1.0 fix pass (pre-release security review; local commit, not pushed)
 
@@ -202,7 +203,10 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
 - [ ] Not done: I3 (WebSocket send timeout / `biased` select), I7 (`wal_checkpoint` result), I8 (session-file cap),
   the stricter `PUT /settings` checks of I6, the review's remaining test-coverage gaps (4–8), a limit on ignore
   rules across projects, `MemoryMax=` in the unit
-- [ ] Maintainer: review the limits and choices listed in ARCHITECTURE.md §14 ("chosen during the pass")
+- [x] Maintainer's review of the choices made during the pass: approved on 2026-11-26 — the 5,000-rule ignore
+  limit, `notes_hidden`, `408` for a late body, exit status 0 on a closed pipe (ARCHITECTURE.md §14). Also verified
+  by the maintainer on the real home: the real `claude` (2.1.332) passes its check under the `socket`/`socketpair`
+  denial
 - ~~Live reconfiguration of roots/exclusions/budget~~ — dropped (O1 approved as permanent)
 
 ---

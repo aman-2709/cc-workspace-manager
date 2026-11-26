@@ -924,9 +924,17 @@ report `unverified`; test 5 keeps strace only (one of the two options the mainta
 pass, for review: the per-project limits (1 MiB, 5,000 rules), `notes_hidden` in privacy mode, `408` for a late
 body, exit status 0 on a closed output pipe, `Clear-Site-Data` not sent, ACLs documented rather than checked.
 
+Decided 2026-11-26 (maintainer): **O8 approved** — every REQUIREMENTS.md Appendix A row that was marked "M4, needs
+approval", the seccomp row as amended by the fix pass (the `sock_diag` socket is opened before the filter, no netlink
+exception) and the probe row as amended (an inconclusive probe reports `unverified`). Approved from the choices made
+during the fix pass: the 5,000-rule ignore limit, `notes_hidden` in privacy mode, `408` for a late request body, and
+exit status 0 on a closed output pipe. The two other choices listed above (`Clear-Site-Data` not sent, POSIX ACLs
+documented rather than checked) were not part of this approval. **Verified by the maintainer on the real home:** with
+the `socket`/`socketpair` denial active, `ccwm doctor` reports the `claude` check ok (Claude Code 2.1.332, `--resume`
+supported, checked by the daemon in its sandbox): the real binary's `--version` and `--help` succeed under the filter.
+**v0.1.0 is released** (tag `v0.1.0` at `975bf10`).
+
 Open:
-- **O8 (M4, needs approval):** the M4 spec changes listed in REQUIREMENTS.md Appendix A ("M4, needs approval"); two
-  of them are superseded by the fix pass (the netlink exception, "inconclusive withdraws nothing").
 - **O2:** a `claude` binary outside the sandbox read set cannot be executed: reported as `failed` (the usual
   `~/.local/bin/claude` → `~/.local/share/claude/…` install is inside home, a root).
 - **O3 (M4):** crate/GitHub/distro naming-conflict check needs outbound requests — needs the maintainer's OK.
