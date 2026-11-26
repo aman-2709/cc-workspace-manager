@@ -400,7 +400,7 @@ Required to pass before each milestone is complete: `cargo fmt --check`, `cargo 
 - Local usage statistics (local only, no telemetry)
 - ARM64 (aarch64-musl) release binaries on native runners
 - Additional AI coding assistants, with the provider abstraction introduced then
-- "Claude running" indicator via opt-in Claude Code `SessionStart`/`SessionEnd` hooks that report to `ccwm` over the Unix socket (never inferred from file or session activity; ccwm never edits `~/.claude`); see ARCHITECTURE §14
+- **Session activity indicator (the v0.2 headline; extends the deferred "Claude running" indicator):** opt-in Claude Code hooks — `SessionStart`/`SessionEnd` and `UserPromptSubmit`/`Stop` — report to `ccwm` over the Unix socket (`session_id`, `cwd`, `pid`; the event names and input fields must be verified against the installed Claude Code version first). States: a dim, steady dot = a session is open and waiting for input; a bright, gently pulsing dot = Claude is working on a turn; no dot = no open session. Liveness comes from `/proc/<pid>/status`; the state is never inferred from file or session activity (§5.3); a text label is always shown with the dot; the pulse is off under `prefers-reduced-motion`; filters "Waiting for me" and "Working". ccwm documents the hook configuration and never edits `~/.claude`. See ARCHITECTURE §14
 - macOS and Windows support
 
 ## 19. Development-time privacy (applies to the coding agent)

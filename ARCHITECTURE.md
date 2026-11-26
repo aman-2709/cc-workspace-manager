@@ -887,6 +887,32 @@ documents the hook configuration for the user to add; it never edits `~/.claude`
 verified against the installed Claude Code version (per §19: from documentation or the maintainer, not by reading
 real session data) before building it.
 
+**Session activity indicator — planned as the v0.2 headline (maintainer, 2026-11-25; nothing built).** It extends
+the design above from "running" to what the session is doing. Hooks, all opt-in and added by the user:
+`SessionStart`/`SessionEnd` (a session is open) and `UserPromptSubmit`/`Stop` (a turn starts and ends), each
+calling the `ccwm` subcommand with `session_id`, `cwd` and `pid` over the Unix socket. States shown on cards and
+table rows:
+
+| State | Shown as | From |
+|---|---|---|
+| a session is open and waiting for input | a dim, steady dot | `SessionStart`, or `Stop` after a turn |
+| Claude is working on a turn | a bright, gently pulsing dot | `UserPromptSubmit` until `Stop` |
+| no open session | no dot | `SessionEnd`, or the process is gone |
+
+Rules: liveness comes from `/proc/<pid>/status` (an entry whose process is gone is dropped); the state is never
+inferred from file or session activity (REQUIREMENTS.md §5.3); the dot always comes with a text label, so the
+state does not depend on colour or motion; the pulse is off under `prefers-reduced-motion`; two filters, "Waiting
+for me" and "Working". **Before building:** verify the four event names and the fields of their input against the
+installed Claude Code version (documentation or the maintainer, §19), in particular where the `pid` comes from.
+**Proposed answers to three open questions (maintainer, 2026-11-25; still to be confirmed in v0.2):**
+
+- *Several open sessions in one project:* the project shows "working" if any of them is working, otherwise
+  "waiting"; the tooltip gives the number of open sessions.
+- *After a restart of the daemon:* the sessions it had recorded as open are restored as open if their `pid` is
+  still alive. Whether such a session is waiting or working is unknown until its next hook fires, and it is
+  never guessed (how an open session of unknown state is shown is part of the v0.2 design).
+- *Privacy mode:* the indicator stays visible; it carries no paths and no text from sessions.
+
 Decided 2026-11-24 (before M4): **O1** approved and permanent (roots, exclusions, depth, same-file-system, budget,
 port and session directory need a restart; Landlock cannot widen a running process's rules, so no in-process
 restart is planned); **O7** approved (`<pasted_content>` is user text; privacy also hides the status/settings paths;

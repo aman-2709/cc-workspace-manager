@@ -207,6 +207,15 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
 
 ---
 
+## v0.1.1 — planned (not started; needs a go-ahead)
+
+- [ ] Session titles on cards and table rows are rendered so that they cannot be mistaken for a status: quoted
+  and in italics, with a tooltip that says it is the session's title. Seen in real use: an AI title worded like
+  a status message (it said that a session was being resumed) read as the state of the project. UI only;
+  REQUIREMENTS.md §9 gets the wording when it is built
+
+---
+
 ## Backlog — v0.2 and later (REQUIREMENTS.md §18; **do not implement in v0.1**)
 
 - [ ] Full session history, expandable conversations, resume for older sessions
@@ -224,4 +233,4 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
 - [ ] macOS and Windows support
 - [ ] Git `core.excludesFile` (the user's global ignore file) in the activity rules (maintainer request, post-v0.1)
 - [ ] Display of `pr-link` records (the session's pull request) in the detail panel (maintainer request, post-v0.1)
-- [ ] "Claude running" indicator (v0.2; deferred from M3.1): opt-in Claude Code `SessionStart`/`SessionEnd` hooks call a `ccwm` subcommand that reports `session_id`, `cwd`, `pid` over the Unix socket; liveness from `/proc/<pid>/status` + `cmdline`; never inferred from activity; ccwm documents the hook config and never edits `~/.claude`; verify the hook input fields against the installed Claude Code version first (ARCHITECTURE §14)
+- [ ] **Session activity indicator — the v0.2 headline** (extends the "Claude running" indicator deferred from M3.1; maintainer, 2026-11-25): opt-in Claude Code hooks `SessionStart`/`SessionEnd` and `UserPromptSubmit`/`Stop` call a `ccwm` subcommand that reports `session_id`, `cwd`, `pid` over the Unix socket. States: dim steady dot = session open, waiting for input; bright, gently pulsing dot = Claude working on a turn; no dot = no open session. Liveness from `/proc/<pid>/status` (+ `cmdline`); never inferred from file or session activity; a text label is always present; the pulse is off under `prefers-reduced-motion`; filters "Waiting for me" and "Working". ccwm documents the hook config and never edits `~/.claude`. First: verify the event names and input fields against the installed Claude Code version (ARCHITECTURE §14)
