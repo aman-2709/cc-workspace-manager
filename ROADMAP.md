@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); v0.1.1 is built and committed locally (below; two commits), not pushed or tagged. Its spec changes and choices are approved (2026-11-26) except one rule added with the allocation by recency.** The session activity indicator is the v0.2 headline (ARCHITECTURE §14).
+Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); v0.1.1 is built and committed locally (below; three commits), not pushed or tagged. Its spec changes and choices are approved (2026-11-26).** The session activity indicator is the v0.2 headline (ARCHITECTURE §14).
 
 ---
 
@@ -214,7 +214,7 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
 ## v0.1.1 — maintenance release (built 2026-11-26; local commit, not pushed, not tagged)
 
 No new features. What was run is in ARCHITECTURE.md §13i; the spec changes are the last rows of REQUIREMENTS.md
-Appendix A (approved on 2026-11-26, one new row "v0.1.1, needs approval").
+Appendix A (all approved on 2026-11-26).
 
 - [x] Session titles on cards and table rows are rendered so that they cannot be mistaken for a status: quoted
   and in italics, with a tooltip (and screen-reader text) that says "Session title". Seen in real use: an AI
@@ -229,7 +229,7 @@ Appendix A (approved on 2026-11-26, one new row "v0.1.1, needs approval").
   not of the order of their walks; re-established after walks and at every scan, giving up before taking
   (`tree::RuleStore`, `Tracker::rebalance_rules`)
 - [x] **Compiled ignore rules are cached** (maintainer decision, 2026-11-26): per ignore file, reused while its
-  device, inode, size and modification time are unchanged, dropped with the project. Repeated scans of the
+  device, inode, size, modification time and change time are unchanged, dropped with the project. Repeated scans of the
   worst-case fixture keep memory flat in both builds (a test in `tests/process.rs`, run for the glibc and the
   musl target; the 20,000-rule measurement in docs/benchmarks.md). Before: a glibc build reached 1.66 GiB
 - [x] Review items **I3** (WebSocket: revocation first, 5 s send timeout), **I7** (the WAL truncation's result
@@ -245,9 +245,13 @@ Appendix A (approved on 2026-11-26, one new row "v0.1.1, needs approval").
 - [x] Maintainer's decisions (2026-11-26): every "v0.1.1, needs approval" row approved; `MemorySwapMax=0`
   approved; `MemoryMax=2G` approved for now; the 20,000-rule limit approved, to be allocated by recency; the
   memory finding to be fixed in v0.1.1 with a rule cache; no README changes
-- [ ] Maintainer: approve or change the one rule added with the allocation by recency — a walk of a project
-  that lacks ignore rules because of the limit across projects does not move a known activity time
-  (REQUIREMENTS.md §5.2, Appendix A; why: ARCHITECTURE.md §7a "Ignore rules")
+- [x] The rule added with the allocation by recency — a scan of a project that lacks ignore rules because of
+  the limit across projects does not move a known activity time — approved by the maintainer (2026-11-26).
+  Scan-derived times only: watcher-observed changes in such a project update its activity as always
+  (confirmed, tested in `tests/tracker.rs`, documented in REQUIREMENTS.md §5.2)
+- [x] `st_ctime` (seconds and nanoseconds) in the rule-cache key (maintainer decision, 2026-11-26): a rewrite in
+  place to the same size with the modification time restored is now seen; the known-limit note and its test
+  updated
 - [ ] Maintainer: push, CI, tag, the release workflow (docs/release-checklist.md)
 
 After v0.1.1:

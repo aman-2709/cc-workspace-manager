@@ -128,7 +128,7 @@ projects and the files of two are skipped. Two builds: `target/release` (glibc) 
 | peak RSS in that run | 344.7 MiB | 384.3 MiB |
 
 That is 17–20 KiB per rule kept, and it stays there: the compiled rules of an ignore file are kept and
-used again until the file changes (its device, inode, size or modification time), so a scan of projects
+used again until the file changes (its device, inode, size, modification time or change time), so a scan of projects
 whose ignore files are as they were compiles nothing. Polled projects are the case that shows it: they
 are walked again at every scan.
 

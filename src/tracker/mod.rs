@@ -715,6 +715,10 @@ impl Tracker {
     /// that decides who gets the rules (a project that just gave its rules up would take them
     /// back from the next one, and so on). A project of which nothing is known yet does get
     /// the time: it needs a place in that order.
+    ///
+    /// This is about scan-derived times only. What the watcher observes in such a project
+    /// ([`Signal::Activity`]) does not come through here: it is recorded as in any other
+    /// project, and is what brings the project's rules back.
     async fn record_inferred(&self, tracked: &[Tracked], id: &str, newest: Option<&(i64, String)>) {
         let Some((at, path)) = newest else {
             return;

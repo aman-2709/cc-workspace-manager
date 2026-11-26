@@ -652,16 +652,32 @@ async fn the_limit_on_ignore_rules_goes_to_the_most_recently_active_projects() {
         "{advice}"
     );
     // The rules apply where they are kept and not where they were given up: a new file that
-    // they name is activity only in the project without rules.
+    // they name is activity only in the project without rules. There it is activity like any
+    // other: what the watcher observes in a project without its rules is recorded as always
+    // (only scans leave such a project's time alone, see below).
+    let oldest_id = s.by_path(oldest).await.unwrap().id;
+    let before = s.row(&oldest_id).await;
+    assert_eq!(
+        before.activity_kind.as_deref(),
+        Some("inferred"),
+        "{before:?}"
+    );
+    assert!(before.activity_at.unwrap() <= now - 2_990, "{before:?}");
     for r in &roots {
         fs::write(r.join("one.tmp"), "x").unwrap();
     }
-    let oldest_id = s.by_path(oldest).await.unwrap().id;
     s.wait("activity in the project without rules", 15, || async {
         let row = s.row(&oldest_id).await;
         row.activity_path.as_deref() == Some("one.tmp")
     })
     .await;
+    let after = s.row(&oldest_id).await;
+    assert_eq!(
+        after.activity_kind.as_deref(),
+        Some("observed"),
+        "{after:?}"
+    );
+    assert!(after.activity_at > before.activity_at, "{after:?}");
     for r in [middle, newest] {
         let row = s.row(&s.by_path(r).await.unwrap().id).await;
         assert_ne!(row.activity_path.as_deref(), Some("one.tmp"), "{r:?}");
@@ -697,6 +713,52 @@ async fn the_limit_on_ignore_rules_goes_to_the_most_recently_active_projects() {
     s.wait_scans(1).await;
     s.wait("the same shares after a restart", 15, || async {
         kept(&s) == [4, 0, 4]
+    })
+    .await;
+
+    // `b-middle` is now the project without its rules, with a known time. Both halves of the
+    // rule, in that one state:
+    // - a scan does not move its time. The scan of this start walked it without its rules and
+    //   found `one.tmp` (written above, when its rules still hid it) as its newest file, far
+    //   newer than what is recorded: the recorded time and file are as they were.
+    let middle_id = s.by_path(middle).await.unwrap().id;
+    s.wait_watched(&middle_id).await;
+    let frozen = s.row(&middle_id).await;
+    assert_ne!(
+        frozen.activity_path.as_deref(),
+        Some("one.tmp"),
+        "{frozen:?}"
+    );
+    assert!(frozen.activity_at.unwrap() <= now - 1_990, "{frozen:?}");
+    // - a change the watcher observes does: it is recorded as in any other project.
+    fs::write(
+        middle.join("notes.txt"),
+        "written while the project has no rules",
+    )
+    .unwrap();
+    s.wait(
+        "the observed change in the project without rules",
+        15,
+        || async {
+            let row = s.row(&middle_id).await;
+            row.activity_path.as_deref() == Some("notes.txt")
+        },
+    )
+    .await;
+    let observed = s.row(&middle_id).await;
+    assert_eq!(
+        observed.activity_kind.as_deref(),
+        Some("observed"),
+        "{observed:?}"
+    );
+    assert!(observed.activity_at.unwrap() >= now, "{observed:?}");
+    // And that real activity is what brings its rules back, at the next scan: `c-newest`, by
+    // now the least recently active project, is the one without.
+    let scans = s.status.snapshot().scans_finished;
+    s.tracker.request_refresh();
+    s.wait_scans(scans + 1).await;
+    s.wait("the rules to come back with real activity", 15, || async {
+        kept(&s) == [4, 4, 0]
     })
     .await;
     s.stop().await;

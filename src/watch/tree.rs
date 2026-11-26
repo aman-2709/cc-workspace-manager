@@ -42,9 +42,16 @@ pub const MAX_GITIGNORE_PATTERNS: usize = 5_000;
 pub const MAX_GITIGNORE_PATTERNS_TOTAL: usize = 20_000;
 
 /// What identifies the content of an ignore file without reading it: a file whose device, inode,
-/// size and modification time are unchanged is taken to hold the same rules, and its compiled
-/// rules are reused. (A rewrite that changes none of the four is not seen until the file changes
-/// again or the daemon restarts; session files are followed by the same four values.)
+/// size, modification time and change time are unchanged is taken to hold the same rules, and
+/// its compiled rules are reused.
+///
+/// The change time is the one a rewrite cannot avoid: the kernel sets it at every write and
+/// whenever the modification time is set, and nothing can set it back. With it, a file rewritten
+/// in place to the same size with its modification time restored is seen as changed. What is
+/// left unseen: a rewrite to the same size within the file system's timestamp resolution of the
+/// file's previous change (milliseconds on ext4 and tmpfs), until the file changes again or the
+/// daemon restarts. A change of the change time alone (a `chmod`, a new hard link) compiles the
+/// file again, which is harmless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileId {
     dev: u64,
@@ -52,6 +59,8 @@ struct FileId {
     size: u64,
     /// Seconds and nanoseconds.
     mtime: (i64, i64),
+    /// Seconds and nanoseconds.
+    ctime: (i64, i64),
 }
 
 impl FileId {
@@ -63,6 +72,7 @@ impl FileId {
             ino: md.ino(),
             size: md.size(),
             mtime: (md.mtime(), md.mtime_nsec()),
+            ctime: (md.ctime(), md.ctime_nsec()),
         })
     }
 }
@@ -301,8 +311,8 @@ impl GitIgnore {
 ///   last activity, their path as the tie-break, the rules they want), not of when they were
 ///   walked.
 /// - **Reuse.** It keeps each project's rules of its last full walk, and hands them to the next
-///   one, which takes over the compiled rules of every ignore file that did not change
-///   ([`FileId`]). Without it every scan of a project without watches compiled all its rules
+///   one, which takes over the compiled rules of every ignore file that did not change (same
+///   device, inode, size, modification time and change time). Without it every scan of a project without watches compiled all its rules
 ///   again (memory several times the kept size in a glibc build). A project that is no longer
 ///   monitored is dropped ([`retain`](Self::retain)), and with it its rules.
 #[derive(Debug)]
@@ -1298,8 +1308,9 @@ mod tests {
     }
 
     /// The rule cache: a walk that is given the project's previous rules takes over the
-    /// compiled rules of every ignore file whose device, inode, size and modification time are
-    /// unchanged, and compiles only what changed. Files that are gone lose their rules.
+    /// compiled rules of every ignore file whose device, inode, size, modification time and
+    /// change time are unchanged, and compiles only what changed. Files that are gone lose their
+    /// rules.
     #[test]
     fn a_later_walk_reuses_the_rules_of_unchanged_ignore_files_and_compiles_only_what_changed() {
         let f = fx();
@@ -1370,43 +1381,75 @@ mod tests {
         assert_eq!(third.ignore.layers.len(), 5);
     }
 
-    /// What "unchanged" means: the same device, inode, size **and** modification time. Any one
-    /// of them changing compiles the file again; a rewrite that changes none of them is not
-    /// seen (the documented limit of the cache).
+    /// What "unchanged" means: the same device, inode, size, modification time **and** change
+    /// time. The first case is the one the change time is there for: a file rewritten in place
+    /// to the same size, with its modification time put back, differs in nothing else, and is
+    /// compiled again. (A rewrite inside the file system's timestamp resolution of the previous
+    /// change would still be missed: the test waits that resolution out.)
     #[test]
-    fn an_ignore_file_counts_as_changed_when_its_size_time_or_inode_changes() {
+    fn an_ignore_file_counts_as_changed_when_its_size_times_or_inode_change() {
         let f = fx();
         let r = &f.root;
         fs::create_dir(r.join(".git")).unwrap();
         let file = r.join(".gitignore");
         fs::write(&file, "aaa.tmp\n").unwrap();
         set_mtime(&file, 1_000);
+        let id = |file: &Path| FileId::of(&fs::File::open(file).unwrap()).unwrap();
         let none = HashSet::new();
         let mut o = opts(&f.ex, &none, true);
         let first = walk(r, &o).unwrap();
         o.reuse = Some(&first.ignore);
         let ignores = |t: &Tree, name: &str| t.ignore.is_ignored(&r.join(name), false);
+        // Control: nothing changed, the rules are reused.
+        assert!(same_layer(
+            &first.ignore,
+            &walk(r, &o).unwrap().ignore,
+            r,
+            false
+        ));
 
-        // Same size, same time, same inode (rewritten in place): taken for unchanged.
-        fs::write(&file, "bbb.tmp\n").unwrap();
-        set_mtime(&file, 1_000);
-        let t = walk(r, &o).unwrap();
-        assert!(same_layer(&first.ignore, &t.ignore, r, false));
-        assert!(ignores(&t, "aaa.tmp") && !ignores(&t, "bbb.tmp"));
-        // The time alone.
-        set_mtime(&file, 2_000);
+        // Rewritten in place: same inode, same size, and the modification time put back. Only
+        // the change time tells (it moves once the file system's clock has ticked).
+        let before = id(&file);
+        let waited = std::time::Instant::now();
+        loop {
+            fs::write(&file, "bbb.tmp\n").unwrap();
+            set_mtime(&file, 1_000);
+            if id(&file).ctime != before.ctime {
+                break;
+            }
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(5),
+                "the change time never moved: no test of it on this file system"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let after = id(&file);
+        assert_eq!(
+            (after.dev, after.ino, after.size, after.mtime),
+            (before.dev, before.ino, before.size, before.mtime),
+            "control: nothing but the change time differs"
+        );
         let t = walk(r, &o).unwrap();
         assert!(!same_layer(&first.ignore, &t.ignore, r, false));
         assert!(ignores(&t, "bbb.tmp") && !ignores(&t, "aaa.tmp"));
-        // The size alone (the time put back).
+
+        // The modification time (setting it moves the change time too).
+        o.reuse = Some(&t.ignore);
+        let before = Arc::clone(&t.ignore);
+        set_mtime(&file, 2_000);
+        let t = walk(r, &o).unwrap();
+        assert!(!same_layer(&before, &t.ignore, r, false));
+        assert!(ignores(&t, "bbb.tmp"));
+        // The size.
         o.reuse = Some(&t.ignore);
         let before = Arc::clone(&t.ignore);
         fs::write(&file, "cccc.tmp\n").unwrap();
         set_mtime(&file, 2_000);
         let t = walk(r, &o).unwrap();
         assert!(!same_layer(&before, &t.ignore, r, false));
-        assert!(ignores(&t, "cccc.tmp"));
-        // The inode alone: another file of the same size and time takes its name.
+        assert!(ignores(&t, "cccc.tmp") && !ignores(&t, "bbb.tmp"));
+        // The inode: another file of the same size and modification time takes its name.
         o.reuse = Some(&t.ignore);
         let before = Arc::clone(&t.ignore);
         let other = r.join("replacement");

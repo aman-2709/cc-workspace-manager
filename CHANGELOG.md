@@ -24,9 +24,10 @@ A maintenance release: no new features. Tested on the same environment as 0.1.0 
   all, the least recently active projects are the ones without, whatever order they were found in, and
   a project that becomes active again gets its rules back at the next scan.
   A scan of a project that is without its rules for that reason does not move the project's known "last
-  change": without the rules, ignored files cannot be told from meaningful ones.
+  change": without the rules, ignored files cannot be told from meaningful ones. Changes that ccwm sees
+  live in such a project are recorded as always.
 - **Compiled ignore rules are kept and reused.** The rules of a `.gitignore` are compiled again only
-  when the file changed (its device, inode, size or modification time). Before, every scan of a project
+  when the file changed (its device, inode, size, modification time or change time). Before, every scan of a project
   without watches compiled all its rules again.
 - **The Settings page refuses more.** A discovery root that is `/` or a folder containing your home
   folder, and your home folder itself as the session directory, can no longer be saved from the browser
@@ -61,8 +62,9 @@ A maintenance release: no new features. Tested on the same environment as 0.1.0 
   rules it replaces. The unit's memory limit (2G) is far above that and will be lowered.
 - The limit across projects goes to the most recently active projects, so a tree of projects with huge
   ignore files and recent file times can take it from older projects until those are active again.
-- The rule cache trusts a file's device, inode, size and modification time: a `.gitignore` rewritten
-  without changing any of them keeps its old rules until it changes again or ccwm restarts.
+- The rule cache trusts a file's device, inode, size, modification time and change time. A `.gitignore`
+  rewritten to the same size within the file system's timestamp resolution of its previous change
+  (milliseconds on ext4) keeps its old rules until it changes again or ccwm restarts.
 - The memory limit needs the cgroup memory controller for your user manager (present on Ubuntu 24.04).
 - Not run: CI on this version, the release workflow, a fresh-account install from the archive.
 - Everything listed under 0.1.0 still applies, except "the ignore-file limits apply per project, not

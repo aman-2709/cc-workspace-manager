@@ -100,7 +100,9 @@ next scan (a project that is ignored or gone frees its share). A skipped
 file's rules do not apply, so files it would ignore count as activity; `ccwm status` says how many files were
 skipped. Ordinary projects have a few dozen rules each, so the limit across projects is far away for a few
 hundred of them. The rules of an ignore file are compiled once and used again until the file changes
-(another size or modification time, or another file under that name). The rules of a repository apply only if its `.git`
+(another size, modification time or change time, or another file under that name). While a project is
+without its rules because of the limit across projects, scans do not move its "last change" (they could
+not tell ignored files from the others); changes seen live are recorded as always. The rules of a repository apply only if its `.git`
 is yours and lies inside the project's discovery root.
 
 ## Git

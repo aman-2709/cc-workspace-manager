@@ -173,7 +173,7 @@ not apply. The limits exist because compiled rules stay in memory: a hostile rep
 chooses how many projects it holds. The limit across projects goes to the most recently active
 projects; the least recently active ones are the ones that lose their rules, whatever order the
 projects were found in. The compiled rules of a file are kept and reused until the file changes (its
-device, inode, size or modification time), so a scan compiles nothing for files that are as they were. The repository whose rules apply is searched no higher than the project's
+device, inode, size, modification time or change time), so a scan compiles nothing for files that are as they were. The repository whose rules apply is searched no higher than the project's
 discovery root, and its `.git` must be owned by you, as Git itself requires. ccwm's own directories are
 never watched, so its writes never count as activity.
 
@@ -328,8 +328,10 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
   ([docs/troubleshooting.md](docs/troubleshooting.md)). The limit needs the cgroup memory controller for
   your user manager (present on Ubuntu 24.04); **without systemd (`ccwm serve` in a terminal) there is no
   such limit**. Not measured: a pattern built to make the matcher itself use as much memory as it can;
-  the measurements used one pattern shape (`*1?b[c-d]*.x`). The cache trusts a file's device, inode, size
-  and modification time: a file rewritten without changing any of them keeps its old rules until it
+  the measurements used one pattern shape (`*1?b[c-d]*.x`). The cache trusts a file's device, inode, size,
+  modification time and change time. The change time cannot be set back, so a file rewritten in place
+  with its old size and modification time is still noticed; a rewrite to the same size within the file
+  system's timestamp resolution of the previous change (milliseconds on ext4) is not, until the file
   changes again or the daemon restarts (that affects what counts as activity, nothing else).
 - **POSIX ACLs** (v0.1.0 review L4). The check that refuses to start when an ancestor of ccwm's
   directories, or the config file, "could be modified by another user" reads the owner and the mode bits.

@@ -369,7 +369,9 @@ in both orders), then `sort_key`, then `id`; the cursor carries `(k1, sort_key, 
 
 **Ignore rules (v0.1.1): `tree::RuleStore`**, one instance shared by the tracker's walks and the monitor.
 `GitIgnore` is a list of `Arc<Layer>`, one per ignore file (its directory, its compiled rules, its size, its
-rule lines, and the file's `FileId` = device, inode, size, modification time).
+rule lines, and the file's `FileId` = device, inode, size, modification time and change time, the last two
+with nanoseconds; the change time cannot be set back, so an in-place rewrite to the same size with the
+modification time restored still differs).
 
 - *Limits per file and per project* are decided in `GitIgnore::load`, from the file's size and rule lines
   (counted before compiling). They count the files a walk left out for its allowance too
@@ -399,7 +401,11 @@ rule lines, and the file's `FileId` = device, inode, size, modification time).
   files from meaningful ones; `Tracker::record_inferred` takes its newest file only for a project that has no
   activity yet. Without that rule a project that gave its rules up became "recent" through the files its
   rules used to hide and took the rules back from the next project (seen in `tests/tracker.rs`: the shares
-  changed across a restart).
+  changed across a restart). **Only scan-derived times are held back.** What the watcher observes in such a
+  project (`Signal::Activity` → `Writer::record_activity`, kind `observed`) does not pass through
+  `record_inferred` and is recorded as in any other project; that activity moves the project up and its
+  rules come back at the next scan (tested in the same tracker test, in one state: the scan leaves the time,
+  the watcher event moves it).
 
 ## 7b. M3 sessions and session-based discovery
 
@@ -905,8 +911,9 @@ rustc 1.94.0, systemd 255).
   restart finds the same shares. `tests/process.rs` with the real daemon and the real limits: six projects
   of 5,000 rules, two files skipped and reported, every project listed.
 - **Rule cache:** unit tests: a later walk shares the layer (`Arc::ptr_eq`) of every unchanged file and
-  compiles only a changed, new or replaced one; size, time and inode each count as a change, a rewrite that
-  changes none of them is not seen (pinned as the documented limit); hard links have rules per directory;
+  compiles only a changed, new or replaced one; a file rewritten in place to the same size with its
+  modification time put back is compiled again (nothing but the change time differs: asserted; the test
+  fails without the change time in the key), and so is one whose modification time, size or inode changes; hard links have rules per directory;
   reused rules meet the same limits as fresh ones for six allowances. `tests/process.rs`
   (`repeated_scans_…`): four polled projects of 400 rules that need a regular expression, twelve scans,
   resident memory may grow by 4 MiB at most; **passes for the glibc target and for
@@ -1065,14 +1072,16 @@ of the worst-case fixture in both builds; no README changes.
 (directory, and whether it is `info/exclude`): compiled rules are relative to their directory, and hard links
 give several locations one inode. The shares by recency: each project all it wants while it fits, the first
 that does not fit completely gets the rest, the ones after it nothing (file granularity inside that one
-project only). Rules follow a change of activity at the next scan, not at once. **One rule needs approval**
-(REQUIREMENTS.md §5.2, Appendix A): a walk of a project that lacks rules because of the limit across projects
-does not move a known activity time. Without it the allocation fed back into its own order — a project that
-gave its rules up looked active through the files its rules used to hide and took the rules back from the
-next one; the tracker test showed different shares after a restart. Consequence to know: a tree of projects
+project only). Rules follow a change of activity at the next scan, not at once. **One rule came with it** (REQUIREMENTS.md §5.2, Appendix A; approved by the maintainer on 2026-11-26): a walk
+of a project that lacks rules because of the limit across projects does not move a known activity time. Without
+it the allocation fed back into its own order — a project that gave its rules up looked active through the files
+its rules used to hide and took the rules back from the next one; the tracker test showed different shares after
+a restart. It applies to scan-derived times only; watcher-observed changes are recorded as always (confirmed and
+tested at the maintainer's request). Consequence to know: a tree of projects
 with huge ignore files and recent file times outranks older projects for the limit across projects (as it does
-for deeper watches). Not done: keying the cache by content; a file rewritten with the same size, time and inode
-keeps its old rules until it changes again or the daemon restarts (session files are followed the same way).
+for deeper watches). **`st_ctime` in the cache key (maintainer decision,
+2026-11-26):** seconds and nanoseconds, next to the modification time. Left over: a rewrite to the same size
+within the file system's timestamp resolution of the previous change; the cache is not keyed by content.
 
 Open:
 - **O2:** a `claude` binary outside the sandbox read set cannot be executed: reported as `failed` (the usual
