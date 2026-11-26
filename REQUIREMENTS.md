@@ -12,6 +12,7 @@ Status: **Approved for implementation** · Single source of truth · Supersedes 
 
 - This file is the only specification. If code, other docs or earlier prompts disagree with it, this file wins.
 - Sections marked **v0.1** are in scope. Section 18 lists roadmap items, which must **not** be implemented in v0.1.
+- Section 21 is the v0.2 design of the session activity indicator (phase 1: verification and design, 2026-11-26), **approved by the maintainer on 2026-11-26** with the decisions of §21.12. It is not built: phase 2 starts on the maintainer's go-ahead. Rules marked *(choice, for review)* there are still for review.
 - If a requirement turns out to be infeasible, contradictory or unsafe once you look at the real environment (for example, the actual Claude Code session schema), **stop and report it with a concrete alternative**. Do not silently change or drop it.
 - Never claim a feature works, a platform is supported or a benchmark was achieved unless it was actually tested or measured.
 
@@ -401,7 +402,7 @@ Required to pass before each milestone is complete: `cargo fmt --check`, `cargo 
 - Local usage statistics (local only, no telemetry)
 - ARM64 (aarch64-musl) release binaries on native runners
 - Additional AI coding assistants, with the provider abstraction introduced then
-- **Session activity indicator (the v0.2 headline; extends the deferred "Claude running" indicator):** opt-in Claude Code hooks — `SessionStart`/`SessionEnd` and `UserPromptSubmit`/`Stop` — report to `ccwm` over the Unix socket (`session_id`, `cwd`, `pid`; the event names and input fields must be verified against the installed Claude Code version first). States: a dim, steady dot = a session is open and waiting for input; a bright, gently pulsing dot = Claude is working on a turn; no dot = no open session. Liveness comes from `/proc/<pid>/status`; the state is never inferred from file or session activity (§5.3); a text label is always shown with the dot; the pulse is off under `prefers-reduced-motion`; filters "Waiting for me" and "Working". ccwm documents the hook configuration and never edits `~/.claude`. See ARCHITECTURE §14
+- **Session activity indicator (the v0.2 headline; extends the deferred "Claude running" indicator):** opt-in Claude Code hooks — `SessionStart`/`SessionEnd` and `UserPromptSubmit`/`Stop` — report to `ccwm` over the Unix socket (`session_id`, `cwd`, `pid`; the event names and input fields must be verified against the installed Claude Code version first). States: a dim, steady dot = a session is open and waiting for input; a bright, gently pulsing dot = Claude is working on a turn; no dot = no open session. Liveness comes from `/proc/<pid>/status`; the state is never inferred from file or session activity (§5.3); a text label is always shown with the dot; the pulse is off under `prefers-reduced-motion`; filters "Waiting for me" and "Working". ccwm documents the hook configuration and never edits `~/.claude`. See ARCHITECTURE §14. **Phase 1 (verification and design, 2026-11-26): §21**, approved 2026-11-26, not built
 - macOS and Windows support
 
 ## 19. Development-time privacy (applies to the coding agent)
@@ -436,6 +437,143 @@ Built from the maintainer's pasted schema output (§19), using synthetic fixture
 **M4 — Release readiness**
 `start/stop/restart/status/scan/doctor/service/auth` commands, the systemd unit and scripts, the port-collision exit code, the security and performance test pass with measured results, the full documentation set, CI and the release workflow, and the musl build.
 *Accept:* a fresh user account can install from the release archive, the service starts at login (and at boot when lingering is enabled), the projects appear, all tests including the full security acceptance suite pass, CI (including gitleaks and the cargo-deny bans) is green, and the benchmarks are documented.
+
+## 21. v0.2 — Session activity indicator (design approved; not built)
+
+**Status:** phase 1 (verification and design) done on 2026-11-26. **The design is approved by the maintainer (2026-11-26)** with the decisions recorded in §21.12 (O9–O17); rules marked *(choice, for review)* were made while recording those decisions. **Nothing is built**: phase 2 starts on the maintainer's go-ahead. The facts it rests on were verified against the installed Claude Code **2.1.332** (ARCHITECTURE.md §11a; what was run, §13k): its hook documentation, the hook input schemas and code embedded in its binary, and one live `claude -p` run in a throwaway project under `/tmp` (approved by the maintainer). It extends §18's bullet and ARCHITECTURE.md §14.
+
+### 21.1 Goal, principles, non-goals
+- Show per project whether a Claude Code session is open there and whether Claude is **working** on a turn, **waiting** for the user's next prompt, or **needs approval** of a tool use. The only source is Claude Code hooks that **the user adds** (opt-in): without them nothing changes.
+- The state is **never inferred** from file, Git or session-file activity (§5.3), and hook events are **never activity**: they move no activity time, no sort order (§5.4) and no watch or ignore-rule allocation (§5.1, §5.2).
+- Unknown stays unknown: no state is derived from a timeout or guessed after a restart.
+- Non-goals: no reading of transcripts for the indicator, no notifications or sounds, no control of Claude Code (ccwm never answers a prompt or a permission dialog, sends input or signals a process), no reading or editing of `~/.claude` settings or any other settings file.
+
+### 21.2 Hook events (verified, Claude Code 2.1.332)
+
+| Hook (matcher) | Fires when | Effect on the session |
+|---|---|---|
+| `SessionStart` | a session starts; `source` = `startup`, `resume`, `clear`, `fork` or `compact` | open, **waiting**; `compact` changes nothing (auto-compaction runs inside a turn) |
+| `UserPromptSubmit` | a prompt is submitted (typed, `-p`/SDK, `/loop` and scheduled wake-ups, system turns) | **working** |
+| `Notification` (matcher `permission_prompt`) | a permission dialog (a tool use, or a sandboxed command's network request) has waited about 6 s; in a terminal each keystroke defers it, and a dialog answered sooner sends nothing | **needs approval** |
+| `PostToolUse`, `PostToolUseFailure` | a tool finished, or failed after it had started | from needs approval or unknown: **working**; otherwise nothing |
+| `PostToolBatch` | every tool call of a batch has resolved, before the next model request | as `PostToolUse` |
+| `Stop` | Claude finished responding — not on a user interrupt, not on an API error | **waiting** |
+| `StopFailure` | the turn ended with an API error (instead of `Stop`) | **waiting** |
+| `Notification` (matcher `idle_prompt`) | about 60 s after Claude finished, with no input since (interactive sessions only) | **waiting** |
+| `SessionEnd` | the session ends; `reason` = `clear`, `resume`, `logout`, `prompt_input_exit` or `other` | **closed** |
+
+- `StopFailure` and `idle_prompt` keep a turn that ended without `Stop` (an API error, an interrupt) from showing "working" for good.
+- **Needs approval (O12; the matcher verified in the documentation and the binary):** the `Notification` matcher is the `notification_type`, and `permission_prompt` is one of its values. **No hook event marks the end of a permission wait** (the documentation names none). After an approval the tool runs, and the state leaves "needs approval" at the session's next tool event: `PostToolUse` or `PostToolUseFailure` when the approved tool finishes, `PostToolBatch` when its batch resolves. It also leaves at the next `UserPromptSubmit`, `Stop`, `StopFailure`, `idle_prompt` or `SessionEnd`. Consequences, documented: **an approved tool that runs long (a build, a test run) shows "needs approval" until it finishes**; a denial fires no tool event (`PermissionDenied` is for auto-mode denials only), so the state stays until the next prompt or the end of the turn.
+- Tool events from inside a subagent (`agent_id` present) are ignored *(choice, for review)*: otherwise a sibling subagent's tools would end another one's "needs approval".
+
+### 21.3 `ccwm hook <Event>` (the hook command)
+- Run by Claude Code through the guarded command of §21.9 (`… && '<ccwm>' hook <Event>; exit 0`), with the event's name as its argument; reads the event JSON on stdin. It is **dispatched before argument parsing**, and anything after the event name is ignored. The argument must equal the input's `hook_event_name`; otherwise nothing is sent.
+- **Always exits 0 and never writes to stdout.** Claude Code adds the stdout of a `SessionStart` or `UserPromptSubmit` hook to the model's context, and reads exit code 2 as "block the prompt" (`UserPromptSubmit`) or "keep working" (`Stop`). A failure writes one line to stderr (visible in `claude --debug hooks`), never input content. Stdin a terminal (run by hand): a one-line hint on stderr, exit 0.
+- **Hard budget:** the socket exchange — connect, send, and the daemon's one-line acknowledgement — gets **at most 100 ms**; past it the command exits 0 silently, whatever happened. The client waits for the acknowledgement inside that budget because the daemon checks the client's ancestry in `/proc` while the client still runs (§21.5): a client that left right after sending would be refused. Stdin is read up to **16 MiB**; a watchdog ends the whole command with status 0 after 1 s, so a stdin that never closes cannot hold Claude Code.
+- **Allowlist parsing:** only `hook_event_name`, `session_id`, `cwd`, `prompt_id`, `source` (SessionStart), `notification_type` (Notification) and the presence of `agent_id` are read. Every other field — the prompt text (`prompt`), the assistant's last message (`last_assistant_message`), the tool fields (`tool_name`, `tool_input`, `tool_response`, `tool_calls`, `error`), `background_tasks` (shell commands), `session_crons` (prompts), `session_title`, `transcript_path`, `model`, `permission_mode`, `effort`, anything unknown — is skipped by the parser without being materialized, **never sent and never logged**.
+- `CLAUDE_PID` (set by Claude Code 2.1.332 for hook commands; the hook documentation does not mention it) is read and sent when present and valid, as a cross-check (§21.5). No other variable of the hook's environment is read: it holds Claude Code's own tokens.
+- Sends nothing (exit 0) for: a `Notification` other than `idle_prompt` or `permission_prompt`; any other event that carries `agent_id` (from inside a subagent); an event name not in §21.2 or not equal to the argument; malformed or oversized input.
+- Sends exactly one `hook.event` request over the Unix socket (§11.2, the daemon's UID verified first, like every CLI command) and reads one response. **It never waits for a starting daemon and never retries** (the 5 s wait of §13 does not apply): no daemon ⇒ exit at once. It opens no config file and no database and writes no file.
+
+### 21.4 The socket message
+`{"op":"hook.event","event":…,"session_id":…,"cwd":…,"claude_pid":…,"prompt_id":…,"source":…,"notification_type":…}`, answered by `{"ok":{"accepted":true}}` or an `invalid_argument` error naming the reason (§21.10).
+- Exact key set: `source` for `SessionStart` only (required there), `notification_type` for `Notification` only (required there: `idle_prompt` or `permission_prompt`), `prompt_id` and `claude_pid` optional, no other key; the object's shape is checked by hand like every op.
+- `event`: one of the nine names of §21.2. `session_id`, `prompt_id`: lower-case UUIDs (§7.1, §8). `cwd`: absolute, at most 4,096 bytes, no NUL. `claude_pid`: an integer from 2 to 4,194,304, not the daemon's own pid. `source`: `startup`, `resume`, `clear`, `compact` or `fork`.
+- **The request limit of the socket is 32 KiB** for every op (was 4 KiB; a cwd of 4,096 bytes, JSON-escaped, does not fit in 4 KiB).
+- The `cwd` is the **only path a socket client ever sends** (O14). It is handled exactly like a cwd recorded in a session file: untrusted, resolved with the rules of §4.4 inside the sandbox, never opened for content, never logged.
+
+### 21.5 Who may report, and which process is the session's (O10)
+- The peer-UID check of §11.2 applies, unchanged.
+- **The daemon finds the Claude Code process itself**; it never relies on the client's word alone. While the client waits for its reply, the daemon takes the client's pid from `SO_PEERCRED` and walks up the parent chain through `/proc/<pid>/status` (`PPid`): at most 8 steps, only through processes whose real and effective UID are the daemon's (the walk stops at the first that is not, and at pid 1). The session's process is the **nearest** ancestor whose `/proc/<pid>/cmdline` identifies Claude Code: the last path component of `argv[0]` is exactly `claude` (verified for 2.1.332 started as `claude`; it also sets its process title to `claude`) *(the exact rule: choice, for review)*. No such ancestor ⇒ refused (`no_claude_ancestor`). The chain of the live run: hook command → `sh` → `claude`.
+- **`CLAUDE_PID`, when sent, must equal that process**; otherwise the event is refused (`pid_mismatch`). Without `CLAUDE_PID` the walk's result is used. Both paths are tested.
+- **Identity** of the process: (pid, start time — field 22 of `/proc/<pid>/stat` —, boot id — `/proc/sys/kernel/random/boot_id`), read at the event. It protects against a reused pid and against a reboot.
+- **Interactive or not (O17):** the same `cmdline` tells whether the session is non-interactive: an argument `-p` or `--print`, or `--output-format` / `--input-format` (with or without `=value`; per `claude --help` both work only with `--print`), before any `--` *(choice, for review: combined short options such as `-cp` are not recognized)*. Non-interactive sessions — `-p` runs, and SDK hosts that start the CLI that way — are tracked but **hidden by default** (§21.8).
+- **Scope, honestly:** same-user processes are outside the threat model (§11.1) and can still forge events (a child can name its parent `claude`). The check stops stale or garbage pids and reports from outside a Claude Code process tree; it is not a defence against a process running as the user.
+- **Sandbox:** nothing changes. Under ccwm's Landlock policy (ABI 8) and seccomp filter, `status`, `stat` and `cmdline` of processes outside the domain stay readable; `exe`, `cwd` and `environ` fail with `EACCES` (verified, ARCHITECTURE.md §13k). No new socket, no new Landlock rule.
+
+### 21.6 States and rules
+| State (per open session) | Meaning | Entered by |
+|---|---|---|
+| `needs_approval` | Claude waits for the user to approve a tool use or a network request | `Notification` `permission_prompt` |
+| `working` | Claude is working on a turn | `UserPromptSubmit`; a tool event in `needs_approval` or `unknown` |
+| `waiting` | open; Claude is idle and waiting for the user's next prompt | `SessionStart` (not `compact`), `Stop`, `StopFailure`, `Notification` `idle_prompt` |
+| `unknown` | open (the process is alive), activity not known | a daemon restart (§21.7); a first event `SessionStart` with `compact` |
+| closed | not tracked: no dot | `SessionEnd`; the process is gone |
+
+- **Any event opens** a session id that is not tracked (hooks added in the middle of a session, a daemon that was down), except `SessionEnd`; a tool event opens it as `working`.
+- A tool event in `waiting` changes nothing *(choice, for review)*: a turn that ended stays ended until the next prompt.
+- **Stale events:** `UserPromptSubmit` records the session's current `prompt_id`; any other event whose `prompt_id` is present and differs from it changes nothing (for example an idle notification that arrives after a newer prompt).
+- `SessionStart` for a tracked id takes the new process identity (a session resumed by a new process, a respawned background session). One process may hold several sessions; each is tracked on its own.
+- **Liveness (O13):** a session is closed when its process is gone — no `/proc` entry, another start time or boot id, or the state `Z`/`X` — checked at every event, at start (§21.7) and **every 5 s** while any session is tracked. No time limit on any state.
+- Each state change records the time (`since`, whole seconds).
+- **Project (O14):** the cwd of the session's first event, validated like a session cwd and resolved with §4.4 (canonical path, roots, exclusions, nested rule, session-only rule). A session whose cwd names no registered project stays tracked as unassigned (counted by reason, §21.10) and is resolved again when projects are added, removed or moved and at each reconciliation. **Hook events never register a project**: the session file does (§4.3).
+- At most 256 tracked sessions; events that would open more are refused (`limit`).
+
+### 21.7 Restart behaviour
+- **Daemon restart:** tracked sessions are persisted (session id, pid, start time, boot id, the first cwd, the time opened; never prompt text, titles or states). At start each is restored if its process is alive with the same start time and boot id and its `cmdline` still identifies Claude Code (§21.5; interactive or not is read again), in the state `unknown` until its next hook event; the others are deleted. The state is never guessed.
+- **Reboot:** the boot id differs; every persisted session is dropped.
+- **Claude Code restarts a session in a new process** (`claude respawn`, `--resume`): its `SessionStart` replaces the identity.
+- A hook event that is lost (the 100 ms budget ran out, the hook timed out) leaves the last known state until the session's next event; this is documented.
+- **"Clear session index"** (§7.3) also deletes the persisted open sessions and empties the tracker (O16); sessions come back with their next hook event.
+
+### 21.8 UI
+- **Cards and table rows** show a dot **and a text label**:
+  - needs approval: a bright, steady dot in a distinct warning colour, label "Needs approval" *(steady, and the colour: choice, for review)*;
+  - working: a bright dot, gently pulsing (opacity, about a 2 s cycle), label "Working";
+  - waiting: a dim, steady dot, label "Waiting for input";
+  - unknown: a hollow ring, steady, label "Session open" (O15);
+  - no open session: nothing.
+- **Several open sessions** in one project: "needs approval" if any session needs it, else "working", else "waiting", else "unknown"; the tooltip and the accessible name give the count per state ("2 open sessions: 1 needs approval, 1 working"), and "since <time>" when there is one session.
+- The label is text; the dot is decorative (`aria-hidden`), its meaning never depends on colour or motion; contrast WCAG AA (3:1 for the dot). Under `prefers-reduced-motion: reduce` the pulse is off (a steady bright dot). No live-region announcements.
+- **Table:** a "Claude" column with a fixed width in `rem` on its header cell. **Detail panel:** each listed session shows its state when it is open.
+- **Filters** (toolbar, combinable with the others, the same in both views): "Waiting for me" — projects with at least one session waiting or needing approval *(including "needs approval": choice, for review)*; "Working" — at least one working session; "Open" — at least one open session in any state (O15). Each filter shows its count. An empty result explains the opt-in ("No session reports yet: `ccwm hooks print`").
+- **Non-interactive sessions (O17)** are hidden by default — no dot, no count, no filter match, not in the detail panel — and shown with the Settings toggle "Show non-interactive sessions (`-p`, SDK)" (`indicator.show_noninteractive`, default off, applies without a restart). SDK hosts that start the CLI with those options (editor extensions, for example) are hidden as well until the toggle is on.
+- Live: a state change publishes the project over the WebSocket (the usual batching). The indicator never drives a sort.
+
+### 21.9 Hook configuration (documented; the user adds it)
+- **`ccwm hooks print`** prints, on stdout and nothing else, the `hooks` object to merge into a Claude Code settings file: one entry per event of §21.2 (`Notification` twice, one per matcher), each `{"type":"command","command":"command -v '<ccwm>' >/dev/null 2>&1 && '<ccwm>' hook <Event>; exit 0","timeout":5}`. `<ccwm>` is the running binary's canonical path, POSIX-quoted (§8) and then JSON-encoded; a path with characters that §8 refuses for a terminal is refused; a warning goes to stderr when the binary is not `~/.local/bin/ccwm`. **The guard makes the hook safe when ccwm is missing or broken:** a missing ccwm is not called, and `exit 0` ends the shell with status 0 whatever ccwm did, with nothing on stdout (checked with dash: a missing path is skipped, the snippet exits 0). The documentation also gives the `PATH` form, `command -v ccwm >/dev/null 2>&1 && ccwm hook <Event>; exit 0`, for a `ccwm` on Claude Code's `PATH`. The hooks stay synchronous, not `async`: Claude Code waits for a synchronous hook before it goes on, which keeps a session's turn events in order (a late `Notification` is caught by the `prompt_id` rule of §21.6), and `-p` kills async hooks at teardown. Example:
+  ```json
+  {"hooks": {
+    "SessionStart":       [{"hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook SessionStart; exit 0"}]}],
+    "UserPromptSubmit":   [{"hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook UserPromptSubmit; exit 0"}]}],
+    "Notification":       [{"matcher": "permission_prompt", "hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook Notification; exit 0"}]},
+                           {"matcher": "idle_prompt", "hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook Notification; exit 0"}]}],
+    "PostToolUse":        [{"hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook PostToolUse; exit 0"}]}],
+    "PostToolUseFailure": [{"hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook PostToolUseFailure; exit 0"}]}],
+    "PostToolBatch":      [{"hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook PostToolBatch; exit 0"}]}],
+    "Stop":               [{"hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook Stop; exit 0"}]}],
+    "StopFailure":        [{"hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook StopFailure; exit 0"}]}],
+    "SessionEnd":         [{"hooks": [{"type": "command", "timeout": 5, "command": "command -v '/home/USER/.local/bin/ccwm' >/dev/null 2>&1 && '/home/USER/.local/bin/ccwm' hook SessionEnd; exit 0"}]}]
+  }}
+  ```
+- **ccwm never reads or edits** `~/.claude/settings.json` or any other settings file. The documentation says where the snippet goes: `~/.claude/settings.json` for every project, or a project's `.claude/settings.local.json` for one; hook entries merge across settings files, and an identical handler in several files runs once.
+- **Cost:** `PostToolUse`/`PostToolUseFailure` and `PostToolBatch` run the hook after every tool call and every batch: one process start and one socket round trip each (a few milliseconds; the socket part at most 100 ms).
+- **Documented limitations:** no hook runs under `claude --bare`, `--safe-mode`, `--restricted` (user, project and local settings are ignored), `disableAllHooks`, a managed `allowManagedHooksOnly`, or, in an interactive session, before the workspace trust dialog is accepted. A Claude Code started under another name (for example through the versioned binary's own path) or in another PID namespace (a container) is not found by the walk (`no_claude_ancestor`). A shell whose runtime directory differs from the daemon's (§11.2) reaches no daemon. With ccwm uninstalled the hooks do nothing until the user removes them.
+
+### 21.10 Status, privacy, security
+- **`ccwm status`** and `/service/status` (`hooks`): open sessions by state, hidden non-interactive ones, unassigned ones by reason, the time of the last event, events received, stale events, refused events by reason (`malformed`, `no_claude_ancestor`, `pid_mismatch`, `limit`). **`ccwm doctor`**: an informational line — the last event, or "no hook event since the daemon started (`ccwm hooks print`)"; never a failure (hooks are opt-in); it reads no settings file.
+- **Privacy (§14 proposal 3, approved):** the indicator stays visible in privacy mode; its payload is states, counts and times only — no path, no pid, no text from sessions. Prompt text, the assistant's text and the tool fields never leave the hook process (§21.3). Logs carry the event name at `trace` level only, never the cwd. Persisted sessions hold the first cwd (like session rows) and are deleted when the session closes (`secure_delete`, §7.3).
+- **Security:** §21.4 and §21.5. The daemon starts no process, opens no socket and gets no new sandbox rule for the indicator; `ccwm hook` runs outside the daemon, as the user, like every CLI command.
+
+### 21.11 Testing (in addition to §16)
+- The state machine: every event in every state, unknown ids, stale `prompt_id`s, `compact`, tool events in each state, subagent events, several sessions in one process, the limit, the aggregate and the three filters.
+- The process walk (O10), **both paths**: `CLAUDE_PID` present and equal to the walk's result, present and different (`pid_mismatch`), absent (the walk's result is used); no `claude` ancestor within 8 steps; a `claude` above a process of another UID. The `cmdline` rules: `argv[0]` forms (`claude`, `/x/claude`, `claude-x`, `/x/2.1.332`) and the non-interactive arguments (`-p`, `--print`, `--output-format=…`, `--input-format …`, after `--`, `-cp`).
+- Message validation: every field at and past its bounds, extra and missing keys, wrong types, 32 KiB.
+- The stdin parser: every 2.1.332 event shape (synthetic fixtures under `tests/fixtures/hooks/2.1.332/`); a 16 MiB prompt; canaries in `prompt`, `last_assistant_message` and `tool_response` that must not reach the socket message, the logs (test 8) or the database.
+- `/proc` handling through an injectable `/proc` root: a UID mismatch, a reused pid, a changed boot id, a zombie, a command name containing `)` and spaces.
+- The budget: a daemon socket that accepts and never answers ⇒ `ccwm hook` exits 0 with the socket part ended at 100 ms; a stdin that never closes ⇒ exit 0 at 1 s.
+- The snippet: `ccwm hooks print` output exactly; each command run by `dash` with ccwm missing, present, and replaced by a stand-in that exits 2 and writes to stdout and stderr ⇒ status 0, and empty stdout wherever ccwm is real or missing.
+- Process level, with a fake `claude` process tree (`argv[0]` `claude` via `exec -a`, then `sh` → `ccwm hook`, with and without `CLAUDE_PID`; never the real `claude`): the states over the API and the WebSocket; the fake process killed ⇒ closed within one sweep; a daemon restart ⇒ `unknown`; a non-interactive fake hidden until the toggle is on.
+- UI (Node DOM tests): dot and label for each state, the accessible name, the reduced-motion rule present, the three filters in both views, the toggle.
+
+### 21.12 Decisions (maintainer, 2026-11-26) and what is left
+- **O9:** §21 approved with the decisions below; every v0.2 row of Appendix A approved.
+- **O10:** `CLAUDE_PID` is used when present but never alone: the daemon walks the client's ancestry to the nearest same-UID process whose `cmdline` identifies Claude Code; `CLAUDE_PID` must match it; without it the walk's result is used (§21.5).
+- **O11 (still open; phase 2, the maintainer on the real home):** after an interrupt (Esc), does `idle_prompt` fire? Do a background session's hooks (`claude --bg`) come from a process the walk identifies? A permission dialog in a terminal session — approve, deny, Esc — and the events that follow (§21.2). The `cmdline` of an npm-installed Claude Code (`argv[0]` may be `node`). The arguments SDK hosts (editor extensions) start the CLI with.
+- **O12:** verified that `Notification` supports the `permission_prompt` matcher ⇒ the state "needs approval" is added (§21.2, §21.6, §21.8), with the limits stated in §21.2.
+- **O13:** the `/proc` check every 5 s. **O14:** the project from the hook's cwd, validated like a session cwd. **O15:** a hollow ring "Session open", and an "Open" filter for every open state. **O16:** "Clear session index" clears the open sessions. **O17:** non-interactive sessions hidden by default, detected from the `cmdline`, with a Settings toggle.
+- **The hook command's budget and the guarded snippet** (maintainer requirement): §21.3 and §21.9.
+- **Choices made while recording these decisions, for review:** the `cmdline` rules (§21.5); tool events from subagents ignored (§21.2); a tool event in `waiting` changes nothing (§21.6); "needs approval" steady and in a warning colour (§21.8); "Waiting for me" includes "needs approval" (§21.8); the event argument must match `hook_event_name` (§21.3); the 1 s watchdog (§21.3); the snippet calls ccwm by its absolute path, with the `PATH` form documented (§21.9).
 
 ---
 
@@ -574,6 +712,16 @@ Built from the maintainer's pasted schema output (§19), using synthetic fixture
 | WAL checkpointed and truncated after a deletion (result not checked) | A truncation that did not happen is logged and repeated after each later write (§7.3; v0.1.1, approved 2026-11-26; v0.1.0 review I7); retries without waiting, one warning, owed at the start (v0.1.1 review L3) |
 | A session missing from a listing is gone | Only from a complete listing: none is removed when the 100,000-file limit cut the listing off (§7.2; v0.1.1, approved 2026-11-26; v0.1.0 review I8); per folder: the folders listed completely still lose their gone sessions; logged once, shown in `ccwm status` (v0.1.1 review I2) |
 | CI requires Landlock and inotify where the runner has them | Also the Landlock ABI (`CCWM_REQUIRE_LANDLOCK_ABI`); the paste test, the JavaScript tests and the `systemd-analyze` check fail in CI instead of skipping (§17; v0.1.1, approved 2026-11-26; v0.1.0 review, test-coverage gap 7) |
+| Session activity indicator (§18): hooks `SessionStart`/`SessionEnd`/`UserPromptSubmit`/`Stop`; `session_id`, `cwd`, `pid` sent by a `ccwm` subcommand; liveness from `/proc/<pid>/status` | Designed in §21: also `StopFailure` and `Notification` (`idle_prompt`), so an API error or an interrupt does not leave "working" for good; states `waiting`/`working`/`unknown`; identity = pid + start time + boot id; liveness at each event, at start and every 5 s; hook events never activity and never register projects (§21; **v0.2, approved 2026-11-26**, O9, O13) |
+| The pid of a session sent by the hook command (§18) | The daemon finds the process itself: the nearest same-UID ancestor of the socket peer (`SO_PEERCRED`, `/proc/<pid>/status`, ≤ 8 steps) whose `cmdline` identifies Claude Code; `CLAUDE_PID` must match it when present, otherwise the walk's result is used (§21.5; **v0.2, maintainer decision 2026-11-26**, O10; the exact `cmdline` rule for review) |
+| No "waiting for permission" state (proposed in phase 1, O12) | State "needs approval" from `Notification` `permission_prompt` (matcher verified), left at the next tool event (`PostToolUse`, `PostToolUseFailure`, `PostToolBatch`), prompt, end of turn or session end; an approved long-running tool shows "needs approval" until it finishes (§21.2, §21.6, §21.8; **v0.2, maintainer decision 2026-11-26**, O12) |
+| Open session of unknown state after a restart: display to be designed (ARCHITECTURE §14) | Hollow ring, label "Session open"; an "Open" filter covers every open state (§21.8; **v0.2, maintainer decision 2026-11-26**, O15) |
+| Every session shown | Non-interactive sessions (`-p`/`--print`, SDK), detected from the Claude Code process's `cmdline`, hidden by default; Settings toggle `indicator.show_noninteractive` (§21.5, §21.8; **v0.2, maintainer decision 2026-11-26**, O17) |
+| Unix-socket requests ≤ 4 KiB (ARCHITECTURE §8) | ≤ 32 KiB for every op, so a 4,096-byte cwd fits JSON-escaped (§21.4; **v0.2, approved 2026-11-26**) |
+| Clients never pass paths (opaque ids only) | One exception: the `cwd` of `hook.event`, validated and handled exactly like a cwd recorded in a session file (§21.4; **v0.2, approved 2026-11-26**, O14) |
+| CLI commands wait up to 5 s while the instance lock is held | Not `ccwm hook <Event>`: it never waits or retries, always exits 0 and never writes to stdout; at most 100 ms for connect, send and the acknowledgement, stdin read bounded, only the needed fields extracted (§21.3; **v0.2, maintainer requirement 2026-11-26**) |
+| (none) | The printed hook command is guarded, safe when ccwm is missing: `command -v '<ccwm>' >/dev/null 2>&1 && '<ccwm>' hook <Event>; exit 0`, nothing on stdout (§21.9; **v0.2, maintainer requirement 2026-11-26**) |
+| "Clear session index" deletes the derived session data | Also the persisted open sessions of the indicator (§21.7; **v0.2, approved 2026-11-26**, O16) |
 
 ## Appendix B — Assumptions and verdicts
 
@@ -589,3 +737,7 @@ Verdicts were recorded on 2026-11-23 on the development host (Ubuntu 24.04.4, Li
 | 6 | Landlock ABI level (`/sys/kernel/security/lsm` contains `landlock`; ABI ≥ 4 for network rules), and a Landlock-restricted process can still bind its TCP port and serve its Unix socket. | **Kernel side confirmed:** `landlock` is in the LSM list and the ABI is 8 (queried with `landlock_create_ruleset`). The bind/serve claim is verified by the M1 tests. |
 | 7 | No-op `-c` overrides for filter drivers are honored by `git status` and prevent the driver from executing. | **True on 2.43.0** (sentinel test), but only together with `--attr-source` (§6). |
 | 8 | `unshare -rn` is available on the test host. | **False on this host:** `unshare -rn` (and `--map-current-user`) fails (`apparmor_restrict_unprivileged_userns=1`). `unshare -rn` would also make ccwm run as uid 0 inside the namespace, which it refuses. Test 5 runs the **strace** variant here (strace 6.8, 2026-11-24). |
+| 9 | Claude Code has the hook events `SessionStart`, `SessionEnd`, `UserPromptSubmit` and `Stop`, and their input carries `session_id` and `cwd` (§18). | **True for 2.1.332** (2026-11-26): the input schemas embedded in the binary, the hook documentation and a live `claude -p` run agree; every event also carries `transcript_path`, the later ones `prompt_id`. `UserPromptSubmit` carries the full `prompt`, `Stop` the `last_assistant_message`: both are skipped (§21.3). 34 events exist; `StopFailure` and `Notification` are added in §21.2. |
+| 10 | The hook input carries the Claude Code process id (§18: "`pid`"). | **False:** no input field holds a pid. Claude Code 2.1.332 sets **`CLAUDE_PID`** in the hook command's environment (in the binary's source and in the live run; not in the hook documentation). The live run's process chain: hook → `sh` (dash does not exec the command) → `claude`, the `CLAUDE_PID` process; its `cmdline` starts with `claude` and the binary sets its process title to `claude` (unless `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`). `CLAUDE_PID` is a cross-check of the daemon's own walk (§21.5, O10). |
+| 11 | Liveness can be checked inside ccwm's sandbox. | **True** (2026-11-26): under the real daemon policy (Landlock ABI 8) and seccomp filter, `/proc/<pid>/status`, `stat` (start time present) and `cmdline` of processes outside the domain are readable, including a real `claude` 2.1.332; `exe`, `cwd` and `environ` fail with `EACCES`; `SO_PEERCRED` gives the peer's pid; `pidfd_open` works and reports the exit. |
+| 12 | `Notification` supports a `permission_prompt` matcher (O12). | **True for 2.1.332** (2026-11-26; documentation and binary, no live run): the `Notification` matcher is compared with `notification_type`; `permission_prompt` is a documented value ("the prompt has waited about six seconds"; in a terminal "each keystroke defers it"); the binary sends it from a 6,000 ms timer started when a permission dialog appears and cancelled when it is answered. **No event marks the end of a permission wait:** an approved tool fires `PostToolUse`/`PostToolUseFailure` when it finishes and `PostToolBatch` when its batch resolves; a denial in the dialog fires no tool event, and `PermissionDenied` is for auto-mode denials only. Not run: an interactive permission dialog (O11). |

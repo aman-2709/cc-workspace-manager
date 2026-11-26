@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); v0.1.1 is built and committed locally (below; three commits), not pushed or tagged. Its spec changes and choices are approved (2026-11-26).** The session activity indicator is the v0.2 headline (ARCHITECTURE §14).
+Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); v0.1.1 is built and committed locally (below; three commits), not pushed or tagged. Its spec changes and choices are approved (2026-11-26).** The session activity indicator is the v0.2 headline: **phase 1 (verification and design) is done and committed locally; the design (REQUIREMENTS.md §21) is approved with the maintainer's decisions (2026-11-26); nothing is built; phase 2 waits for the go-ahead** (below).
 
 ---
 
@@ -288,6 +288,48 @@ After v0.1.1:
 
 ---
 
+## v0.2 — Session activity indicator (REQUIREMENTS.md §21, ARCHITECTURE.md §11a, §13k, §15)
+
+### Phase 1 — verification and design (2026-11-26; docs only, one local commit)
+- [x] Hook events and input fields verified against Claude Code 2.1.332: `claude --help`, the hook documentation,
+  the schemas embedded in the binary, one live `claude -p` run in `/tmp` (approved by the maintainer) — §11a
+- [x] Where the pid comes from: no input field; `CLAUDE_PID` in the hook environment (verified live), checked as an
+  ancestor of the socket peer (`SO_PEERCRED` + `/proc/<pid>/status`)
+- [x] Readable inside ccwm's Landlock (ABI 8) + seccomp sandbox: `/proc/<pid>/status`, `stat` (start time),
+  `cmdline`; `exe`/`cwd`/`environ` `EACCES`; `pidfd_open` works — throwaway probe with the real policy and filter
+  (§13k)
+- [x] Design in REQUIREMENTS.md §21 and ARCHITECTURE.md §15: `ccwm hook` and its message, states, liveness,
+  restart, the three §14 answers, UI, filters, privacy, security, `ccwm hooks print`; spec changes in Appendix A;
+  verdicts 9–12 in Appendix B
+- [x] Maintainer's decisions (2026-11-26): design approved (O9) with O10 (the daemon walks to the nearest `claude`
+  ancestor; `CLAUDE_PID` only a cross-check), O12 (verified in documentation and binary: `permission_prompt`
+  exists ⇒ "needs approval" added), O13–O16 as proposed plus an "Open" filter, O17 (non-interactive sessions
+  hidden by default, Settings toggle), a 100 ms budget for `ccwm hook` and a guarded snippet; every v0.2 Appendix
+  A row approved. Left: O11 (phase 2, on the real home) and the choices for review (REQUIREMENTS.md §21.12)
+
+### Phase 2 — build (on the maintainer's go-ahead; ARCHITECTURE.md §15 "Phase 2")
+- [ ] `claude/hook.rs` (allowlist stdin parser, fixtures `tests/fixtures/hooks/2.1.332/`), `ccwm hook <Event>`
+  (before clap, exit 0, no stdout, 100 ms socket budget, 1 s watchdog, 16 MiB stdin), `ccwm hooks print` (the
+  guarded command for the nine events)
+- [ ] Socket op `hook.event` (32 KiB limit, shape and field validation, the peer's pid)
+- [ ] `presence/` (state machine with `needs_approval`, `ProcFs`, the walk to the nearest `claude` and the
+  `CLAUDE_PID` cross-check — both paths tested —, identity, non-interactive detection, 5 s sweep, limit,
+  counters); tracker resolution and re-resolution; migration 6, restore at start; "Clear session index" clears it
+- [ ] `[indicator] show_noninteractive` (live setting, Settings toggle)
+- [ ] API and WebSocket (`live` fields, `live=waiting|working|open`, `/stats`, `/service/status` `hooks`);
+  `ccwm status`, `ccwm doctor`
+- [ ] UI: dot and label for four states, pulse, reduced motion, "Claude" column, detail panel, the three filters
+  with counts
+- [ ] Tests (§21.11): unit, `tests/hooks.rs` with a fake `claude` tree, the budget and the guarded snippet, canaries
+  (test 8), DOM tests
+- [ ] Docs: docs/session-hooks.md (the snippet, where it goes, cost, limitations), README section, SECURITY.md (who
+  may report, same-user limit), configuration and troubleshooting
+- [ ] fmt / clippy / test green; synthetic daemon + real browser check; one local commit; report
+- [ ] Maintainer on the real home: adds the snippet; checks O11 (interrupt and `idle_prompt`, a background
+  session, permission dialogs, an npm install's `cmdline`, SDK hosts' arguments)
+
+---
+
 ## Backlog — v0.2 and later (REQUIREMENTS.md §18; **do not implement in v0.1**)
 
 - [ ] Full session history, expandable conversations, resume for older sessions
@@ -305,4 +347,4 @@ After v0.1.1:
 - [ ] macOS and Windows support
 - [ ] Git `core.excludesFile` (the user's global ignore file) in the activity rules (maintainer request, post-v0.1)
 - [ ] Display of `pr-link` records (the session's pull request) in the detail panel (maintainer request, post-v0.1)
-- [ ] **Session activity indicator — the v0.2 headline** (extends the "Claude running" indicator deferred from M3.1; maintainer, 2026-11-25): opt-in Claude Code hooks `SessionStart`/`SessionEnd` and `UserPromptSubmit`/`Stop` call a `ccwm` subcommand that reports `session_id`, `cwd`, `pid` over the Unix socket. States: dim steady dot = session open, waiting for input; bright, gently pulsing dot = Claude working on a turn; no dot = no open session. Liveness from `/proc/<pid>/status` (+ `cmdline`); never inferred from file or session activity; a text label is always present; the pulse is off under `prefers-reduced-motion`; filters "Waiting for me" and "Working". ccwm documents the hook config and never edits `~/.claude`. First: verify the event names and input fields against the installed Claude Code version (ARCHITECTURE §14)
+- [ ] **Session activity indicator — the v0.2 headline** (extends the "Claude running" indicator deferred from M3.1; maintainer, 2026-11-25): opt-in Claude Code hooks `SessionStart`/`SessionEnd` and `UserPromptSubmit`/`Stop` call a `ccwm` subcommand that reports `session_id`, `cwd`, `pid` over the Unix socket. States: dim steady dot = session open, waiting for input; bright, gently pulsing dot = Claude working on a turn; no dot = no open session. Liveness from `/proc/<pid>/status` (+ `cmdline`); never inferred from file or session activity; a text label is always present; the pulse is off under `prefers-reduced-motion`; filters "Waiting for me" and "Working". ccwm documents the hook config and never edits `~/.claude`. First: verify the event names and input fields against the installed Claude Code version (ARCHITECTURE §14) — **done in v0.2 phase 1; see the v0.2 section above**
