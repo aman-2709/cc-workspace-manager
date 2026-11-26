@@ -321,7 +321,7 @@ async fn run(p: Prepared) -> Result<()> {
         boundaries: boundaries.clone(),
         fuse_mounts: fuse_mounts.clone(),
     };
-    let ignore_budget = Arc::new(crate::watch::tree::IgnoreBudget::default());
+    let rules = Arc::new(crate::watch::tree::RuleStore::default());
     let tracker = Tracker::new(
         Arc::clone(&writer),
         reader.clone(),
@@ -345,7 +345,7 @@ async fn run(p: Prepared) -> Result<()> {
                 ),
                 claude: Some(Arc::clone(&claude)),
             }),
-            ignore_budget: Arc::clone(&ignore_budget),
+            rules: Arc::clone(&rules),
         },
     );
     let monitor = Monitor::new(
@@ -362,7 +362,7 @@ async fn run(p: Prepared) -> Result<()> {
             max_user_watches,
             debounce: Duration::from_millis(config.watch.debounce_ms),
             events_per_project: config.activity.events_per_project as usize,
-            ignore_budget,
+            rules,
         },
         Arc::clone(&clock),
         signals_tx,

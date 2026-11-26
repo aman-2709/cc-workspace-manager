@@ -19,8 +19,9 @@ and measures, per scenario, from /proc and the daemon's own status over its Unix
   ignore     the worst case the ignore-file limits allow: --ignore-projects projects, each with a
              `.gitignore` of --ignore-rules rules that need a regular expression (more projects
              than the limit across projects admits): RSS and peak RSS after the first scan, which
-             files were skipped, and the peak while every project is walked again next to the
-             rules it already holds (a watch budget of 1, so every project is polled).
+             files were skipped, and RSS after each of --ignore-scans further scans with every
+             project polled (a watch budget of 1: each scan walks every project again; the
+             compiled rules of unchanged files are reused, so memory must stay where it is).
 
 Usage (build first: cargo build --release --bins):
   scripts/bench.py --bin target/release [--projects 500] [--idle 600] [--sessions-mb 500]
@@ -547,13 +548,18 @@ def scenario_ignore(args, base, results):
     r["exit_code"] = code
 
     # Every project polled (no watch left for them): each reconciliation walks every project
-    # again, and the new rules exist next to the old ones until they replace them.
+    # again. Unchanged ignore files are not compiled again, so memory stays where it is.
     env.write_config("[watch]\nbudget = 1\n")
     d = Daemon(env)
     d.wait_scans(1)
     wait_quiet(d.pid)
-    r["polled_refresh_s"] = [round(d.refresh(), 2) for _ in range(2)]
-    wait_quiet(d.pid)
+    r["polled_rss_mib_after_start"] = round(memory_kib(d.pid)["VmRSS"] / 1024, 1)
+    scans = []
+    for _ in range(args.ignore_scans):
+        seconds = d.refresh()
+        wait_quiet(d.pid, quiet_for=2.0)
+        scans.append({"s": round(seconds, 2), "rss_mib": round(memory_kib(d.pid)["VmRSS"] / 1024, 1)})
+    r["polled_scans"] = scans
     measure(d, "polled_")
     code, _ = d.stop()
     r["polled_exit_code"] = code
@@ -600,6 +606,7 @@ def main():
     p.add_argument("--sessions-mb", type=int, default=500)
     p.add_argument("--ignore-projects", type=int, default=6, help="projects of the ignore scenario")
     p.add_argument("--ignore-rules", type=int, default=5000, help="ignore rules per project (ignore scenario)")
+    p.add_argument("--ignore-scans", type=int, default=10, help="scans of the polled projects (ignore scenario)")
     p.add_argument("--only", default="projects,burst,exhaustion,sessions,ignore")
     p.add_argument("--keep", action="store_true", help="keep the synthetic environments")
     ARGS = p.parse_args()

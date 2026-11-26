@@ -80,7 +80,7 @@ fn fx_with(budget: usize, fake: Option<Fake>) -> Fx {
         max_user_watches: Some(65_536),
         debounce: DEBOUNCE,
         events_per_project: 200,
-        ignore_budget: Arc::default(),
+        rules: Arc::default(),
     };
     let backend = fake.clone().map(|f| Box::new(f) as Box<dyn WatchBackend>);
     let monitor = Monitor::new(
@@ -134,6 +134,7 @@ impl Fx {
                 now: i64::MAX,
                 max_entries: tree::MAX_ENTRIES,
                 max_patterns: tree::MAX_GITIGNORE_PATTERNS,
+                reuse: None,
             },
         )
         .unwrap()

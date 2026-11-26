@@ -170,8 +170,10 @@ one project, and 20,000 rules for all projects together (v0.1.1). A file over a 
 (never read in part), counted, and reported in the monitoring status and `ccwm status`; its rules then do
 not apply. The limits exist because compiled rules stay in memory: a hostile repository with many large
 `.gitignore` files took the daemon to hundreds of megabytes (v0.1.0 review M2), and a directory tree also
-chooses how many projects it holds. The limit across projects is first come, first served: the projects
-walked first keep their rules. The repository whose rules apply is searched no higher than the project's
+chooses how many projects it holds. The limit across projects goes to the most recently active
+projects; the least recently active ones are the ones that lose their rules, whatever order the
+projects were found in. The compiled rules of a file are kept and reused until the file changes (its
+device, inode, size or modification time), so a scan compiles nothing for files that are as they were. The repository whose rules apply is searched no higher than the project's
 discovery root, and its `.git` must be owned by you, as Git itself requires. ccwm's own directories are
 never watched, so its writes never count as activity.
 
@@ -306,23 +308,29 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
   project when its Git HEAD and remote (or its `CLAUDE.md` hash) match; all of these are content
   anyone who can write in a discovery root controls, so in a shared or group-writable root another
   user could make a directory inherit a missing project's id, history and ignore state.
-- **Ignore rules cost memory.** The limits above bound the rules ccwm **keeps**: 5,000 per project and
+- **Ignore rules cost memory.** The limits above bound the rules ccwm keeps: 5,000 per project and
   20,000 for all projects together. Only rules that need a regular expression are expensive (17–20 KiB
   each; ordinary ones cost almost nothing), so the worst case — every rule of that kind, as a hostile tree
-  would have it — is about 75 MiB for one project and 350–400 MiB for all (measured with release builds,
-  [docs/benchmarks.md](docs/benchmarks.md)). **More than that is in use for a while when projects are
-  walked again**: the new rules are built next to the ones they replace. For watched projects that is one
-  project at a time. Projects *without* watches (polled: no inotify instance, or the budget is used up) are
-  all walked at every scan: the release binary then peaked at 775 MiB and went back to 395 MiB after each
-  scan. **A build from source against glibc does not give that memory back**: with the same content it
-  grew to 1.66 GiB over four scans, and with a smaller rule set to about ten times what it keeps before it
-  levelled off. The rule limits therefore do not bound the process by themselves; the systemd unit does:
-  `MemoryMax=2G` with `MemorySwapMax=0` (on a host with swap, `MemoryMax=` alone only moves the excess to
-  swap). At the limit the kernel stops the service and systemd starts it again after 5 s, for as long as
-  the cause is there ([docs/troubleshooting.md](docs/troubleshooting.md)). The limit needs the cgroup
-  memory controller for your user manager (present on Ubuntu 24.04); **without systemd (`ccwm serve` in a
-  terminal) there is no such limit**. Not measured: a pattern built to make the matcher itself use as much
-  memory as it can; the measurements used one pattern shape (`*1?b[c-d]*.x`).
+  would have it — is about 75 MiB for one project and 345–395 MiB for all (measured with release builds,
+  [docs/benchmarks.md](docs/benchmarks.md)). The rules of a file are compiled once and reused until the
+  file changes, so scanning the same projects again and again leaves memory where it is (measured over
+  ten scans with every project polled: 344 MiB in a glibc build, 381 MiB with the release binary; before
+  the rules were cached, a glibc build grew to 1.66 GiB in four such scans). What still costs extra, for a
+  moment: an ignore file that changed is compiled next to the rules it replaces (at most one project's
+  worth at a time), and when the rules move from one project to another (the limit across projects, by
+  recency) the project that gives up goes first. **Who can take the rules:** a tree of projects with huge
+  ignore files and recent file times can take the whole limit across projects, because the limit goes to
+  the most recently active projects; older projects then lose their ignore rules until they are active
+  again (files their rules would ignore count as activity meanwhile; `ccwm status` reports the skipped
+  files). The process as a whole is bounded by the systemd unit: `MemoryMax=2G` with `MemorySwapMax=0` (on
+  a host with swap, `MemoryMax=` alone only moves the excess to swap). At the limit the kernel stops the
+  service and systemd starts it again after 5 s, for as long as the cause is there
+  ([docs/troubleshooting.md](docs/troubleshooting.md)). The limit needs the cgroup memory controller for
+  your user manager (present on Ubuntu 24.04); **without systemd (`ccwm serve` in a terminal) there is no
+  such limit**. Not measured: a pattern built to make the matcher itself use as much memory as it can;
+  the measurements used one pattern shape (`*1?b[c-d]*.x`). The cache trusts a file's device, inode, size
+  and modification time: a file rewritten without changing any of them keeps its old rules until it
+  changes again or the daemon restarts (that affects what counts as activity, nothing else).
 - **POSIX ACLs** (v0.1.0 review L4). The check that refuses to start when an ancestor of ccwm's
   directories, or the config file, "could be modified by another user" reads the owner and the mode bits.
   It does not read access control lists: with an extended ACL the group bits show the ACL mask, so a

@@ -19,7 +19,7 @@ pub const UNIT_NAME: &str = "ccwm.service";
 pub const BINARY_IN_HOME: &str = ".local/bin/ccwm";
 /// `MemoryMax=` of the unit: the most memory the daemon and its `git` / `claude` children may
 /// use together. A backstop, not a working size: ccwm normally needs 20–30 MiB, and the worst
-/// case its ignore-rule limits allow was measured at 775 MiB with the release binary
+/// case its ignore-rule limits allow was measured at 395 MiB with the release binary
 /// (docs/benchmarks.md). Above it the kernel stops the service instead of letting it take the
 /// machine's memory. `MemorySwapMax=0` goes with it: where there is swap, `MemoryMax=` alone
 /// only moves the excess there (verified in a user unit, ARCHITECTURE.md §13).

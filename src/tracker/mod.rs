@@ -48,8 +48,9 @@ pub struct Settings {
     pub full_scan: bool,
     /// The session integration; `None` disables it (tests of the M2 machinery).
     pub sessions: Option<SessionSettings>,
-    /// The limit on ignore rules across projects; the monitor's settings hold the same one.
-    pub ignore_budget: Arc<tree::IgnoreBudget>,
+    /// The ignore rules the projects keep (the limit across projects, reuse between walks); the
+    /// monitor's settings hold the same one.
+    pub rules: Arc<tree::RuleStore>,
 }
 
 #[derive(Clone)]
@@ -295,6 +296,7 @@ impl Tracker {
             }
             self.refresh_polled(rescan_all).await?;
         }
+        self.rebalance_rules().await?;
 
         let retention = now - self.live().retention_secs;
         for id in self.writer.purge_missing(retention).await? {
@@ -501,7 +503,8 @@ impl Tracker {
         let trees = self.walk_many(jobs, &tracked).await;
         let mut plan = Vec::new();
         for (id, tree) in trees {
-            self.record_inferred(&id, tree.newest.as_ref()).await;
+            self.record_inferred(&tracked, &id, tree.newest.as_ref())
+                .await;
             plan.push(WatchProject { id, tree });
         }
         plan.sort_by_key(|p| std::cmp::Reverse(p.tree.newest.as_ref().map(|n| n.0)));
@@ -551,7 +554,8 @@ impl Tracker {
             let trees = self.walk_many(whole, &tracked).await;
             let mut plan = Vec::new();
             for (id, tree) in trees {
-                self.record_inferred(&id, tree.newest.as_ref()).await;
+                self.record_inferred(&tracked, &id, tree.newest.as_ref())
+                    .await;
                 self.git.request(&id);
                 plan.push(WatchProject { id, tree });
             }
@@ -565,7 +569,7 @@ impl Tracker {
         }
         if !partial.is_empty() {
             for (id, newest, roots, dirs) in self.walk_subtrees(partial, &tracked).await {
-                self.record_inferred(&id, newest.as_ref()).await;
+                self.record_inferred(&tracked, &id, newest.as_ref()).await;
                 self.git.request(&id);
                 let _ = self.monitor.send(Cmd::Retry { id, roots, dirs }).await;
             }
@@ -623,27 +627,36 @@ impl Tracker {
         let now = self.clock.now();
         tokio::task::spawn_blocking(move || {
             jobs.into_iter()
-                .filter_map(|(id, path)| ctx.walk(&path, now).map(|t| (id, t)))
+                .filter_map(|(id, path)| {
+                    ctx.walk(&path, now, tree::MAX_GITIGNORE_PATTERNS)
+                        .map(|t| (id, t))
+                })
                 .collect()
         })
         .await
         .unwrap_or_default()
     }
 
-    fn walk_context(&self, tracked: &[Tracked]) -> WalkContext {
-        let s = &self.settings.scan;
-        // Projects that are no longer monitored keep no rules: their part of the limit across
-        // projects is free again before anything is walked.
-        let monitored: HashSet<&Path> = tracked
+    /// The monitored projects of `tracked` by root, with their last activity (their place in the
+    /// order in which the limit on ignore rules is shared). Projects that are no longer among
+    /// them keep no rules: the store forgets them here, before anything is walked or shared.
+    fn monitored_recency(&self, tracked: &[Tracked]) -> HashMap<PathBuf, Option<i64>> {
+        let monitored: HashMap<PathBuf, Option<i64>> = tracked
             .iter()
             .filter(|t| !t.missing && !t.ignored)
-            .map(|t| Path::new(&t.path))
+            .map(|t| (PathBuf::from(&t.path), t.activity_at))
             .collect();
         self.settings
-            .ignore_budget
-            .retain(|root| monitored.contains(root));
+            .rules
+            .retain(|root| monitored.contains_key(root));
+        monitored
+    }
+
+    fn walk_context(&self, tracked: &[Tracked]) -> WalkContext {
+        let s = &self.settings.scan;
         WalkContext {
-            budget: Arc::clone(&self.settings.ignore_budget),
+            rules: Arc::clone(&self.settings.rules),
+            recency: self.monitored_recency(tracked),
             roots: self.root_exclusions(),
             others: tracked
                 .iter()
@@ -657,10 +670,63 @@ impl Tracker {
         }
     }
 
-    async fn record_inferred(&self, id: &str, newest: Option<&(i64, String)>) {
+    /// Give the ignore rules to the most recently active projects when they do not fit all (the
+    /// limit across projects): walk again the projects whose rules are not what the order of
+    /// recency gives them ([`tree::RuleStore::rebalance`]), those that give rules up before
+    /// those that take. Nothing to do while every project has the rules it wants, which is the
+    /// normal state. Called after every walk and at every reconciliation, so the rules follow
+    /// the projects' activity at the latest at the next scan.
+    async fn rebalance_rules(self: &Arc<Self>) -> Result<()> {
+        let rules = &self.settings.rules;
+        if !rules.contended() {
+            return Ok(());
+        }
+        let tracked = self.tracked().await?;
+        let recency = self.monitored_recency(&tracked);
+        for (root, at) in &recency {
+            rules.set_recency(root, *at);
+        }
+        let ids: HashMap<&Path, &str> = tracked
+            .iter()
+            .map(|t| (Path::new(&t.path), t.id.as_str()))
+            .collect();
+        for (root, allowance) in rules.rebalance() {
+            let Some(id) = ids.get(root.as_path()) else {
+                continue;
+            };
+            let ctx = self.walk_context(&tracked);
+            let now = self.clock.now();
+            let walked = tokio::task::spawn_blocking(move || ctx.walk(&root, now, allowance)).await;
+            if let Ok(Some(tree)) = walked {
+                self.record_inferred(&tracked, id, tree.newest.as_ref())
+                    .await;
+                let id = (*id).to_string();
+                let _ = self.monitor.send(Cmd::Add(WatchProject { id, tree })).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the newest file a walk found as the inferred activity of project `id`.
+    ///
+    /// Except when the project lacks ignore rules because of the limit across projects and
+    /// already has a time: a walk without the project's rules cannot tell an ignored file from
+    /// a meaningful one, and a time raised by it would move the project up in the very order
+    /// that decides who gets the rules (a project that just gave its rules up would take them
+    /// back from the next one, and so on). A project of which nothing is known yet does get
+    /// the time: it needs a place in that order.
+    async fn record_inferred(&self, tracked: &[Tracked], id: &str, newest: Option<&(i64, String)>) {
         let Some((at, path)) = newest else {
             return;
         };
+        let rules = &self.settings.rules;
+        if rules.contended()
+            && tracked.iter().any(|t| {
+                t.id == id && t.activity_at.is_some() && rules.lacks_rules(Path::new(&t.path))
+            })
+        {
+            return;
+        }
         let activity = Activity {
             at: *at,
             kind: ActivityKind::Inferred,
@@ -716,7 +782,8 @@ impl Tracker {
             }
         }
         self.writer.store_git(&id, info, self.clock.now()).await?;
-        self.record_inferred(&id, tree.newest.as_ref()).await;
+        self.record_inferred(&tracked, &id, tree.newest.as_ref())
+            .await;
         self.notifier.project(&id);
         let ignored = self
             .reader
@@ -782,10 +849,18 @@ impl Tracker {
             Control::Ignored(id) => self.unwatch(&id).await,
             Control::Unignored(id) => self.enroll(&id, false).await?,
         }
-        Ok(())
+        // A project left or joined: the rules may have to go to other projects.
+        self.rebalance_rules().await
     }
 
     pub async fn on_signal(self: &Arc<Self>, s: Signal) -> Result<()> {
+        // Signals after which projects were walked, came or went: the ignore rules may then
+        // have to go to other projects. (Plain activity only changes the order; that is taken
+        // up at the next scan.)
+        let rebalance = !matches!(
+            s,
+            Signal::Activity { .. } | Signal::Git { .. } | Signal::Rescan
+        );
         match s {
             Signal::Activity {
                 id,
@@ -831,6 +906,9 @@ impl Tracker {
                     }
                 }
             }
+        }
+        if rebalance {
+            self.rebalance_rules().await?;
         }
         Ok(())
     }
@@ -954,7 +1032,9 @@ fn upsert_of(c: Candidate) -> ProjectUpsert {
 
 /// Everything a tree walk needs, owned so it can move to a blocking thread.
 struct WalkContext {
-    budget: Arc<tree::IgnoreBudget>,
+    rules: Arc<tree::RuleStore>,
+    /// Last activity of every monitored project, by root.
+    recency: HashMap<PathBuf, Option<i64>>,
     roots: Vec<(PathBuf, Exclusions)>,
     others: HashSet<PathBuf>,
     home: PathBuf,
@@ -965,12 +1045,23 @@ struct WalkContext {
 }
 
 impl WalkContext {
-    fn walk(&self, root: &Path, now: i64) -> Option<Tree> {
-        self.walk_from(root, root, &tree::GitIgnore::default(), now)
+    /// A full walk of project `root`, which may keep at most `at_most` ignore rules
+    /// ([`tree::MAX_GITIGNORE_PATTERNS`] unless the rules are being rebalanced). It replaces
+    /// the project's rules: the store says what it may keep and which rules it can reuse, and
+    /// is told the result.
+    fn walk(&self, root: &Path, now: i64, at_most: usize) -> Option<Tree> {
+        let recency = self.recency.get(root).copied().flatten();
+        self.walk_with(root, root, &tree::GitIgnore::default(), now, || {
+            self.rules.begin(root, recency, at_most)
+        })
+        .inspect_err(|()| self.rules.settle(root, None))
+        .ok()
+        .inspect(|tree| self.rules.settle(root, Some(tree)))
     }
 
     /// The part of project `root` at and below `start`, with the project's known rules `base`
-    /// (see [`tree::walk_from`]).
+    /// (see [`tree::walk_from`]). It keeps nothing: it only asks how many rules the project
+    /// may hold.
     fn walk_from(
         &self,
         root: &Path,
@@ -978,22 +1069,35 @@ impl WalkContext {
         base: &tree::GitIgnore,
         now: i64,
     ) -> Option<Tree> {
-        let (discovery_root, ex) = self
+        self.walk_with(root, start, base, now, || tree::Grant {
+            max_patterns: self.rules.room(root),
+            reuse: None,
+        })
+        .ok()
+    }
+
+    /// `grant` is asked only when the walk is going to happen (a full walk reserves there).
+    /// `Err(())`: the walk itself failed after that.
+    fn walk_with(
+        &self,
+        root: &Path,
+        start: &Path,
+        base: &tree::GitIgnore,
+        now: i64,
+        grant: impl FnOnce() -> tree::Grant,
+    ) -> std::result::Result<Tree, ()> {
+        let Some((discovery_root, ex)) = self
             .roots
             .iter()
             .filter(|(r, _)| root.starts_with(r))
-            .max_by_key(|(r, _)| r.as_os_str().len())?;
+            .max_by_key(|(r, _)| r.as_os_str().len())
+        else {
+            return Err(());
+        };
         let mut others = self.others.clone();
         others.remove(root);
         let repo = tree::git_worktree_root(root, discovery_root, &self.home, self.uid);
-        // A full walk replaces the project's rules: it reserves its share of the limit across
-        // projects and settles for what it kept. A subtree walk keeps nothing.
-        let full = start == root;
-        let max_patterns = if full {
-            self.budget.reserve(root)
-        } else {
-            self.budget.room(root)
-        };
+        let grant = grant();
         let opts = TreeOptions {
             exclusions: ex,
             other_projects: &others,
@@ -1003,14 +1107,10 @@ impl WalkContext {
             repo_root: repo.as_deref(),
             now,
             max_entries: tree::MAX_ENTRIES,
-            max_patterns,
+            max_patterns: grant.max_patterns,
+            reuse: grant.reuse.as_deref(),
         };
-        let tree = tree::walk_from(root, start, base, &opts).ok();
-        if full {
-            let kept = tree.as_ref().map_or(0, |t| t.ignore.patterns());
-            self.budget.settle(root, kept);
-        }
-        tree
+        tree::walk_from(root, start, base, &opts).map_err(|_| ())
     }
 }
 

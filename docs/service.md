@@ -128,7 +128,7 @@ Notes:
   shell can.
 - **`MemoryMax=2G` and `MemorySwapMax=0`** (since 0.1.1): the most memory the daemon and its `git` and
   `claude` children may use together, with no swap on top. It is a backstop, not a working size: ccwm
-  normally needs 20–30 MiB, and the worst case its own limits allow was measured at 775 MiB with the release
+  normally needs 20–30 MiB, and the worst case its own limits allow was measured at 395 MiB with the release
   binary ([benchmarks.md](benchmarks.md#ignore-rules-at-their-limits)). If the limit is ever reached, the
   kernel stops the service and systemd starts it again after 5 s
   ([troubleshooting.md](troubleshooting.md#the-service-keeps-restarting-out-of-memory)). `MemorySwapMax=0`

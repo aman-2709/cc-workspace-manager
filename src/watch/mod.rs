@@ -234,8 +234,8 @@ pub struct Settings {
     pub max_user_watches: Option<u64>,
     pub debounce: Duration,
     pub events_per_project: usize,
-    /// The limit on ignore rules across projects (the tracker's walks reserve from the same one).
-    pub ignore_budget: Arc<tree::IgnoreBudget>,
+    /// The ignore rules the projects keep (the tracker's walks use the same store).
+    pub rules: Arc<tree::RuleStore>,
 }
 
 /// The watcher abstraction the monitor needs; [`notify::INotifyWatcher`] in production.
@@ -1098,7 +1098,7 @@ impl Monitor {
             self.settings.same_file_system,
             self.clock.now(),
         );
-        let max_patterns = self.settings.ignore_budget.room(&root);
+        let max_patterns = self.settings.rules.room(&root);
         tokio::task::spawn_blocking(move || {
             let opts = TreeOptions {
                 exclusions: &ex,
@@ -1110,6 +1110,8 @@ impl Monitor {
                 now,
                 max_entries: tree::MAX_ENTRIES,
                 max_patterns,
+                // A subtree walk starts from the project's rules: they are what it reuses.
+                reuse: None,
             };
             if let Ok(tree) = tree::walk_from(&root, &dir, &ignore, &opts) {
                 let _ = tx.blocking_send(Cmd::Walked { owner, tree });
@@ -1228,7 +1230,7 @@ impl Monitor {
             self.projects.values().map(|p| p.ignore_files_skipped).sum();
         if ignore_files_skipped > 0 {
             advice.push(format!(
-                "{ignore_files_skipped} .gitignore or .git/info/exclude file(s) were skipped: larger than {} KiB, or the project has more than {} KiB or {} rules of ignore files, or all projects together have more than {} rules. Their rules do not apply, so files they would ignore count as activity.",
+                "{ignore_files_skipped} .gitignore or .git/info/exclude file(s) were skipped: larger than {} KiB, or the project has more than {} KiB or {} rules of ignore files, or all projects together have more than {} rules (the most recently active projects keep theirs). Their rules do not apply, so files they would ignore count as activity.",
                 tree::MAX_GITIGNORE_BYTES / 1024,
                 tree::MAX_GITIGNORE_TOTAL_BYTES / 1024,
                 tree::MAX_GITIGNORE_PATTERNS,

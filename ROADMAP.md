@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); v0.1.1 is built and committed locally (below), not pushed or tagged; its spec changes and choices wait for the maintainer's approval.** The session activity indicator is the v0.2 headline (ARCHITECTURE §14).
+Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); v0.1.1 is built and committed locally (below; two commits), not pushed or tagged. Its spec changes and choices are approved (2026-11-26) except one rule added with the allocation by recency.** The session activity indicator is the v0.2 headline (ARCHITECTURE §14).
 
 ---
 
@@ -214,7 +214,7 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
 ## v0.1.1 — maintenance release (built 2026-11-26; local commit, not pushed, not tagged)
 
 No new features. What was run is in ARCHITECTURE.md §13i; the spec changes are the last rows of REQUIREMENTS.md
-Appendix A ("v0.1.1, needs approval").
+Appendix A (approved on 2026-11-26, one new row "v0.1.1, needs approval").
 
 - [x] Session titles on cards and table rows are rendered so that they cannot be mistaken for a status: quoted
   and in italics, with a tooltip (and screen-reader text) that says "Session title". Seen in real use: an AI
@@ -224,7 +224,14 @@ Appendix A ("v0.1.1, needs approval").
   on Ubuntu 24.04 (limits in the cgroup, `oom-kill` and restart below the limit's need, a normal run under it);
   documented with how to override it (docs/service.md, docs/troubleshooting.md)
 - [x] A limit on ignore rules across all projects (20,000), next to the limits per file and per project; files
-  beyond it are skipped and counted; first come, first served (`tree::IgnoreBudget`)
+  beyond it are skipped and counted. **Allocated by recency** (maintainer decision, 2026-11-26): the most recently
+  active projects keep their rules, as a function of the projects alone (last activity, path between equals),
+  not of the order of their walks; re-established after walks and at every scan, giving up before taking
+  (`tree::RuleStore`, `Tracker::rebalance_rules`)
+- [x] **Compiled ignore rules are cached** (maintainer decision, 2026-11-26): per ignore file, reused while its
+  device, inode, size and modification time are unchanged, dropped with the project. Repeated scans of the
+  worst-case fixture keep memory flat in both builds (a test in `tests/process.rs`, run for the glibc and the
+  musl target; the 20,000-rule measurement in docs/benchmarks.md). Before: a glibc build reached 1.66 GiB
 - [x] Review items **I3** (WebSocket: revocation first, 5 s send timeout), **I7** (the WAL truncation's result
   is checked; a failed one is retried), **I8** (a session listing cut off at its limit removes nothing), **I6**
   (`PUT /settings` refuses broad roots and home as the session directory)
@@ -233,14 +240,22 @@ Appendix A ("v0.1.1, needs approval").
   `tests/service.rs`) are written by a child shell (`synth::write_executable`)
 - [x] Version 0.1.1; CHANGELOG; fmt / clippy / test (`CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_LANDLOCK_ABI=8
   CCWM_REQUIRE_INOTIFY=1`) / cargo deny / gitleaks green; docs; one local commit
-- [ ] README: the request's item was an unfilled placeholder ("list anything confusing you found installing
-  from the release"); nothing was changed for it (only the version in the install commands and the status line)
-- [ ] Maintainer: approve or change the spec changes and the choices (ARCHITECTURE.md §14: 20,000 rules, 2G,
-  `MemorySwapMax=0`, the 5 s send timeout, `CCWM_REQUIRE_LANDLOCK_ABI`)
+- [x] README: no changes wanted for now (maintainer, 2026-11-26); only the version in the install commands and
+  the status line changed
+- [x] Maintainer's decisions (2026-11-26): every "v0.1.1, needs approval" row approved; `MemorySwapMax=0`
+  approved; `MemoryMax=2G` approved for now; the 20,000-rule limit approved, to be allocated by recency; the
+  memory finding to be fixed in v0.1.1 with a rule cache; no README changes
+- [ ] Maintainer: approve or change the one rule added with the allocation by recency — a walk of a project
+  that lacks ignore rules because of the limit across projects does not move a known activity time
+  (REQUIREMENTS.md §5.2, Appendix A; why: ARCHITECTURE.md §7a "Ignore rules")
 - [ ] Maintainer: push, CI, tag, the release workflow (docs/release-checklist.md)
-- [ ] Found, not fixed (outside the list; proposal in ARCHITECTURE.md §14): in polled mode every scan compiles
-  every project's ignore rules again, and a glibc build keeps the freed memory (1.66 GiB measured at the limit).
-  Proposed: reuse the compiled rules of an ignore file whose content did not change
+
+After v0.1.1:
+
+- [ ] **Tighten `MemoryMax=`** (2G is approved for now). With the rule cache the worst measured case is the
+  kept rules alone (344 MiB in a glibc build, 395 MiB with the release binary, flat over repeated scans),
+  no longer 0.8–1.7 GiB. Choose the lower value from a new measurement that also covers what is not in the
+  benchmarks: `git status` children on very large repositories, and `claude --version`
 
 ---
 

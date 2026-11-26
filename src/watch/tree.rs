@@ -33,99 +33,37 @@ pub const MAX_GITIGNORE_TOTAL_BYTES: u64 = 1024 * 1024;
 /// 1 MiB of memory per KiB of file. 5,000 such rules are about 75 MiB and 1.2 s; literal rules
 /// cost almost nothing.
 pub const MAX_GITIGNORE_PATTERNS: usize = 5_000;
-/// All ignore rules of **all** projects together ([`IgnoreBudget`]). The limits above bound one
+/// All ignore rules of **all** projects together ([`RuleStore`]). The limits above bound one
 /// project, and a directory tree chooses how many projects it holds (each needs only a marker):
-/// without this limit, memory grew with their number. A file that would take the daemon past it
-/// is skipped and counted like any other, whichever project it belongs to; projects walked
-/// earlier keep their rules. At about 15 KiB per rule that needs a regular expression this is
-/// about 300 MiB in the worst case (measured: docs/benchmarks.md); ordinary rules cost a small
-/// fraction of that.
+/// without this limit, memory grew with their number. The rules go to the most recently active
+/// projects first; a file that does not fit any more is skipped and counted like any other. At
+/// 17-20 KiB per rule that needs a regular expression this is 350-400 MiB in the worst case
+/// (measured: docs/benchmarks.md); ordinary rules cost a small fraction of that.
 pub const MAX_GITIGNORE_PATTERNS_TOTAL: usize = 20_000;
 
-/// How many ignore rules each project keeps, so that all projects together stay within a limit
-/// ([`MAX_GITIGNORE_PATTERNS_TOTAL`]). Shared by everything that walks project trees.
-///
-/// A full walk of a project [`reserve`](Self::reserve)s what the project may keep at most,
-/// walks, and then [`settle`](Self::settle)s for what it kept. The reservation is what makes the
-/// limit hold when two projects are walked at the same time: the second one sees the first one's
-/// reservation, not its still-empty result. The count is of rules kept for later (a project's
-/// rules stay in memory while it is tracked); rules of a walk in progress that replace a
-/// project's current ones exist next to them until the walk's result is taken over.
-#[derive(Debug)]
-pub struct IgnoreBudget {
-    limit: usize,
-    /// Project root -> the rules it keeps (during its full walk: may keep).
-    kept: Mutex<HashMap<PathBuf, usize>>,
+/// What identifies the content of an ignore file without reading it: a file whose device, inode,
+/// size and modification time are unchanged is taken to hold the same rules, and its compiled
+/// rules are reused. (A rewrite that changes none of the four is not seen until the file changes
+/// again or the daemon restarts; session files are followed by the same four values.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    /// Seconds and nanoseconds.
+    mtime: (i64, i64),
 }
 
-impl Default for IgnoreBudget {
-    fn default() -> Self {
-        Self::new(MAX_GITIGNORE_PATTERNS_TOTAL)
-    }
-}
-
-impl IgnoreBudget {
-    /// A budget of `limit` rules for all projects together.
-    pub fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            kept: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn with<T>(&self, f: impl FnOnce(&mut HashMap<PathBuf, usize>) -> T) -> T {
-        // A panic while the lock was held leaves numbers that are still usable.
-        f(&mut self.kept.lock().unwrap_or_else(|e| e.into_inner()))
-    }
-
-    fn room_in(&self, kept: &HashMap<PathBuf, usize>, root: &Path) -> usize {
-        let others: usize = kept
-            .iter()
-            .filter(|(r, _)| r.as_path() != root)
-            .map(|(_, n)| n)
-            .sum();
-        MAX_GITIGNORE_PATTERNS.min(self.limit.saturating_sub(others))
-    }
-
-    /// The rules project `root` may hold: what the other projects leave of the limit, at most
-    /// [`MAX_GITIGNORE_PATTERNS`]. For a walk that keeps nothing (a subtree walk, which starts
-    /// from the project's rules).
-    pub fn room(&self, root: &Path) -> usize {
-        self.with(|kept| self.room_in(kept, root))
-    }
-
-    /// Start a full walk of project `root`: [`room`](Self::room), reserved for `root` until
-    /// [`settle`](Self::settle) (the project's previous count no longer applies: a full walk
-    /// replaces its rules).
-    pub fn reserve(&self, root: &Path) -> usize {
-        self.with(|kept| {
-            let room = self.room_in(kept, root);
-            Self::set(kept, root, room);
-            room
+impl FileId {
+    fn of(file: &std::fs::File) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let md = file.metadata().ok()?;
+        Some(Self {
+            dev: md.dev(),
+            ino: md.ino(),
+            size: md.size(),
+            mtime: (md.mtime(), md.mtime_nsec()),
         })
-    }
-
-    /// The full walk of `root` kept `rules` rules (0: the project has none, or the walk failed).
-    pub fn settle(&self, root: &Path, rules: usize) {
-        self.with(|kept| Self::set(kept, root, rules));
-    }
-
-    fn set(kept: &mut HashMap<PathBuf, usize>, root: &Path, rules: usize) {
-        if rules == 0 {
-            kept.remove(root);
-        } else {
-            kept.insert(root.to_path_buf(), rules);
-        }
-    }
-
-    /// Forget the projects whose root `keep` rejects (no longer tracked).
-    pub fn retain(&self, keep: impl Fn(&Path) -> bool) {
-        self.with(|kept| kept.retain(|root, _| keep(root)));
-    }
-
-    /// Rules counted for all projects together (kept or reserved); never above the limit.
-    pub fn total(&self) -> usize {
-        self.with(|kept| kept.values().sum())
     }
 }
 
@@ -133,14 +71,18 @@ impl IgnoreBudget {
 /// `.gitignore` files from the repository's root down, deeper ones overriding shallower ones.
 /// Approximates Git (documented differences: no `core.excludesFile`; rules above the
 /// repository root never apply).
+///
+/// The compiled rules of each file are shared (`Arc`): a later walk of the project takes over
+/// the layers of files that did not change instead of compiling them again, and a copy of the
+/// rules costs one pointer per file.
 #[derive(Debug, Default, Clone)]
 pub struct GitIgnore {
     /// Sorted by rank, lowest priority first. Only layers whose directory is an ancestor of a
     /// path apply to it, and those are ordered by depth, so one sorted list serves every path.
-    layers: Vec<Layer>,
+    layers: Vec<Arc<Layer>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Layer {
     dir: PathBuf,
     /// (depth of `dir`, 0 for `info/exclude` / 1 for `.gitignore`).
@@ -148,13 +90,68 @@ struct Layer {
     rules: Gitignore,
     /// Size of the file the rules came from (counted against [`MAX_GITIGNORE_TOTAL_BYTES`]).
     bytes: u64,
-    /// Number of rules (counted against [`MAX_GITIGNORE_PATTERNS`]).
-    patterns: usize,
+    /// The file's rule lines (every line that can hold a rule): what the limits on rules count,
+    /// before anything is compiled.
+    rule_lines: usize,
+    /// The file the rules were read from (`None`: rules given as text, never reused).
+    file: Option<FileId>,
+}
+
+impl Layer {
+    fn is(&self, dir: &Path, rank: (usize, u8)) -> bool {
+        self.dir == dir && self.rank == rank
+    }
 }
 
 /// See [`Layer::rank`].
 fn rank(dir: &Path, exclude_file: bool) -> (usize, u8) {
     (dir.components().count(), u8::from(!exclude_file))
+}
+
+/// Every line that can hold a rule (not blank, not a comment): counted before compiling.
+fn rule_lines(text: &[u8]) -> usize {
+    text.split(|b| *b == b'\n')
+        .filter(|line| !line.starts_with(b"#") && !line.trim_ascii().is_empty())
+        .count()
+}
+
+/// Why an ignore file was skipped (its rules do not apply).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skipped {
+    /// A limit of the file or of its project ([`MAX_GITIGNORE_BYTES`],
+    /// [`MAX_GITIGNORE_TOTAL_BYTES`], [`MAX_GITIGNORE_PATTERNS`]).
+    ByProject,
+    /// Only the walk's allowance ([`TreeOptions::max_patterns`], the limit across projects):
+    /// the project's own limits would have let it in.
+    ByAllowance,
+}
+
+/// What one walk carries from ignore file to ignore file, besides the rules collected so far.
+struct Admission<'a> {
+    /// Rules the project may keep ([`TreeOptions::max_patterns`]).
+    allowance: usize,
+    /// The files this walk skipped only because of `allowance`. They still count towards the
+    /// project's own limits, so that those decide the same way whatever the allowance is, and
+    /// the number of rules the project wants does not depend on what it was allowed.
+    denied_bytes: u64,
+    denied_rules: usize,
+    /// The layers of the project's previous rules ([`TreeOptions::reuse`]) by location.
+    reuse: HashMap<(&'a Path, (usize, u8)), &'a Arc<Layer>>,
+}
+
+impl<'a> Admission<'a> {
+    fn new(o: &TreeOptions<'a>) -> Self {
+        let layers = o.reuse.map_or(&[][..], |g| &g.layers[..]);
+        Self {
+            allowance: o.max_patterns,
+            denied_bytes: 0,
+            denied_rules: 0,
+            reuse: layers
+                .iter()
+                .map(|l| ((l.dir.as_path(), l.rank), l))
+                .collect(),
+        }
+    }
 }
 
 impl GitIgnore {
@@ -172,83 +169,329 @@ impl GitIgnore {
         false
     }
 
-    /// Add (or replace) the rules of `dir`'s `.gitignore` (or `info/exclude` when
-    /// `exclude_file`).
-    fn add(&mut self, dir: &Path, exclude_file: bool, text: &[u8]) {
-        let rank = rank(dir, exclude_file);
-        self.layers.retain(|l| !(l.dir == dir && l.rank == rank));
+    /// Compile `text` as the rules of `dir`'s `.gitignore` (or `info/exclude` when
+    /// `exclude_file`). `None` if it holds no usable rule.
+    fn compile(
+        dir: &Path,
+        exclude_file: bool,
+        text: &[u8],
+        file: Option<FileId>,
+    ) -> Option<Arc<Layer>> {
         let mut b = GitignoreBuilder::new(dir);
         for line in String::from_utf8_lossy(text).lines() {
             let _ = b.add_line(None, line); // an invalid pattern is skipped, like Git does
         }
-        if let Ok(rules) = b.build() {
-            let patterns =
-                usize::try_from(rules.num_ignores() + rules.num_whitelists()).unwrap_or(usize::MAX);
-            if patterns > 0 {
-                let at = self.layers.partition_point(|l| l.rank <= rank);
-                self.layers.insert(
-                    at,
-                    Layer {
-                        dir: dir.to_path_buf(),
-                        rank,
-                        rules,
-                        bytes: u64::try_from(text.len()).unwrap_or(u64::MAX),
-                        patterns,
-                    },
-                );
-            }
+        let rules = b.build().ok()?;
+        (rules.num_ignores() + rules.num_whitelists() > 0).then(|| {
+            Arc::new(Layer {
+                dir: dir.to_path_buf(),
+                rank: rank(dir, exclude_file),
+                rules,
+                bytes: u64::try_from(text.len()).unwrap_or(u64::MAX),
+                rule_lines: rule_lines(text),
+                file,
+            })
+        })
+    }
+
+    /// Put `layer` in the place of the layer of its location (if any).
+    fn set(&mut self, dir: &Path, rank: (usize, u8), layer: Option<Arc<Layer>>) {
+        self.layers.retain(|l| !l.is(dir, rank));
+        if let Some(layer) = layer {
+            let at = self.layers.partition_point(|l| l.rank <= rank);
+            self.layers.insert(at, layer);
         }
     }
 
-    /// Number of rules in all layers.
+    /// Add (or replace) the rules of `dir`'s `.gitignore` (or `info/exclude` when
+    /// `exclude_file`), given as text.
+    #[cfg(test)]
+    fn add(&mut self, dir: &Path, exclude_file: bool, text: &[u8]) {
+        let layer = Self::compile(dir, exclude_file, text, None);
+        self.set(dir, rank(dir, exclude_file), layer);
+    }
+
+    /// Number of rules in all layers, as the limits count them (rule lines).
     pub fn patterns(&self) -> usize {
-        self.layers.iter().map(|l| l.patterns).sum()
+        self.layers.iter().map(|l| l.rule_lines).sum()
     }
 
     /// Read `name` through `handle` (the descriptor of the directory that holds it) as the
     /// `.gitignore` of `dir` (or its `info/exclude` when `exclude_file`) and add its rules.
-    /// Returns `true` when the file was **skipped**: it is larger than [`MAX_GITIGNORE_BYTES`],
-    /// or it would take the project past [`MAX_GITIGNORE_TOTAL_BYTES`] or past `max_patterns`
-    /// rules ([`TreeOptions::max_patterns`]). A skipped file is not read beyond the limit,
-    /// nothing of it is compiled, and none of its rules apply (not even its first ones).
+    ///
+    /// `Some` when the file was **skipped**: it is larger than [`MAX_GITIGNORE_BYTES`], or it
+    /// would take the project past [`MAX_GITIGNORE_TOTAL_BYTES`] or [`MAX_GITIGNORE_PATTERNS`],
+    /// or past the walk's allowance. A skipped file is not read beyond the limit, nothing of it
+    /// is compiled, and none of its rules apply (not even its first ones).
+    ///
+    /// A file that is unchanged ([`FileId`]) since its rules were compiled — for this project's
+    /// current rules, or for the ones in `adm.reuse` — is not read at all: its layer is taken
+    /// over, and the limits decide from the numbers recorded with it, exactly as for a fresh read.
     fn load(
         &mut self,
         dir: &Path,
         exclude_file: bool,
         handle: &DirHandle,
         name: &str,
-        max_patterns: usize,
-    ) -> bool {
+        adm: &mut Admission,
+    ) -> Option<Skipped> {
+        use std::io::Read;
         let rank = rank(dir, exclude_file);
-        let replaces = |l: &Layer| l.dir == dir && l.rank == rank;
-        // The layer this file replaces does not count against the project's totals.
-        let (bytes, patterns) = self
+        // Absent, or not a readable regular file: nothing to skip.
+        let file = handle.open_regular(OsStr::new(name))?;
+        let id = FileId::of(&file)?;
+        let known = self
             .layers
             .iter()
-            .filter(|l| !replaces(l))
-            .fold((0u64, 0usize), |(b, p), l| (b + l.bytes, p + l.patterns));
-        let limit = MAX_GITIGNORE_BYTES.min(MAX_GITIGNORE_TOTAL_BYTES.saturating_sub(bytes));
-        // One byte past the limit shows that the file is too large without reading the rest.
-        let Some((text, _)) = handle.read_regular(OsStr::new(name), false, limit + 1) else {
-            return false; // absent or not a readable regular file: nothing to skip
+            .find(|l| l.is(dir, rank))
+            .or_else(|| adm.reuse.get(&(dir, rank)).copied())
+            .filter(|l| l.file == Some(id))
+            .cloned();
+        // The layer this file replaces does not count against the project's totals.
+        let (kept_bytes, kept_rules) = self
+            .layers
+            .iter()
+            .filter(|l| !l.is(dir, rank))
+            .fold((0u64, 0usize), |(b, r), l| (b + l.bytes, r + l.rule_lines));
+        let limit = MAX_GITIGNORE_BYTES
+            .min(MAX_GITIGNORE_TOTAL_BYTES.saturating_sub(kept_bytes + adm.denied_bytes));
+        let rules_left = MAX_GITIGNORE_PATTERNS.saturating_sub(kept_rules + adm.denied_rules);
+        let (bytes, rule_lines, text) = match &known {
+            Some(l) => (l.bytes, l.rule_lines, None),
+            // Too large by its size alone: not read.
+            None if id.size > limit => (id.size, 0, None),
+            None => {
+                // One byte past the limit shows that a file that grew meanwhile is too large.
+                let mut text = Vec::new();
+                file.take(limit + 1).read_to_end(&mut text).ok()?;
+                let bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+                (bytes, rule_lines(&text), Some(text))
+            }
         };
-        // Counted before anything is compiled: every line that can hold a rule.
-        let rule_lines = text
-            .split(|b| *b == b'\n')
-            .filter(|line| !line.starts_with(b"#") && !line.trim_ascii().is_empty())
-            .count();
-        if u64::try_from(text.len()).unwrap_or(u64::MAX) > limit
-            || rule_lines > max_patterns.saturating_sub(patterns)
-        {
-            self.layers.retain(|l| !replaces(l));
-            return true;
+        if bytes > limit || rule_lines > rules_left {
+            self.set(dir, rank, None);
+            return Some(Skipped::ByProject);
         }
-        self.add(dir, exclude_file, &text);
-        false
+        if rule_lines > adm.allowance.saturating_sub(kept_rules) {
+            adm.denied_bytes += bytes;
+            adm.denied_rules += rule_lines;
+            self.set(dir, rank, None);
+            return Some(Skipped::ByAllowance);
+        }
+        let layer = known.or_else(|| Self::compile(dir, exclude_file, &text?, Some(id)));
+        self.set(dir, rank, layer);
+        None
     }
 
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
+    }
+}
+
+/// The ignore rules that the monitored projects keep, shared by everything that walks project
+/// trees. It does two things:
+///
+/// - **The limit across projects** ([`MAX_GITIGNORE_PATTERNS_TOTAL`]). Every walk gets its
+///   allowance here, and all projects together never hold more than the limit: a full walk
+///   [`begin`](Self::begin)s with what the others leave (reserved for it until it
+///   [`settle`](Self::settle)s, so two walks at once cannot both take the last room).
+///   **Who** holds the rules when they do not fit all is decided by recency, not by who came
+///   first: [`rebalance`](Self::rebalance) names the projects to walk again so that the most
+///   recently active ones have theirs. That outcome is a function of the projects alone (their
+///   last activity, their path as the tie-break, the rules they want), not of when they were
+///   walked.
+/// - **Reuse.** It keeps each project's rules of its last full walk, and hands them to the next
+///   one, which takes over the compiled rules of every ignore file that did not change
+///   ([`FileId`]). Without it every scan of a project without watches compiled all its rules
+///   again (memory several times the kept size in a glibc build). A project that is no longer
+///   monitored is dropped ([`retain`](Self::retain)), and with it its rules.
+#[derive(Debug)]
+pub struct RuleStore {
+    limit: usize,
+    projects: Mutex<HashMap<PathBuf, Kept>>,
+}
+
+/// What one project keeps.
+#[derive(Debug)]
+struct Kept {
+    /// The project's last activity (seconds): more recent comes first. `None` (unknown) comes
+    /// last.
+    recency: Option<i64>,
+    /// The rules of its last full walk.
+    rules: Arc<GitIgnore>,
+    /// The rules it would keep if only its own limits applied ([`Tree::ignore_rules_wanted`]).
+    wanted: usize,
+    /// The allowance of its last full walk.
+    walked_with: usize,
+    /// Set while a full walk runs: the walk's allowance, counted instead of `rules`.
+    reserved: Option<usize>,
+}
+
+impl Kept {
+    fn held(&self) -> usize {
+        self.reserved.unwrap_or_else(|| self.rules.patterns())
+    }
+}
+
+/// What a full walk gets from [`RuleStore::begin`].
+#[derive(Debug)]
+pub struct Grant {
+    /// For [`TreeOptions::max_patterns`].
+    pub max_patterns: usize,
+    /// For [`TreeOptions::reuse`]: the project's rules of its last full walk.
+    pub reuse: Option<Arc<GitIgnore>>,
+}
+
+impl Default for RuleStore {
+    fn default() -> Self {
+        Self::new(MAX_GITIGNORE_PATTERNS_TOTAL)
+    }
+}
+
+impl RuleStore {
+    /// A store that lets all projects together keep `limit` rules.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            projects: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut HashMap<PathBuf, Kept>) -> T) -> T {
+        // A panic while the lock was held leaves numbers that are still usable.
+        f(&mut self.projects.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// What the other projects leave of the limit, at most [`MAX_GITIGNORE_PATTERNS`].
+    fn room_in(&self, projects: &HashMap<PathBuf, Kept>, root: &Path) -> usize {
+        let others: usize = projects
+            .iter()
+            .filter(|(r, _)| r.as_path() != root)
+            .map(|(_, k)| k.held())
+            .sum();
+        MAX_GITIGNORE_PATTERNS.min(self.limit.saturating_sub(others))
+    }
+
+    /// The rules project `root` may hold in a walk that keeps nothing (a subtree walk, which
+    /// starts from the project's rules).
+    pub fn room(&self, root: &Path) -> usize {
+        self.with(|projects| self.room_in(projects, root))
+    }
+
+    /// Start a full walk of project `root`, last active at `recency`: what it may keep — what
+    /// the other projects leave of the limit, and no more than `at_most` — and its previous
+    /// rules to reuse. The allowance stays reserved for it until [`settle`](Self::settle).
+    pub fn begin(&self, root: &Path, recency: Option<i64>, at_most: usize) -> Grant {
+        self.with(|projects| {
+            let max_patterns = at_most.min(self.room_in(projects, root));
+            let kept = projects.entry(root.to_path_buf()).or_insert_with(|| Kept {
+                recency,
+                rules: Arc::default(),
+                wanted: 0,
+                walked_with: 0,
+                reserved: None,
+            });
+            kept.recency = recency;
+            kept.reserved = Some(max_patterns);
+            Grant {
+                max_patterns,
+                reuse: (!kept.rules.is_empty()).then(|| Arc::clone(&kept.rules)),
+            }
+        })
+    }
+
+    /// The full walk of `root` that [`begin`](Self::begin) started is over; `tree` is its result
+    /// (`None`: the walk failed, the project keeps nothing).
+    pub fn settle(&self, root: &Path, tree: Option<&Tree>) {
+        self.with(|projects| {
+            let walked = projects.get_mut(root).zip(tree);
+            match walked {
+                // A project that wants no rules has no part in the limit.
+                Some((kept, tree)) if tree.ignore_rules_wanted > 0 => {
+                    kept.walked_with = kept.reserved.take().unwrap_or(0);
+                    kept.rules = Arc::clone(&tree.ignore);
+                    kept.wanted = tree.ignore_rules_wanted;
+                }
+                _ => {
+                    projects.remove(root);
+                }
+            }
+        });
+    }
+
+    /// Forget the projects whose root `keep` rejects (no longer monitored), and their rules.
+    pub fn retain(&self, keep: impl Fn(&Path) -> bool) {
+        self.with(|projects| projects.retain(|root, _| keep(root)));
+    }
+
+    /// The last activity of project `root` is now `recency` (its place in the order).
+    pub fn set_recency(&self, root: &Path, recency: Option<i64>) {
+        self.with(|projects| {
+            if let Some(kept) = projects.get_mut(root) {
+                kept.recency = recency;
+            }
+        });
+    }
+
+    /// The projects whose rules are not what the order of recency gives them, each with the
+    /// allowance to walk it again with ([`begin`](Self::begin)'s `at_most`), in the order to do
+    /// it: first the projects that hold more than their share (least recent first), then the
+    /// ones that may hold more than they were allowed (most recent first). Giving up before
+    /// taking keeps all projects together within the limit throughout. Empty when every project
+    /// has the rules it wants, which is the normal state.
+    ///
+    /// The shares: most recently active first (unknown last; the path decides between equals),
+    /// each project gets all the rules it wants while they fit in what is left of the limit;
+    /// the first one that does not fit completely gets what is left, the ones after it nothing.
+    pub fn rebalance(&self) -> Vec<(PathBuf, usize)> {
+        self.with(|projects| {
+            let mut order: Vec<(&PathBuf, &Kept)> = projects.iter().collect();
+            // Known before unknown, later before earlier, then by path.
+            order.sort_by_key(|(root, kept)| (std::cmp::Reverse(kept.recency), *root));
+            let mut left = self.limit;
+            let (mut give_up, mut take) = (Vec::new(), Vec::new());
+            for (root, kept) in order {
+                let share = kept.wanted.min(left);
+                left = if share < kept.wanted { 0 } else { left - share };
+                if kept.reserved.is_some() {
+                    continue; // being walked right now: it settles first
+                }
+                let has = kept.rules.patterns();
+                if has > share {
+                    give_up.push((root.clone(), share));
+                } else if has < kept.wanted && share > kept.walked_with {
+                    take.push((root.clone(), share));
+                }
+            }
+            give_up.reverse();
+            give_up.extend(take);
+            give_up
+        })
+    }
+
+    /// Some project does not have all the rules it wants: the only state in which
+    /// [`rebalance`](Self::rebalance) can have anything to do.
+    pub fn contended(&self) -> bool {
+        self.with(|projects| projects.values().any(|k| k.rules.patterns() < k.wanted))
+    }
+
+    /// Project `root` does not have all the rules it wants.
+    pub fn lacks_rules(&self, root: &Path) -> bool {
+        self.with(|projects| {
+            projects
+                .get(root)
+                .is_some_and(|k| k.rules.patterns() < k.wanted)
+        })
+    }
+
+    /// Rules project `root` keeps (0: none, or not a project of the store).
+    pub fn kept(&self, root: &Path) -> usize {
+        self.with(|projects| projects.get(root).map_or(0, |k| k.rules.patterns()))
+    }
+
+    /// Rules counted for all projects together (kept or reserved); never above the limit.
+    pub fn total(&self) -> usize {
+        self.with(|projects| projects.values().map(Kept::held).sum())
     }
 }
 
@@ -291,9 +534,12 @@ pub struct TreeOptions<'a> {
     /// File times after this are clamped to it (a future mtime must not pin a project on top).
     pub now: i64,
     pub max_entries: usize,
-    /// Ignore rules the project may hold: [`MAX_GITIGNORE_PATTERNS`], or less when the other
-    /// projects leave less of the limit across projects ([`IgnoreBudget`]).
+    /// Ignore rules the project may hold: [`MAX_GITIGNORE_PATTERNS`], or less when the limit
+    /// across projects leaves it less ([`RuleStore`]).
     pub max_patterns: usize,
+    /// The rules the project has from its last full walk: the compiled rules of every ignore
+    /// file that did not change since are taken over instead of being compiled again.
+    pub reuse: Option<&'a GitIgnore>,
 }
 
 #[derive(Debug)]
@@ -314,6 +560,10 @@ pub struct Tree {
     /// [`MAX_GITIGNORE_TOTAL_BYTES`], [`MAX_GITIGNORE_PATTERNS`],
     /// [`MAX_GITIGNORE_PATTERNS_TOTAL`]): their rules do not apply.
     pub ignore_files_skipped: u64,
+    /// The rules the project would keep if only its own limits applied: the ones it keeps plus
+    /// those of the files that only the walk's allowance kept out. The same whatever the
+    /// allowance was (meaningful for a full walk).
+    pub ignore_rules_wanted: usize,
 }
 
 struct Frame {
@@ -356,12 +606,13 @@ pub fn walk_from(
         truncated: false,
         unreadable: 0,
         ignore_files_skipped: 0,
+        ignore_rules_wanted: 0,
     };
     let mut ignore = base.clone();
+    let mut adm = Admission::new(o);
     if o.git_aware && start_depth == 0 {
         if let Some(repo) = o.repo_root.filter(|r| *r != root && root.starts_with(r)) {
-            tree.ignore_files_skipped +=
-                add_repository_layers(&mut ignore, repo, root, o.max_patterns);
+            tree.ignore_files_skipped += add_repository_layers(&mut ignore, repo, root, &mut adm);
         }
     }
     let mut entries_seen = 0usize;
@@ -391,11 +642,14 @@ pub fn walk_from(
         if o.git_aware {
             if frame.depth == 0 && o.repo_root.is_none_or(|r| r == root) {
                 tree.ignore_files_skipped +=
-                    load_info_exclude(&mut ignore, &frame.path, &dir, o.max_patterns);
+                    load_info_exclude(&mut ignore, &frame.path, &dir, &mut adm);
             }
             if entries.iter().any(|e| e.name == ".gitignore") {
-                tree.ignore_files_skipped +=
-                    u64::from(ignore.load(&frame.path, false, &dir, ".gitignore", o.max_patterns));
+                tree.ignore_files_skipped += u64::from(
+                    ignore
+                        .load(&frame.path, false, &dir, ".gitignore", &mut adm)
+                        .is_some(),
+                );
             }
         }
         let mut subdirs = Vec::new();
@@ -447,6 +701,7 @@ pub fn walk_from(
             });
         }
     }
+    tree.ignore_rules_wanted = ignore.patterns() + adm.denied_rules;
     tree.ignore = Arc::new(ignore);
     Ok(tree)
 }
@@ -459,7 +714,7 @@ fn add_repository_layers(
     ignore: &mut GitIgnore,
     repo: &Path,
     root: &Path,
-    max_patterns: usize,
+    adm: &mut Admission,
 ) -> u64 {
     let Ok(rel) = root.strip_prefix(repo) else {
         return 0;
@@ -478,9 +733,9 @@ fn add_repository_layers(
             continue;
         };
         if i == 0 {
-            skipped += load_info_exclude(ignore, d, &h, max_patterns);
+            skipped += load_info_exclude(ignore, d, &h, adm);
         }
-        skipped += u64::from(ignore.load(d, false, &h, ".gitignore", max_patterns));
+        skipped += u64::from(ignore.load(d, false, &h, ".gitignore", adm).is_some());
     }
     skipped
 }
@@ -491,13 +746,13 @@ fn load_info_exclude(
     ignore: &mut GitIgnore,
     path: &Path,
     dir: &DirHandle,
-    max_patterns: usize,
+    adm: &mut Admission,
 ) -> u64 {
     let info = dir
         .open_child_dir(OsStr::new(".git"))
         .and_then(|git| git.open_child_dir(OsStr::new("info")));
     info.map_or(0, |info| {
-        u64::from(ignore.load(path, true, &info, "exclude", max_patterns))
+        u64::from(ignore.load(path, true, &info, "exclude", adm).is_some())
     })
 }
 
@@ -517,6 +772,7 @@ mod tests {
             now: i64::MAX,
             max_entries: MAX_ENTRIES,
             max_patterns: MAX_GITIGNORE_PATTERNS,
+            reuse: None,
         }
     }
 
@@ -931,8 +1187,8 @@ mod tests {
         let o = opts(&f.ex, &none, true);
         let t = walk(r, &o).unwrap();
         assert_eq!(t.ignore_files_skipped, 2, "four files fill the budget");
-        let kept: usize = t.ignore.layers.iter().map(|l| l.patterns).sum();
-        assert_eq!(kept, MAX_GITIGNORE_PATTERNS);
+        assert_eq!(t.ignore.patterns(), MAX_GITIGNORE_PATTERNS);
+        assert_eq!(t.ignore_rules_wanted, MAX_GITIGNORE_PATTERNS);
         assert!(t.ignore.is_ignored(&r.join("d3/rule7"), false));
         assert!(!t.ignore.is_ignored(&r.join("d4/rule7"), false));
 
@@ -943,13 +1199,15 @@ mod tests {
         let mut gi = GitIgnore::default();
         fs::write(r.join("d5/.gitignore"), &over).unwrap();
         let d5 = DirHandle::open_root(&r.join("d5")).unwrap();
-        let limit = MAX_GITIGNORE_PATTERNS;
-        assert!(gi.load(&r.join("d5"), false, &d5, ".gitignore", limit));
+        let mut adm = Admission::new(&o);
+        let skipped = gi.load(&r.join("d5"), false, &d5, ".gitignore", &mut adm);
+        assert_eq!(skipped, Some(Skipped::ByProject));
         assert!(gi.is_empty());
         let last_line = over.trim_end().rfind('\n').unwrap();
         fs::write(r.join("d5/.gitignore"), &over[..=last_line]).unwrap();
-        assert!(!gi.load(&r.join("d5"), false, &d5, ".gitignore", limit));
-        assert_eq!(gi.layers[0].patterns, MAX_GITIGNORE_PATTERNS);
+        let skipped = gi.load(&r.join("d5"), false, &d5, ".gitignore", &mut adm);
+        assert_eq!(skipped, None);
+        assert_eq!(gi.layers[0].rule_lines, MAX_GITIGNORE_PATTERNS);
     }
 
     /// The limit across projects reaches a walk as the number of rules the project may hold
@@ -994,49 +1252,347 @@ mod tests {
         assert_eq!((sub.ignore_files_skipped, sub.ignore.patterns()), (0, 7));
     }
 
+    /// The number of rules a project wants (what the limit across projects is shared by) does
+    /// not depend on what the walk was allowed, and neither do the project's own limits: files
+    /// that only the allowance kept out still count towards them.
     #[test]
-    fn the_budget_gives_each_project_what_the_others_leave_of_the_limit() {
+    fn what_a_project_wants_does_not_depend_on_what_it_was_allowed() {
+        let f = fx();
+        let r = &f.root;
+        fs::create_dir(r.join(".git")).unwrap();
+        let per_file = MAX_GITIGNORE_PATTERNS / 4;
+        let text: String = (0..per_file).map(|i| format!("rule{i}\n")).collect();
+        for d in ["d0", "d1", "d2", "d3", "d4", "d5"] {
+            fs::create_dir(r.join(d)).unwrap();
+            fs::write(r.join(d).join(".gitignore"), &text).unwrap();
+        }
+        let none = HashSet::new();
+        let mut o = opts(&f.ex, &none, true);
+        for (allowance, kept, skipped) in [
+            (MAX_GITIGNORE_PATTERNS, 4 * per_file, 2),
+            (2 * per_file + 1, 2 * per_file, 4),
+            (per_file - 1, 0, 6),
+            (0, 0, 6),
+        ] {
+            o.max_patterns = allowance;
+            let t = walk(r, &o).unwrap();
+            assert_eq!(t.ignore.patterns(), kept, "allowance {allowance}");
+            assert_eq!(t.ignore_files_skipped, skipped, "allowance {allowance}");
+            // Four files fill the project's own limit; d4 and d5 are over it in every case.
+            assert_eq!(t.ignore_rules_wanted, 4 * per_file, "allowance {allowance}");
+        }
+    }
+
+    /// Whether two sets of rules share the compiled rules of the ignore file in `dir`.
+    fn same_layer(a: &GitIgnore, b: &GitIgnore, dir: &Path, exclude_file: bool) -> bool {
+        let find = |g: &GitIgnore| {
+            g.layers
+                .iter()
+                .find(|l| l.is(dir, rank(dir, exclude_file)))
+                .cloned()
+        };
+        match (find(a), find(b)) {
+            (Some(a), Some(b)) => Arc::ptr_eq(&a, &b),
+            _ => false,
+        }
+    }
+
+    /// The rule cache: a walk that is given the project's previous rules takes over the
+    /// compiled rules of every ignore file whose device, inode, size and modification time are
+    /// unchanged, and compiles only what changed. Files that are gone lose their rules.
+    #[test]
+    fn a_later_walk_reuses_the_rules_of_unchanged_ignore_files_and_compiles_only_what_changed() {
+        let f = fx();
+        let r = &f.root;
+        fs::create_dir_all(r.join(".git/info")).unwrap();
+        fs::write(r.join(".git/info/exclude"), "excluded.txt\n").unwrap();
+        fs::write(r.join(".gitignore"), "*.log\n").unwrap();
+        for d in ["a", "b", "c"] {
+            fs::create_dir(r.join(d)).unwrap();
+            fs::write(r.join(d).join(".gitignore"), format!("{d}-first.tmp\n")).unwrap();
+        }
+        let none = HashSet::new();
+        let mut o = opts(&f.ex, &none, true);
+        let first = walk(r, &o).unwrap();
+        assert_eq!(first.ignore.layers.len(), 5);
+
+        // Without the previous rules everything is compiled again (the control).
+        let again = walk(r, &o).unwrap();
+        assert!(!same_layer(&first.ignore, &again.ignore, r, false));
+
+        // With them, nothing is: every layer is the same object.
+        o.reuse = Some(&first.ignore);
+        let second = walk(r, &o).unwrap();
+        assert_eq!(second.ignore.layers.len(), 5);
+        assert!(
+            same_layer(&first.ignore, &second.ignore, r, true),
+            "info/exclude"
+        );
+        for dir in [r.clone(), r.join("a"), r.join("b"), r.join("c")] {
+            assert!(
+                same_layer(&first.ignore, &second.ignore, &dir, false),
+                "{dir:?}"
+            );
+        }
+        assert_eq!(second.ignore_rules_wanted, first.ignore_rules_wanted);
+
+        // One file changes, one is deleted, one is new: only those differ.
+        fs::write(r.join("a/.gitignore"), "a-second-version.tmp\n").unwrap();
+        fs::remove_file(r.join("b/.gitignore")).unwrap();
+        fs::create_dir(r.join("d")).unwrap();
+        fs::write(r.join("d/.gitignore"), "d-first.tmp\n").unwrap();
+        let third = walk(r, &o).unwrap();
+        assert!(!same_layer(
+            &first.ignore,
+            &third.ignore,
+            &r.join("a"),
+            false
+        ));
+        assert!(third
+            .ignore
+            .is_ignored(&r.join("a/a-second-version.tmp"), false));
+        assert!(!third.ignore.is_ignored(&r.join("a/a-first.tmp"), false));
+        assert!(
+            !third.ignore.is_ignored(&r.join("b/b-first.tmp"), false),
+            "deleted"
+        );
+        assert!(
+            third.ignore.is_ignored(&r.join("d/d-first.tmp"), false),
+            "new"
+        );
+        assert!(same_layer(
+            &first.ignore,
+            &third.ignore,
+            &r.join("c"),
+            false
+        ));
+        assert!(same_layer(&first.ignore, &third.ignore, r, false));
+        assert_eq!(third.ignore.layers.len(), 5);
+    }
+
+    /// What "unchanged" means: the same device, inode, size **and** modification time. Any one
+    /// of them changing compiles the file again; a rewrite that changes none of them is not
+    /// seen (the documented limit of the cache).
+    #[test]
+    fn an_ignore_file_counts_as_changed_when_its_size_time_or_inode_changes() {
+        let f = fx();
+        let r = &f.root;
+        fs::create_dir(r.join(".git")).unwrap();
+        let file = r.join(".gitignore");
+        fs::write(&file, "aaa.tmp\n").unwrap();
+        set_mtime(&file, 1_000);
+        let none = HashSet::new();
+        let mut o = opts(&f.ex, &none, true);
+        let first = walk(r, &o).unwrap();
+        o.reuse = Some(&first.ignore);
+        let ignores = |t: &Tree, name: &str| t.ignore.is_ignored(&r.join(name), false);
+
+        // Same size, same time, same inode (rewritten in place): taken for unchanged.
+        fs::write(&file, "bbb.tmp\n").unwrap();
+        set_mtime(&file, 1_000);
+        let t = walk(r, &o).unwrap();
+        assert!(same_layer(&first.ignore, &t.ignore, r, false));
+        assert!(ignores(&t, "aaa.tmp") && !ignores(&t, "bbb.tmp"));
+        // The time alone.
+        set_mtime(&file, 2_000);
+        let t = walk(r, &o).unwrap();
+        assert!(!same_layer(&first.ignore, &t.ignore, r, false));
+        assert!(ignores(&t, "bbb.tmp") && !ignores(&t, "aaa.tmp"));
+        // The size alone (the time put back).
+        o.reuse = Some(&t.ignore);
+        let before = Arc::clone(&t.ignore);
+        fs::write(&file, "cccc.tmp\n").unwrap();
+        set_mtime(&file, 2_000);
+        let t = walk(r, &o).unwrap();
+        assert!(!same_layer(&before, &t.ignore, r, false));
+        assert!(ignores(&t, "cccc.tmp"));
+        // The inode alone: another file of the same size and time takes its name.
+        o.reuse = Some(&t.ignore);
+        let before = Arc::clone(&t.ignore);
+        let other = r.join("replacement");
+        fs::write(&other, "dddd.tmp\n").unwrap();
+        set_mtime(&other, 2_000);
+        fs::rename(&other, &file).unwrap();
+        let t = walk(r, &o).unwrap();
+        assert!(!same_layer(&before, &t.ignore, r, false));
+        assert!(ignores(&t, "dddd.tmp") && !ignores(&t, "cccc.tmp"));
+    }
+
+    /// One ignore file hard-linked into several directories is one inode with one size and
+    /// time, but its rules are relative to each directory: every location has its own compiled
+    /// rules, and each is reused for its own location only.
+    #[test]
+    fn hard_links_to_one_ignore_file_have_rules_of_their_own_per_directory() {
+        let f = fx();
+        let r = &f.root;
+        fs::create_dir(r.join(".git")).unwrap();
+        fs::write(r.join("shared"), "/only-here.tmp\n").unwrap();
+        for d in ["a", "b"] {
+            fs::create_dir(r.join(d)).unwrap();
+            fs::hard_link(r.join("shared"), r.join(d).join(".gitignore")).unwrap();
+        }
+        let none = HashSet::new();
+        let mut o = opts(&f.ex, &none, true);
+        let first = walk(r, &o).unwrap();
+        o.reuse = Some(&first.ignore);
+        for t in [&first, &walk(r, &o).unwrap()] {
+            assert_eq!(t.ignore.layers.len(), 2);
+            assert!(t.ignore.is_ignored(&r.join("a/only-here.tmp"), false));
+            assert!(t.ignore.is_ignored(&r.join("b/only-here.tmp"), false));
+            assert!(!t.ignore.is_ignored(&r.join("a/sub/only-here.tmp"), false));
+            assert!(same_layer(&first.ignore, &t.ignore, &r.join("a"), false));
+            assert!(same_layer(&first.ignore, &t.ignore, &r.join("b"), false));
+            assert!(!Arc::ptr_eq(&t.ignore.layers[0], &t.ignore.layers[1]));
+        }
+    }
+
+    /// The limits decide the same way for a file whose rules are reused as for one that is
+    /// read: nothing is kept that a fresh walk would skip.
+    #[test]
+    fn reused_rules_are_held_to_the_same_limits_as_fresh_ones() {
+        let f = fx();
+        let r = &f.root;
+        fs::create_dir(r.join(".git")).unwrap();
+        for (dir, rules) in [("d0", 3), ("d1", 4), ("d2", 2), ("d3", 1)] {
+            fs::create_dir(r.join(dir)).unwrap();
+            let text: String = (0..rules).map(|i| format!("rule{i}\n")).collect();
+            fs::write(r.join(dir).join(".gitignore"), text).unwrap();
+        }
+        let none = HashSet::new();
+        let mut o = opts(&f.ex, &none, true);
+        let all = walk(r, &o).unwrap();
+        assert_eq!((all.ignore.patterns(), all.ignore_files_skipped), (10, 0));
+        o.reuse = Some(&all.ignore);
+        for allowance in [10, 9, 6, 3, 2, 0] {
+            o.max_patterns = allowance;
+            let reused = walk(r, &o).unwrap();
+            o.reuse = None;
+            let fresh = walk(r, &o).unwrap();
+            o.reuse = Some(&all.ignore);
+            assert_eq!(
+                (
+                    reused.ignore.patterns(),
+                    reused.ignore_files_skipped,
+                    reused.ignore_rules_wanted
+                ),
+                (
+                    fresh.ignore.patterns(),
+                    fresh.ignore_files_skipped,
+                    fresh.ignore_rules_wanted
+                ),
+                "allowance {allowance}"
+            );
+            assert!(reused.ignore.patterns() <= allowance);
+            for dir in ["d0", "d1", "d2", "d3"] {
+                assert_eq!(
+                    reused.ignore.is_ignored(&r.join(dir).join("rule0"), false),
+                    fresh.ignore.is_ignored(&r.join(dir).join("rule0"), false),
+                    "{dir}, allowance {allowance}"
+                );
+            }
+        }
+    }
+
+    /// The result of a full walk of `root` that kept `kept` rules and wanted `wanted`.
+    fn walked(root: &Path, kept: usize, wanted: usize) -> Tree {
+        let mut ignore = GitIgnore::default();
+        let text: String = (0..kept).map(|i| format!("rule{i}\n")).collect();
+        ignore.add(root, false, text.as_bytes());
+        assert_eq!(ignore.patterns(), kept);
+        Tree {
+            root: root.to_path_buf(),
+            dirs: Vec::new(),
+            git_dir: None,
+            newest: None,
+            ignore: Arc::new(ignore),
+            truncated: false,
+            unreadable: 0,
+            ignore_files_skipped: 0,
+            ignore_rules_wanted: wanted,
+        }
+    }
+
+    /// A full walk of `root` through the store: it keeps what it wants as far as it is allowed.
+    fn walk_through(
+        store: &RuleStore,
+        root: &Path,
+        recency: Option<i64>,
+        wanted: usize,
+        at_most: usize,
+    ) -> usize {
+        let grant = store.begin(root, recency, at_most);
+        let kept = wanted.min(grant.max_patterns);
+        store.settle(root, Some(&walked(root, kept, wanted)));
+        kept
+    }
+
+    const NO_CAP: usize = MAX_GITIGNORE_PATTERNS;
+
+    #[test]
+    fn all_projects_together_never_hold_more_than_the_limit() {
         let (a, b, c) = (Path::new("/p/a"), Path::new("/p/b"), Path::new("/p/c"));
-        let budget = IgnoreBudget::new(10);
-        assert_eq!(budget.room(a), 10);
-        assert_eq!(budget.total(), 0, "asking reserves nothing");
-        // A full walk of `a` is in progress: its whole share is taken until it settles.
-        assert_eq!(budget.reserve(a), 10);
-        assert_eq!((budget.room(b), budget.reserve(b)), (0, 0));
-        budget.settle(a, 4);
-        budget.settle(b, 0);
-        assert_eq!((budget.room(b), budget.total()), (6, 4));
-        assert_eq!(budget.reserve(b), 6);
-        budget.settle(b, 6);
-        assert_eq!((budget.room(c), budget.total()), (0, 10));
+        let store = RuleStore::new(10);
+        assert_eq!((store.room(a), store.total()), (10, 0));
+        // A full walk of `a` is in progress: its whole allowance is taken until it settles.
+        let grant = store.begin(a, None, NO_CAP);
+        assert_eq!(grant.max_patterns, 10);
+        assert!(grant.reuse.is_none(), "nothing to reuse yet");
+        assert_eq!((store.room(b), store.total()), (0, 10));
+        store.settle(a, Some(&walked(a, 4, 4)));
+        assert_eq!((store.room(b), store.total(), store.kept(a)), (6, 4, 4));
+        assert!(!store.contended());
+        // `b` wants more than is left: it keeps what fits and stays wanting.
+        assert_eq!(walk_through(&store, b, None, 9, NO_CAP), 6);
+        assert_eq!((store.room(c), store.total()), (0, 10));
+        assert!(store.contended());
         // A project's own rules do not count against it: a full walk replaces them.
-        assert_eq!(budget.room(a), 4);
-        assert_eq!(budget.reserve(a), 4);
-        budget.settle(a, 1);
-        assert_eq!((budget.room(c), budget.total()), (3, 7));
-        // A project that is no longer tracked frees its share.
-        budget.retain(|root| root != b);
-        assert_eq!((budget.room(c), budget.total()), (9, 1));
-        // A walk that failed (or found no rules) keeps nothing.
-        assert_eq!(budget.reserve(c), 9);
-        budget.settle(c, 0);
-        assert_eq!(budget.total(), 1);
+        assert_eq!(store.room(a), 4);
+        // No more than the caller allows, either.
+        assert_eq!(store.begin(a, None, 3).max_patterns, 3);
+        store.settle(a, Some(&walked(a, 1, 4)));
+        assert_eq!((store.room(c), store.total()), (3, 7));
+        // A walk that failed, and a project without rules, keep nothing and leave no entry.
+        store.begin(c, None, NO_CAP);
+        store.settle(c, None);
+        store.begin(c, None, NO_CAP);
+        store.settle(c, Some(&walked(c, 0, 0)));
+        assert_eq!((store.total(), store.kept(c)), (7, 0));
+        // A project that is no longer monitored frees its share.
+        store.retain(|root| root != b);
+        assert_eq!((store.room(c), store.total()), (9, 1));
     }
 
     #[test]
-    fn the_budget_never_gives_one_project_more_than_the_project_limit() {
-        let budget = IgnoreBudget::default();
+    fn a_full_walk_is_handed_the_rules_of_the_previous_one() {
+        let store = RuleStore::new(100);
         let a = Path::new("/p/a");
-        assert_eq!(budget.room(a), MAX_GITIGNORE_PATTERNS);
-        assert_eq!(budget.reserve(a), MAX_GITIGNORE_PATTERNS);
+        store.begin(a, None, NO_CAP);
+        let first = walked(a, 3, 3);
+        store.settle(a, Some(&first));
+        let grant = store.begin(a, None, NO_CAP);
+        assert!(Arc::ptr_eq(&grant.reuse.unwrap(), &first.ignore));
+        store.settle(a, Some(&first));
+        store.retain(|_| false);
+        assert!(
+            store.begin(a, None, NO_CAP).reuse.is_none(),
+            "forgotten with the project"
+        );
+    }
+
+    #[test]
+    fn one_project_never_gets_more_than_the_project_limit() {
+        let store = RuleStore::default();
         let fit = MAX_GITIGNORE_PATTERNS_TOTAL / MAX_GITIGNORE_PATTERNS;
-        for i in 1..fit {
+        for i in 0..fit {
             let root = PathBuf::from(format!("/p/{i}"));
-            assert_eq!(budget.reserve(&root), MAX_GITIGNORE_PATTERNS);
+            assert_eq!(store.room(&root), MAX_GITIGNORE_PATTERNS);
+            let grant = store.begin(&root, None, usize::MAX);
+            assert_eq!(grant.max_patterns, MAX_GITIGNORE_PATTERNS);
         }
         let rest = MAX_GITIGNORE_PATTERNS_TOTAL - fit * MAX_GITIGNORE_PATTERNS;
-        assert_eq!(budget.reserve(Path::new("/p/last")), rest);
-        assert_eq!(budget.total(), MAX_GITIGNORE_PATTERNS_TOTAL);
+        let last = store.begin(Path::new("/p/last"), None, usize::MAX);
+        assert_eq!(last.max_patterns, rest);
+        assert_eq!(store.total(), MAX_GITIGNORE_PATTERNS_TOTAL);
     }
 
     /// Two projects walked at the same time cannot both take the last room: what was handed out
@@ -1045,18 +1601,137 @@ mod tests {
     fn walks_at_the_same_time_cannot_take_more_than_the_limit_together() {
         const LIMIT: usize = 12_000;
         for _ in 0..50 {
-            let budget = Arc::new(IgnoreBudget::new(LIMIT));
+            let store = Arc::new(RuleStore::new(LIMIT));
             let walkers: Vec<_> = (0..8)
                 .map(|i| {
-                    let budget = Arc::clone(&budget);
-                    std::thread::spawn(move || budget.reserve(Path::new(&format!("/p/{i}"))))
+                    let store = Arc::clone(&store);
+                    std::thread::spawn(move || {
+                        let root = PathBuf::from(format!("/p/{i}"));
+                        store.begin(&root, None, NO_CAP).max_patterns
+                    })
                 })
                 .collect();
             let mut given: Vec<usize> = walkers.into_iter().map(|w| w.join().unwrap()).collect();
             given.sort_unstable();
             assert_eq!(given, [0, 0, 0, 0, 0, 2_000, 5_000, 5_000]);
-            assert_eq!(budget.total(), LIMIT);
+            assert_eq!(store.total(), LIMIT);
         }
+    }
+
+    /// The limit across projects goes to the most recently active projects, not to whoever was
+    /// walked first. `rebalance` names the walks that get there (give up first, then take), and
+    /// has nothing to say once it is so.
+    #[test]
+    fn the_rules_go_to_the_most_recently_active_projects() {
+        let (old, recent, unknown) = (
+            Path::new("/p/a-old"),
+            Path::new("/p/b-recent"),
+            Path::new("/p/c-unknown"),
+        );
+        let store = RuleStore::new(10);
+        // Walked in path order, first come, first served: the old project took the room.
+        assert_eq!(walk_through(&store, old, Some(100), 6, NO_CAP), 6);
+        assert_eq!(walk_through(&store, recent, Some(200), 6, NO_CAP), 4);
+        assert_eq!(walk_through(&store, unknown, None, 3, NO_CAP), 0);
+        // By recency: `recent` gets all it wants (6), `old` what is left (4), `unknown` nothing.
+        let plan = store.rebalance();
+        assert_eq!(plan, [(old.to_path_buf(), 4), (recent.to_path_buf(), 6)]);
+        for (root, allowance) in &plan {
+            let (recency, wanted) = if root == old {
+                (Some(100), 6)
+            } else {
+                (Some(200), 6)
+            };
+            walk_through(&store, root, recency, wanted, *allowance);
+            assert!(store.total() <= 10, "within the limit at every step");
+        }
+        assert_eq!(
+            (store.kept(recent), store.kept(old), store.kept(unknown)),
+            (6, 4, 0)
+        );
+        assert_eq!(store.rebalance(), [], "settled: nothing is walked again");
+        assert!(
+            store.contended(),
+            "two projects still want more than they have"
+        );
+
+        // The project nobody knew anything about becomes the most recently active one.
+        store.set_recency(unknown, Some(300));
+        let plan = store.rebalance();
+        assert_eq!(plan, [(old.to_path_buf(), 1), (unknown.to_path_buf(), 3)]);
+        walk_through(&store, old, Some(100), 6, 1);
+        walk_through(&store, unknown, Some(300), 3, 3);
+        assert_eq!(
+            (store.kept(unknown), store.kept(recent), store.kept(old)),
+            (3, 6, 1)
+        );
+        assert_eq!(store.rebalance(), []);
+
+        // A project leaves: the next in the order takes what it frees.
+        store.retain(|root| root != recent);
+        assert_eq!(store.rebalance(), [(old.to_path_buf(), 6)]);
+        walk_through(&store, old, Some(100), 6, 6);
+        assert_eq!(store.rebalance(), []);
+        assert!(!store.contended());
+    }
+
+    /// The same projects give the same shares whatever order they were walked in, and equal
+    /// recency is decided by the path: nothing depends on timing.
+    #[test]
+    fn the_shares_depend_on_the_projects_alone_not_on_the_order_of_their_walks() {
+        let projects: [(&str, Option<i64>, usize); 5] = [
+            ("/p/e", Some(500), 4),
+            ("/p/d", Some(500), 4), // as recent as /p/e: the path decides (d before e)
+            ("/p/c", Some(100), 4),
+            ("/p/b", None, 4),
+            ("/p/a", None, 4), // unknown comes last, whatever its path
+        ];
+        let expected = [
+            ("/p/d", 4),
+            ("/p/e", 4),
+            ("/p/c", 2),
+            ("/p/a", 0),
+            ("/p/b", 0),
+        ];
+        let orders: [[usize; 5]; 4] = [
+            [0, 1, 2, 3, 4],
+            [4, 3, 2, 1, 0],
+            [2, 4, 0, 3, 1],
+            [3, 0, 4, 1, 2],
+        ];
+        for order in orders {
+            let store = RuleStore::new(10);
+            for i in order {
+                let (root, recency, wanted) = projects[i];
+                walk_through(&store, Path::new(root), recency, wanted, NO_CAP);
+            }
+            // Until nothing is left to do (one round is enough; a second one must be empty).
+            for (root, allowance) in store.rebalance() {
+                let (_, recency, wanted) =
+                    projects.iter().find(|p| Path::new(p.0) == root).unwrap();
+                walk_through(&store, &root, *recency, *wanted, allowance);
+                assert!(store.total() <= 10);
+            }
+            assert_eq!(store.rebalance(), [], "order {order:?}");
+            for (root, kept) in expected {
+                assert_eq!(store.kept(Path::new(root)), kept, "{root}, order {order:?}");
+            }
+        }
+    }
+
+    /// A project in the middle of a walk is left alone: its numbers are about to change.
+    #[test]
+    fn a_project_that_is_being_walked_is_not_planned_for() {
+        let (a, b) = (Path::new("/p/a"), Path::new("/p/b"));
+        let store = RuleStore::new(10);
+        walk_through(&store, a, Some(100), 8, NO_CAP);
+        walk_through(&store, b, Some(200), 8, NO_CAP);
+        assert_eq!(
+            store.rebalance(),
+            [(a.to_path_buf(), 2), (b.to_path_buf(), 8)]
+        );
+        store.begin(a, Some(100), NO_CAP);
+        assert_eq!(store.rebalance(), [(b.to_path_buf(), 8)]);
     }
 
     /// A file that grew past the limit loses the rules read earlier: they no longer describe it.

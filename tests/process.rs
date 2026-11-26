@@ -2222,6 +2222,63 @@ fn projects_beyond_the_limit_on_ignore_rules_across_projects_lose_their_rules_no
     assert_eq!(code, Some(0), "{log}");
 }
 
+/// The rule cache at daemon level, on the shape that showed the problem: projects **without
+/// watches** (a watch budget of 1: every project is polled, so every scan walks all of them
+/// again), each with a `.gitignore` of rules that all need a regular expression. Before the
+/// cache, every scan compiled every rule again next to the ones it replaced, and a glibc build
+/// kept the memory it had freed: resident memory rose by roughly the size of the rules scan
+/// after scan, to several times what is kept. Now a scan of unchanged ignore files compiles
+/// nothing, so memory after ten more scans is where it was.
+///
+/// The same test covers the static release target, whose allocator behaves differently:
+/// `cargo test --target x86_64-unknown-linux-musl --test process repeated_scans`.
+#[test]
+fn repeated_scans_of_polled_projects_with_expensive_ignore_rules_keep_memory_flat() {
+    const PROJECTS: usize = 4;
+    const RULES_PER_PROJECT: usize = 400;
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("s"), 0).unwrap();
+    for i in 0..PROJECTS {
+        let project = env.home.join(format!("rules/proj-{i:02}"));
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(project.join("CLAUDE.md"), "# rules\n").unwrap();
+        let rules: String = (0..RULES_PER_PROJECT)
+            .map(|k| format!("*{i}x{k}?b[c-d]*.x\n"))
+            .collect();
+        std::fs::write(project.join(".gitignore"), rules).unwrap();
+    }
+    let cfg = t.path().join("c.toml");
+    std::fs::write(&cfg, "[watch]\nbudget = 1\n").unwrap();
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let d = Daemon::start(&env, &["--config", cfg.to_str().unwrap()]);
+    wait_scans_finished(&env, 1);
+    let monitoring = socket_call(&env, "service.status")["monitoring"].clone();
+    assert!(
+        monitoring["polled_projects"].as_u64() >= Some(PROJECTS as u64),
+        "control: the projects have no watches, so every scan walks them again: {monitoring}"
+    );
+    assert_eq!(monitoring["ignore_files_skipped"], 0, "{monitoring}");
+    // Two scans to let the first one's work settle, then the baseline.
+    refresh_and_wait(&env);
+    refresh_and_wait(&env);
+    let baseline = rss_kib(d.pid());
+    assert!(
+        baseline > 8 * 1024,
+        "control: the rules take memory worth watching ({baseline} KiB)"
+    );
+    for _ in 0..10 {
+        refresh_and_wait(&env);
+    }
+    let after = rss_kib(d.pid());
+    // The rules alone take about 25 MiB here; without the cache ten scans added several times
+    // that. Allow a few MiB for everything else a scan touches.
+    assert!(
+        after <= baseline + 4 * 1024,
+        "resident memory grew from {baseline} KiB to {after} KiB over ten scans of unchanged projects"
+    );
+    assert_eq!(d.stop().0, Some(0));
+}
+
 /// v0.1.0 review L2: `XDG_DATA_HOME` reached through a symlink that resolves **inside a
 /// project**. ccwm's directories are hard boundaries under their canonical spelling too, so the
 /// daemon neither walks nor watches its own database there, and its own writes never become

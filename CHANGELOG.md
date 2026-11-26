@@ -19,8 +19,15 @@ A maintenance release: no new features. Tested on the same environment as 0.1.0 
   alone only moves the excess to swap. Run `scripts/install.sh` (or `ccwm service install`) to get the
   new unit; change the limit with a drop-in (`systemctl --user edit ccwm`, see docs/service.md).
 - **Ignore rules are limited across projects too**: 20,000 rules for all projects together, next to the
-  limits per file and per project. Beyond it a project's ignore files are skipped and counted, as before
-  (`ccwm status`); the projects walked first keep their rules.
+  limits per file and per project. Beyond it ignore files are skipped and counted, as before
+  (`ccwm status`). The limit goes to the **most recently active projects**: when the rules do not fit
+  all, the least recently active projects are the ones without, whatever order they were found in, and
+  a project that becomes active again gets its rules back at the next scan.
+  A scan of a project that is without its rules for that reason does not move the project's known "last
+  change": without the rules, ignored files cannot be told from meaningful ones.
+- **Compiled ignore rules are kept and reused.** The rules of a `.gitignore` are compiled again only
+  when the file changed (its device, inode, size or modification time). Before, every scan of a project
+  without watches compiled all its rules again.
 - **The Settings page refuses more.** A discovery root that is `/` or a folder containing your home
   folder, and your home folder itself as the session directory, can no longer be saved from the browser
   (symlinks are resolved first). Edit `config.toml` if you really want such a root.
@@ -48,12 +55,14 @@ A maintenance release: no new features. Tested on the same environment as 0.1.0 
   busy").
 
 ### Known limitations
-- The limit on ignore rules bounds what ccwm keeps (measured: at most 344–395 MiB, with 20,000 rules that
-  all need a regular expression). Projects without watches are walked again at every scan, and the new
-  rules exist next to the old ones for a moment: the release binary peaked at 775 MiB. **A build from
-  source against glibc does not return that memory** and grew to 1.66 GiB over four scans. In that case
-  the unit's memory limit is what stops it; a daemon started by hand has no such limit. See
-  docs/benchmarks.md.
+- Ignore rules that need a regular expression cost 17–20 KiB each. With 20,000 of them, the most the
+  limits allow, ccwm keeps 343.7 MiB (a glibc build) or 391.4 MiB (the release binary), and stays there
+  over repeated scans (docs/benchmarks.md). An ignore file that changes is compiled again next to the
+  rules it replaces. The unit's memory limit (2G) is far above that and will be lowered.
+- The limit across projects goes to the most recently active projects, so a tree of projects with huge
+  ignore files and recent file times can take it from older projects until those are active again.
+- The rule cache trusts a file's device, inode, size and modification time: a `.gitignore` rewritten
+  without changing any of them keeps its old rules until it changes again or ccwm restarts.
 - The memory limit needs the cgroup memory controller for your user manager (present on Ubuntu 24.04).
 - Not run: CI on this version, the release workflow, a fresh-account install from the archive.
 - Everything listed under 0.1.0 still applies, except "the ignore-file limits apply per project, not

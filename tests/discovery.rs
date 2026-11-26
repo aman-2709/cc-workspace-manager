@@ -745,6 +745,7 @@ fn a_directory_on_another_file_system_is_not_entered() {
                 now: i64::MAX,
                 max_entries: tree::MAX_ENTRIES,
                 max_patterns: tree::MAX_GITIGNORE_PATTERNS,
+                reuse: None,
             },
         )
         .unwrap();

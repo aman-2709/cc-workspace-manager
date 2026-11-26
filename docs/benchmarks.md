@@ -121,28 +121,34 @@ projects and the files of two are skipped. Two builds: `target/release` (glibc) 
 | | glibc build | musl binary (release) |
 |---|---|---|
 | ignore files skipped / rules kept | 2 / 20,000 | 2 / 20,000 |
-| first scan finished after start (the rules are compiled in it) | 8.0 s | 7.4 s |
-| CPU until quiet | 7.7 s | 7.3 s |
-| RSS with every project watched (peak) | **343.5 MiB** (343.5 MiB) | **391.3 MiB** (394.4 MiB) |
-| every project polled (`watch.budget = 1`): two more scans, each | 6.5 s, 6.6 s | 5.6 s, 5.7 s |
-| RSS after those scans | **1,001.9 MiB** | 384.7 MiB |
-| peak RSS | 1,001.9 MiB | **754.8 MiB** |
+| first scan finished after start (the rules are compiled in it) | 5.3 s | 5.7 s |
+| RSS with every project watched (peak) | **343.7 MiB** (343.7 MiB) | **391.4 MiB** (394.8 MiB) |
+| every project polled (`watch.budget = 1`): ten more scans, each | 0.1 s | 0.1 s |
+| RSS after the first and after the tenth of those scans | **343.8 MiB → 344.7 MiB** | **380.6 MiB → 380.7 MiB** |
+| peak RSS in that run | 344.7 MiB | 384.3 MiB |
 
-That is 17–20 KiB per rule kept. A polled project is walked again at every scan, and its new rules are
-built before the old ones are dropped: twice the memory for a moment. The musl binary gives it back (it
-peaked at 755–775 MiB and returned to 385–399 MiB). **The glibc build does not**: in a longer run of the
-same content it held 672, 1,002, 1,332 and 1,661 MiB after scans 1 to 4, then stayed there for two more
-(the musl binary: 395–399 MiB after each of six scans, peak 775 MiB). With a smaller set (6 projects of 500
-such rules, about 60 MiB kept) the glibc build reached 633 MiB after 30 scans and stayed there for ten more;
-the musl binary went from 63 MiB to 82 MiB over 40 scans and had not levelled off. Not measured: a pattern
-built to make the matcher use as much memory as it can, and scans beyond those counts.
+That is 17–20 KiB per rule kept, and it stays there: the compiled rules of an ignore file are kept and
+used again until the file changes (its device, inode, size or modification time), so a scan of projects
+whose ignore files are as they were compiles nothing. Polled projects are the case that shows it: they
+are walked again at every scan.
 
-What follows from it: the limits bound what ccwm *keeps*; while projects are polled and hold expensive
-rules, the process can use several times that. The systemd unit therefore carries a hard limit,
-`MemoryMax=2G` with `MemorySwapMax=0` ([service.md](service.md#the-unit)): above everything measured with the
-release binary, and far above normal use (17–26 MiB in the tables above). A short re-run of the 500-project
-scenario with 0.1.1 gave 21.6 MiB after start and a 25.8 MiB peak in the 10,000-file burst (0.1.0: 21.4 and
-25.0).
+**Before the rules were cached** (the first 0.1.1 build, same fixture) every such scan compiled all 20,000
+rules again, 5–6 s each, next to the ones they replaced. The musl binary gave the memory back (peak 775 MiB,
+395–399 MiB after each scan). The glibc build did not: 672, 1,002, 1,332 and 1,661 MiB after scans 1 to 4.
+With a smaller set (6 projects of 500 such rules, about 60 MiB kept) the glibc build reached 633 MiB after
+30 scans. That measurement is why the cache exists.
+
+The same check is a test (`tests/process.rs`, four polled projects of 400 such rules, twelve scans, memory
+must not grow by more than 4 MiB): it passes for the glibc and for the musl target, and fails with reuse
+switched off (99 MiB → 244 MiB in ten scans, glibc). Not measured: a pattern built to make the matcher
+itself use as much memory as it can; ignore files that change at every scan (each change compiles that
+file again, next to the rules it replaces, one project at a time).
+
+The systemd unit carries a hard limit all the same, `MemoryMax=2G` with `MemorySwapMax=0`
+([service.md](service.md#the-unit)): far above normal use (17–26 MiB in the tables above) and above this
+worst case. With the cache it can be lower; that is planned (ROADMAP.md). A short re-run of the
+500-project scenario with 0.1.1 gave 21.6 MiB after start and a 25.8 MiB peak in the 10,000-file burst
+(0.1.0: 21.4 and 25.0).
 
 ## Reproducing
 

@@ -93,11 +93,14 @@ walked is watched live) and the whole tree is checked at each scan.
 
 **Limits on ignore files.** ccwm reads `.gitignore` files and `.git/info/exclude` to decide what counts as
 activity. A file larger than 256 KiB is skipped, and so is every further file once a project's ignore files
-reach 1 MiB or 5,000 rules together, or once all projects together hold 20,000 rules (since 0.1.1; the
-projects walked first keep their rules, and a project that is ignored or gone frees its share). A skipped
+reach 1 MiB or 5,000 rules together, or once all projects together hold 20,000 rules (since 0.1.1). That
+last limit goes to the most recently active projects: when the rules do not fit all, the least recently
+active projects are the ones without, and a project that becomes active again gets its rules back at the
+next scan (a project that is ignored or gone frees its share). A skipped
 file's rules do not apply, so files it would ignore count as activity; `ccwm status` says how many files were
 skipped. Ordinary projects have a few dozen rules each, so the limit across projects is far away for a few
-hundred of them. The rules of a repository apply only if its `.git`
+hundred of them. The rules of an ignore file are compiled once and used again until the file changes
+(another size or modification time, or another file under that name). The rules of a repository apply only if its `.git`
 is yours and lies inside the project's discovery root.
 
 ## Git

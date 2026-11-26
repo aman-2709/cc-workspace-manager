@@ -329,12 +329,7 @@ the project's ignore rules; `.git` is retried, never walked), their newest file 
 `.git/info/exclude` layers when the project is in a Git work tree below home — since M2.1 also the
 `info/exclude` and `.gitignore` files from a work-tree root *above* the project root, layers ranked by
 depth — ≤100 000 entries, future mtimes
-clamped to now; ignore files within the limits of REQUIREMENTS.md §5.2: per file and per project in
-`GitIgnore::load`, across projects through `tree::IgnoreBudget`, one instance shared by the tracker's walks
-and the monitor: a full walk `reserve`s what the project may keep — the limit minus the other projects'
-rules, at most the project limit — and `settle`s for what it kept, so two walks at once cannot both take
-the last room; a subtree walk only asks for the `room`; the tracker drops the entries of projects that are
-no longer monitored before each batch of walks) → newest file = *inferred* activity → Git inspection → for a newly inserted project while
+clamped to now; ignore files within the limits of REQUIREMENTS.md §5.2, see "Ignore rules" below) → newest file = *inferred* activity → Git inspection → for a newly inserted project while
 missing projects exist: **move matching** (exactly one missing project with the same HEAD commit and the same
 sanitized remote, or — without a commit — the same marker hash and no Git head; ambiguity ⇒ no match) ⇒ the old id
 moves to the new path and the new row is deleted → Git cache stored → `Cmd::Add` to the monitor.
@@ -371,6 +366,40 @@ all watches, then `OverflowRecovered`.
 status per row and the `[from, until)` ranges used by the `activity` filter and the stats, from the same day
 boundaries. Sort keys: `k1` = negated time for "newest first", time for "oldest first", `i64::MAX` for unknown (last
 in both orders), then `sort_key`, then `id`; the cursor carries `(k1, sort_key, id)`.
+
+**Ignore rules (v0.1.1): `tree::RuleStore`**, one instance shared by the tracker's walks and the monitor.
+`GitIgnore` is a list of `Arc<Layer>`, one per ignore file (its directory, its compiled rules, its size, its
+rule lines, and the file's `FileId` = device, inode, size, modification time).
+
+- *Limits per file and per project* are decided in `GitIgnore::load`, from the file's size and rule lines
+  (counted before compiling). They count the files a walk left out for its allowance too
+  (`Admission.denied_*`), so they decide the same way whatever the allowance is, and
+  `Tree::ignore_rules_wanted` (what the project would keep under its own limits alone) does not depend on it.
+- *Reuse (the rule cache).* The store keeps each project's rules of its last full walk. `begin(root, recency,
+  at_most)` hands them to the next full walk (`TreeOptions::reuse`), and `load` takes over the layer of every
+  file whose `FileId` is unchanged without reading the file; only changed and new files are compiled, and
+  layers of files that are gone are not carried over. A subtree walk starts from the project's rules (a copy
+  costs a pointer per file) and reuses them the same way. Location is part of the identity (the directory and
+  whether it is `info/exclude`): compiled rules are relative to their directory, and hard links give several
+  locations one inode. `retain` drops projects that are no longer monitored, rules included.
+- *The limit across projects.* `begin` gives a full walk what the other projects leave of the limit (at most
+  the project limit, at most `at_most`) and keeps that reserved until `settle`: all projects together never
+  hold more than the limit, also when two are walked at once. A subtree walk asks for `room`.
+- *By recency.* Who holds the rules when they do not fit is a function of the projects alone
+  (`RuleStore::rebalance`): ordered by last activity (most recent first, unknown last, the path between
+  equals), each project gets all it wants while it fits in what is left, the first that does not fit
+  completely gets what is left, the ones after it nothing. `rebalance` returns the walks that get there:
+  projects that hold more than their share first (least recent first), then projects that may hold more
+  (most recent first), each with its allowance. `Tracker::rebalance_rules` runs them (`Cmd::Add` replaces the
+  project in the monitor); it is called at the end of every reconciliation, after the signals that walk or
+  remove projects, and after ignore/un-ignore, and returns at once unless some project lacks rules
+  (`contended`). Walk batches go in the order of `tracked_projects` (recency first), so a start with known
+  activity gets the shares right in the first pass.
+- *No feedback from the allocation into the order.* A walk of a project that lacks rules cannot tell ignored
+  files from meaningful ones; `Tracker::record_inferred` takes its newest file only for a project that has no
+  activity yet. Without that rule a project that gave its rules up became "recent" through the files its
+  rules used to hide and took the rules back from the next project (seen in `tests/tracker.rs`: the shares
+  changed across a restart).
 
 ## 7b. M3 sessions and session-based discovery
 
@@ -865,21 +894,30 @@ rustc 1.94.0, systemd 255).
   in quotation marks and italics (`font-style: italic` computed), the line's tooltip starts with
   "Session title:", the same words are there for screen readers (`.sr-only`), and privacy mode shows no
   quotation. Not checked in Firefox.
-- **Limit on ignore rules across projects:** unit tests of `IgnoreBudget` (arithmetic, the project limit,
-  eight walks reserving at once never exceed the limit) and of a walk with less room than the project limit;
-  `tests/tracker.rs` with the real tracker and monitor and a limit of six rules: one of two four-rule
-  projects is skipped and counted, gets its rules when the other is ignored, and the other is then the one
-  without room; `tests/process.rs` with the real daemon and the real limits: six projects of 5,000 rules,
-  two files skipped and reported, every project listed.
+- **Limit on ignore rules across projects, by recency:** unit tests of `RuleStore`: the hard limit (also with
+  eight walks beginning at once), the shares as a function of recency, path and wanted rules (the same result
+  for four different walk orders; unknown recency last; a project being walked is left alone), and
+  `rebalance` giving up before taking with the total within the limit at every step. `tests/tracker.rs` with
+  the real tracker and monitor, room for eight rules and three projects of four whose names sort opposite to
+  their recency: the two most recent hold the rules after the first start (when no activity is known before
+  the walks), a file their rules name is activity only in the project without rules, that project then gets
+  the rules at the next scan and the least recent one gives them up without its activity moving, and a
+  restart finds the same shares. `tests/process.rs` with the real daemon and the real limits: six projects
+  of 5,000 rules, two files skipped and reported, every project listed.
+- **Rule cache:** unit tests: a later walk shares the layer (`Arc::ptr_eq`) of every unchanged file and
+  compiles only a changed, new or replaced one; size, time and inode each count as a change, a rewrite that
+  changes none of them is not seen (pinned as the documented limit); hard links have rules per directory;
+  reused rules meet the same limits as fresh ones for six allowances. `tests/process.rs`
+  (`repeated_scans_…`): four polled projects of 400 rules that need a regular expression, twelve scans,
+  resident memory may grow by 4 MiB at most; **passes for the glibc target and for
+  `x86_64-unknown-linux-musl`** (`cargo test --target x86_64-unknown-linux-musl --test process
+  repeated_scans`); with reuse switched off it fails (99 MiB → 244 MiB, glibc; checked once).
 - **Memory, measured** (`scripts/bench.py --only ignore`, release builds, docs/benchmarks.md): 20,000 rules
-  that need a regular expression cost 344 MiB (glibc build) / 395 MiB (the static musl release binary) once
-  kept. With every project polled (a watch budget of 1), each scan walks every project again: the musl binary
-  peaks at 775 MiB and is back at 395 MiB after the scan; **the glibc build keeps what it freed** — 672,
-  1,002, 1,332, 1,661 MiB after scans 1 to 4, then level for two more; with 3,000 rules (60 MiB kept) it
-  reached 633 MiB after 30 scans and stayed there for ten more. The musl binary crept from 63 to 82 MiB over
-  40 scans with 3,000 rules, not yet level. The limit therefore bounds what is kept, not the process in
-  polled mode: that is `MemoryMax=`'s job. Not built: reusing the compiled rules of an unchanged ignore file
-  across walks, which would remove the churn (a proposal, §14).
+  that need a regular expression: 343.7 MiB kept in the glibc build, 391.4 MiB (peak 394.8) with the static
+  musl release binary. With every project polled (a watch budget of 1), ten more scans: glibc 343.8 →
+  344.7 MiB, musl 380.6 → 380.7 MiB, 0.1 s per scan. Before the cache (the first v0.1.1
+  commit): each such scan took 5–6 s; musl peaked at 775 MiB and returned to 395 MiB; glibc held 672, 1,002,
+  1,332, 1,661 MiB after scans 1 to 4, and with 3,000 rules reached 633 MiB after 30 scans.
 - **`MemoryMax=`:** see §13.
 - **I3:** `tests/http.rs`: a sign-out and an event made ready at the same instant (one runtime thread, no
   await between them), 16 rounds: the close frame 4401 comes first every time; a client that stops reading
@@ -1008,17 +1046,33 @@ the `socket`/`socketpair` denial active, `ccwm doctor` reports the `claude` chec
 supported, checked by the daemon in its sandbox): the real binary's `--version` and `--help` succeed under the filter.
 **v0.1.0 is released** (tag `v0.1.0` at `975bf10`).
 
-**v0.1.1 (2026-11-26; built on the maintainer's go-ahead, the choices below are for review).** Chosen during the
-work: the limit across projects at **20,000 rules** (four full projects; 344–395 MiB kept in the worst case),
-first come, first served; **`MemoryMax=2G`**, sized above the worst measured case of the release binary (775 MiB)
-with room for Git children, and **`MemorySwapMax=0`**, which was not asked for but without which the limit does
-not limit on a host with swap (§13); the WebSocket send timeout of **5 s**; refusing home as the session
+**v0.1.1 (2026-11-26).** Built on the maintainer's go-ahead; choices made on the way: the limit across
+projects at 20,000 rules; `MemoryMax=2G` with `MemorySwapMax=0` (the latter not asked for: without it the limit
+does not limit on a host with swap, §13); the WebSocket send timeout of 5 s; refusing home as the session
 directory and `..` in root paths as well as broad roots; a WAL truncation that failed is retried after every
-later batch (not only logged); `CCWM_REQUIRE_LANDLOCK_ABI` in CI. **Found, not fixed (outside the list):** in
-polled mode every scan compiles every project's ignore rules again, and a glibc build does not return the freed
-memory (§13i) — proposal: keep the compiled rules of an ignore file whose content did not change (compare a hash
-of the file), which removes the churn for both allocators and the repeated CPU cost. The README item of the
-request was an unfilled placeholder; only version numbers and the status line were changed there.
+later batch; `CCWM_REQUIRE_LANDLOCK_ABI` in CI. Reported with them: in polled mode every scan compiled every
+project's ignore rules again, and a glibc build kept the freed memory (1.66 GiB at the limit).
+
+**Decided by the maintainer (2026-11-26):** every "v0.1.1, needs approval" row of Appendix A approved;
+`MemorySwapMax=0` approved; `MemoryMax=2G` approved **for now**, to be tightened after the rule-cache fix
+(ROADMAP.md "After v0.1.1"); the 20,000-rule limit approved, but **allocated by recency** (most recently active
+projects first, the priority of the watch budget), deterministic and tested, not first come, first served; the
+memory finding **fixed in v0.1.1** by caching compiled ignore rules per file, keyed by its device, inode, size
+and modification time, recompiling only on change and evicting with removed projects, tested by repeated scans
+of the worst-case fixture in both builds; no README changes.
+
+**Built for those decisions, with choices for review:** the cache entry is also bound to the file's location
+(directory, and whether it is `info/exclude`): compiled rules are relative to their directory, and hard links
+give several locations one inode. The shares by recency: each project all it wants while it fits, the first
+that does not fit completely gets the rest, the ones after it nothing (file granularity inside that one
+project only). Rules follow a change of activity at the next scan, not at once. **One rule needs approval**
+(REQUIREMENTS.md §5.2, Appendix A): a walk of a project that lacks rules because of the limit across projects
+does not move a known activity time. Without it the allocation fed back into its own order — a project that
+gave its rules up looked active through the files its rules used to hide and took the rules back from the
+next one; the tracker test showed different shares after a restart. Consequence to know: a tree of projects
+with huge ignore files and recent file times outranks older projects for the limit across projects (as it does
+for deeper watches). Not done: keying the cache by content; a file rewritten with the same size, time and inode
+keeps its old rules until it changes again or the daemon restarts (session files are followed the same way).
 
 Open:
 - **O2:** a `claude` binary outside the sandbox read set cannot be executed: reported as `failed` (the usual
