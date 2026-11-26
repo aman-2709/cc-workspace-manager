@@ -65,12 +65,6 @@ impl Tracker {
         };
 
         let gone = gone_files(scanned.listing.as_ref(), scanned.absent, full, &states);
-        if scanned.listing.as_ref().is_some_and(|l| l.truncated) {
-            tracing::warn!(
-                limit = locate::MAX_FILES,
-                "more session files than one listing holds: the rest is not indexed, and no session is dropped from the index as gone"
-            );
-        }
         let mut affected = Vec::new();
         if !gone.is_empty() {
             affected.extend(self.writer.delete_sessions(gone).await?);
@@ -234,9 +228,25 @@ impl Tracker {
         let (files, skipped) = listing
             .as_ref()
             .map_or((0, 0), |l| (l.files.len() as u64, l.skipped));
+        let cut = listing.as_ref().is_some_and(Listing::truncated);
         let home = self.settings.scan.home.clone();
         self.status.update(|s| {
             let st = &mut s.sessions;
+            // Logged when it starts and when it ends, not at every ingest (v0.1.1 review I2:
+            // that was at every change of a session file). A partial listing can only add it.
+            if full || cut {
+                match (st.listing_cut, cut) {
+                    (false, true) => tracing::warn!(
+                        limit = locate::MAX_FILES,
+                        "more session files than one listing holds: the rest is not indexed, and sessions in the folders the limit cut off are not dropped from the index as gone"
+                    ),
+                    (true, false) => {
+                        tracing::info!("the session files fit in one listing again");
+                    }
+                    _ => {}
+                }
+                st.listing_cut = cut;
+            }
             if full {
                 st.state = match (listing, absent) {
                     (Some(l), _) if l.errors == 0 => "ok",
@@ -290,10 +300,17 @@ fn gone_files(
 ) -> Vec<String> {
     let all = || states.values().map(|s| s.file_path.clone()).collect();
     match listing {
-        Some(l) if l.truncated => Vec::new(),
         Some(l) => {
             let present: HashSet<&Path> = l.files.iter().map(|f| f.path.as_path()).collect();
-            let listed: HashSet<&Path> = l.dirs.iter().map(PathBuf::as_path).collect();
+            // Only directories listed completely: in one the file limit cut off, an absent
+            // file may be one the listing left out (v0.1.0 review I8, v0.1.1 review I2).
+            let cut: HashSet<&Path> = l.cut.iter().map(PathBuf::as_path).collect();
+            let listed: HashSet<&Path> = l
+                .dirs
+                .iter()
+                .map(PathBuf::as_path)
+                .filter(|d| !cut.contains(d))
+                .collect();
             states
                 .values()
                 .filter(|s| {
@@ -396,6 +413,42 @@ mod tests {
             .collect()
     }
 
+    /// v0.1.1 review I2: a listing that the file limit cut off still knows the folders it listed
+    /// completely. A session deleted from one of those is gone; the folder the limit cut off
+    /// keeps all of its sessions (one may only have been left out). Whichever folder is listed
+    /// first, the one with the deleted file is complete: it holds no session file any more.
+    #[test]
+    fn a_cut_off_listing_still_finds_the_sessions_gone_from_folders_it_listed_completely() {
+        let t = tempfile::tempdir().unwrap();
+        let projects = fs::canonicalize(t.path()).unwrap().join(PROJECTS_DIR);
+        let (a, b) = (projects.join("-synthetic-a"), projects.join("-synthetic-b"));
+        let files = [
+            a.join(format!("{}.jsonl", IDS[0])),
+            b.join(format!("{}.jsonl", IDS[1])),
+            b.join(format!("{}.jsonl", IDS[2])),
+        ];
+        for f in &files {
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, "{}\n").unwrap();
+        }
+        let states = indexed(&files);
+        fs::remove_file(&files[0]).unwrap();
+        let cut = locate::list_all_capped(&projects, 1).unwrap();
+        assert!(cut.truncated());
+        assert_eq!(
+            cut.cut,
+            std::slice::from_ref(&b),
+            "only the folder the limit was reached in"
+        );
+        for full in [true, false] {
+            assert_eq!(
+                gone_files(Some(&cut), false, full, &states),
+                [files[0].to_string_lossy().into_owned()],
+                "full {full}"
+            );
+        }
+    }
+
     /// v0.1.0 review I8: the sessions a listing left out at its file limit are still there; they
     /// must not be dropped from the index as gone. Controls: a complete listing does find a
     /// deleted file, a vanished directory and a vanished `projects/`.
@@ -421,13 +474,13 @@ mod tests {
 
         // Every file exists; the listing holds only two of the three.
         let cut = locate::list_all_capped(&projects, 2).unwrap();
-        assert!(cut.truncated && cut.files.len() == 2);
+        assert!(cut.truncated() && cut.files.len() == 2);
         for full in [true, false] {
             assert!(gone_files(Some(&cut), false, full, &states).is_empty());
         }
         // Control: the same listing without the mark would drop the third session.
         let unmarked = Listing {
-            truncated: false,
+            cut: Vec::new(),
             ..locate::list_all_capped(&projects, 2).unwrap()
         };
         assert_eq!(gone_files(Some(&unmarked), false, true, &states).len(), 1);

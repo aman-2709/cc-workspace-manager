@@ -303,6 +303,10 @@ pub fn format_status(v: &serde_json::Value) -> String {
             out.push_str(&format!("    ! {a}\n"));
         }
     }
+    out.push_str(&ignore_rules_limited(string_list(
+        &v["monitoring"],
+        "ignore_rules_limited",
+    )));
     out.push_str(&format!(
         "  git: {} {} (hardened status: {})\n",
         s(v, "/git/program"),
@@ -339,6 +343,28 @@ pub fn string_list<'a>(v: &'a serde_json::Value, key: &str) -> Vec<&'a str> {
         .and_then(serde_json::Value::as_array)
         .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
         .unwrap_or_default()
+}
+
+/// How many names [`ignore_rules_limited`] shows.
+const LIMITED_SHOWN: usize = 8;
+
+/// The projects the limit on ignore rules across projects holds back (v0.1.1 review M2): their
+/// file events are judged without some of their rules, their scans with all of them.
+fn ignore_rules_limited(names: Vec<&str>) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    let more = names.len().saturating_sub(LIMITED_SHOWN);
+    let shown = names[..names.len() - more].join(", ");
+    let rest = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "    ! ignore rules limited: {} project(s) ({shown}{rest}) lack some of their ignore rules because all projects together have more than the limit; changes to the files those rules ignore count as activity in them, but their scans still use all of their rules\n",
+        names.len()
+    )
 }
 
 /// A yes/no protection of the sandbox report (`filesystem`, `signal`, …) for display: `true`,
@@ -389,6 +415,7 @@ pub fn format_sessions(d: &serde_json::Value) -> String {
         .unwrap_or_default();
     let total: u64 = reasons.iter().map(|r| r.1).sum();
     let duplicates = d.pointer("/sessions/duplicate_ids").map_or(0, n);
+    let cut = d.pointer("/sessions/listing_cut") == Some(&serde_json::Value::Bool(true));
     let mut out = format!(
         "  sessions: {} ({} files, {} indexed{}{})\n",
         s(d, "/sessions/state"),
@@ -405,6 +432,12 @@ pub fn format_sessions(d: &serde_json::Value) -> String {
             format!("; {duplicates} duplicate session files skipped")
         }
     );
+    if cut {
+        out.push_str(&format!(
+            "    ! more than {} session files: the rest is not indexed, and sessions in the folders the limit cut off stay in the index after their file is deleted\n",
+            crate::claude::locate::MAX_FILES
+        ));
+    }
     for (reason, count) in reasons {
         let label = reason.replace('_', " ");
         let mut listed = 0;
@@ -814,6 +847,50 @@ mod status_tests {
             assert!(t.contains(want), "{want} in {t}");
         }
         assert!(!t.contains("unverified"), "{t}");
+    }
+
+    /// v0.1.1 review M2: the projects that the limit on ignore rules across projects holds back
+    /// are named (a long list is shortened); none, no line.
+    #[test]
+    fn status_text_names_the_projects_whose_ignore_rules_are_limited() {
+        let status = |names: Vec<String>| {
+            format_status(&serde_json::json!({
+                "monitoring": {"ignore_rules_limited": names}
+            }))
+        };
+        let t = status(vec!["alpha".into(), "beta".into()]);
+        assert!(
+            t.contains("! ignore rules limited: 2 project(s) (alpha, beta) lack some of their ignore rules"),
+            "{t}"
+        );
+        assert!(
+            t.contains("their scans still use all of their rules"),
+            "{t}"
+        );
+        let many: Vec<String> = (0..11).map(|i| format!("p{i:02}")).collect();
+        let t = status(many);
+        assert!(
+            t.contains("11 project(s) (p00, p01, p02, p03, p04, p05, p06, p07 and 3 more)"),
+            "{t}"
+        );
+        assert!(!status(Vec::new()).contains("ignore rules limited"));
+        assert!(!format_status(&serde_json::json!({})).contains("ignore rules limited"));
+    }
+
+    /// v0.1.1 review I2: a session listing cut off at the file limit shows in `ccwm status`.
+    #[test]
+    fn status_text_says_when_the_session_listing_was_cut_off() {
+        let cut = format_sessions(&serde_json::json!({
+            "sessions": {"state": "ok", "files": 100_000, "indexed": 100_000, "listing_cut": true}
+        }));
+        assert!(
+            cut.contains("! more than 100000 session files: the rest is not indexed"),
+            "{cut}"
+        );
+        let whole = format_sessions(&serde_json::json!({
+            "sessions": {"state": "ok", "files": 9, "indexed": 9, "listing_cut": false}
+        }));
+        assert!(!whole.contains("session files:"), "{whole}");
     }
 
     /// A protection whose probe failed for an unexpected reason is shown as unverified, not as

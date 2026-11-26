@@ -19,11 +19,19 @@ pub const UNIT_NAME: &str = "ccwm.service";
 pub const BINARY_IN_HOME: &str = ".local/bin/ccwm";
 /// `MemoryMax=` of the unit: the most memory the daemon and its `git` / `claude` children may
 /// use together. A backstop, not a working size: ccwm normally needs 20–30 MiB, and the worst
-/// case its ignore-rule limits allow was measured at 395 MiB with the release binary
-/// (docs/benchmarks.md). Above it the kernel stops the service instead of letting it take the
-/// machine's memory. `MemorySwapMax=0` goes with it: where there is swap, `MemoryMax=` alone
-/// only moves the excess there (verified in a user unit, ARCHITECTURE.md §13).
+/// case its ignore-rule limits allow was measured at about 400 MiB with the release binary, plus
+/// one project's worth of rules while a project that lacks rules is scanned with them
+/// (docs/benchmarks.md). Above it the kernel kills the largest process of the unit instead of
+/// letting it take the machine's memory. `MemorySwapMax=0` goes with it: where there is swap,
+/// `MemoryMax=` alone only moves the excess there (verified in a user unit, ARCHITECTURE.md §13).
 pub const MEMORY_MAX: &str = "2G";
+
+/// `StartLimitIntervalSec=` / `StartLimitBurst=`: a service that fails this often ends in the
+/// `failed` state instead of being restarted for ever (with `RestartSec=5` the default of 5
+/// starts in 10 s can never be reached). Starts by hand count too, so the number leaves room for
+/// a few `ccwm restart`s (v0.1.1 review L4).
+pub const START_LIMIT_INTERVAL: &str = "10min";
+pub const START_LIMIT_BURST: u32 = 10;
 
 /// The unit file `ccwm service install` writes. Only directives verified to work in a **user**
 /// unit with the real daemon are used (ARCHITECTURE.md §13); `ProtectSystem`/`ProtectHome` and
@@ -31,12 +39,19 @@ pub const MEMORY_MAX: &str = "2G";
 /// instead). `MemoryDenyWriteExecute` is left out because it is inherited by `claude --version`,
 /// whose JavaScript runtime needs writable executable memory. The memory limit ([`MEMORY_MAX`])
 /// takes effect where the user manager has the cgroup memory controller (it does on Ubuntu 24.04).
+/// `OOMPolicy=continue`: a `git` or `claude` child that the kernel kills at the limit fails like
+/// any other failed command, and the daemon goes on (the default policy, `stop`, stopped the
+/// whole unit with it); when the daemon itself is killed, `Restart=on-failure` applies.
 pub fn unit_text() -> String {
     format!(
         "# Written by `ccwm service install`; `ccwm service uninstall` removes it.\n\
          # Local changes belong in a drop-in (`systemctl --user edit ccwm`), which a reinstall keeps.\n\
          [Unit]\n\
          Description=CC Workspace Manager (ccwm, unofficial): discover, track and resume Claude Code projects\n\
+         # A daemon that keeps failing stays stopped (`ccwm status` shows it) instead of being\n\
+         # restarted for ever; `systemctl --user reset-failed ccwm` clears it.\n\
+         StartLimitIntervalSec={START_LIMIT_INTERVAL}\n\
+         StartLimitBurst={START_LIMIT_BURST}\n\
          \n\
          [Service]\n\
          Type=exec\n\
@@ -50,10 +65,12 @@ pub fn unit_text() -> String {
          TimeoutStopSec=10\n\
          # A hard limit on the memory of the daemon and its git and claude children together, with\n\
          # no swap on top. ccwm normally needs 20-30 MiB: reaching the limit means something is\n\
-         # wrong, and the kernel then stops the service (systemd starts it again).\n\
-         # To change it, use a drop-in: `systemctl --user edit ccwm` (docs/service.md).\n\
+         # wrong, and the kernel then kills the largest process. A git or claude child that is\n\
+         # killed fails like any failed command and the daemon goes on; a killed daemon is\n\
+         # started again. To change it, use a drop-in: `systemctl --user edit ccwm` (docs/service.md).\n\
          MemoryMax={MEMORY_MAX}\n\
          MemorySwapMax=0\n\
+         OOMPolicy=continue\n\
          UMask=0077\n\
          Nice=10\n\
          IOSchedulingClass=idle\n\
@@ -313,6 +330,7 @@ mod tests {
             "TimeoutStopSec=10",
             "MemoryMax=2G",
             "MemorySwapMax=0",
+            "OOMPolicy=continue",
             "UMask=0077",
             "Nice=10",
             "IOSchedulingClass=idle",
@@ -340,6 +358,19 @@ mod tests {
         assert_eq!(service, directives);
         assert!(u.contains("\n[Install]\nWantedBy=default.target\n"), "{u}");
         assert!(u.contains("\n[Unit]\nDescription="), "{u}");
+        // The start limit belongs to [Unit] (systemd ignores it in [Service]).
+        let unit: Vec<&str> = u
+            .lines()
+            .skip_while(|l| *l != "[Unit]")
+            .skip(1)
+            .take_while(|l| !l.starts_with('['))
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("Description="))
+            .collect();
+        assert_eq!(
+            unit,
+            ["StartLimitIntervalSec=10min", "StartLimitBurst=10"],
+            "{u}"
+        );
         for never in [
             "PrivateDevices",
             "ProtectHome",

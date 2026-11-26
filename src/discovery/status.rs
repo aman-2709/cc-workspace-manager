@@ -80,6 +80,10 @@ pub struct SessionStatus {
     /// Session files skipped because another file has the same session id (one file per id:
     /// the indexed one, else the first by path).
     pub duplicate_ids: u64,
+    /// More session files than one listing holds ([`crate::claude::locate::MAX_FILES`]): the
+    /// rest is not indexed, and sessions in the folders the limit cut off are kept in the index
+    /// even when their file is deleted.
+    pub listing_cut: bool,
     /// Sessions whose cwd names no project, by reason (`home`, `temporary`, `nonexistent`,
     /// `container`, …).
     pub unassigned: std::collections::BTreeMap<&'static str, u64>,

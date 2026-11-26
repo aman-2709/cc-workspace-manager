@@ -738,6 +738,77 @@ async fn new_subdirectories_inside_a_project_are_walked_and_watched() {
     assert!(f.flush().contains(&Signal::Discover(p.join("pkg/sub"))));
 }
 
+/// The walk of a directory created at runtime (v0.1.1 review M1).
+async fn walked(f: &mut Fx) -> (tree::Tree, bool) {
+    match tokio::time::timeout(Duration::from_secs(10), f.cmds.recv()).await {
+        Ok(Some(Cmd::Walked {
+            tree,
+            rules_out_of_date,
+            ..
+        })) => (tree, rules_out_of_date),
+        Ok(Some(_)) => panic!("another command came before the walk of the new directory"),
+        Ok(None) | Err(_) => panic!("the new directory was not walked"),
+    }
+}
+
+/// v0.1.1 review M1: every directory created in (or moved into) a watched project is walked on
+/// a blocking thread of its own, so these walks must compile no ignore rules: with the project's
+/// room in the limit across projects, 24 directories of 4,900 expensive rules took the daemon
+/// past 2 GiB. The walk holds the rules the project holds and no more; an ignore file it meets
+/// is left out, and the project is walked again (that full walk reads it within the limit).
+/// Control: a new directory without ignore files is not a reason to walk the project again.
+#[tokio::test]
+async fn a_new_directory_compiles_no_ignore_rules_and_has_its_project_walked_again() {
+    let mut f = fx();
+    let p = f.project("p", &["src/a.rs"]);
+    fs::write(p.join(".gitignore"), "*.log\n").unwrap();
+    f.plan(&[("p", &p)]);
+    assert_eq!(f.flush(), [], "control: nothing pending");
+
+    // A directory with an ignore file of its own (as a checkout or a `mv` brings it).
+    mkfile(&p.join("vendor/sub/lib.c"));
+    fs::write(p.join("vendor/.gitignore"), "*.o\n").unwrap();
+    f.event(EventKind::Create(CreateKind::Folder), &[&p.join("vendor")]);
+    let (tree, out_of_date) = walked(&mut f).await;
+    assert_eq!(
+        tree.ignore.patterns(),
+        1,
+        "only the rule the project holds (`*.log`): vendor/.gitignore was not compiled"
+    );
+    assert!(tree.ignore.is_ignored(&p.join("vendor/x.log"), false));
+    assert!(!tree.ignore.is_ignored(&p.join("vendor/x.o"), false));
+    assert_eq!(tree.ignore_files_skipped, 1);
+    assert!(out_of_date);
+    f.monitor.on_cmd(Cmd::Walked {
+        owner: Owner::Project("p".into()),
+        tree,
+        rules_out_of_date: out_of_date,
+    });
+    assert!(
+        f.watched().contains(&"p/vendor/sub".to_string()),
+        "{:?}",
+        f.watched()
+    );
+    let s = f.flush();
+    assert!(s.contains(&Signal::Rewalk { id: "p".into() }), "{s:?}");
+
+    // Control: a new directory without an ignore file.
+    mkfile(&p.join("docs/guide.md"));
+    f.event(EventKind::Create(CreateKind::Folder), &[&p.join("docs")]);
+    let (tree, out_of_date) = walked(&mut f).await;
+    assert!(!out_of_date && tree.ignore_files_skipped == 0);
+    f.monitor.on_cmd(Cmd::Walked {
+        owner: Owner::Project("p".into()),
+        tree,
+        rules_out_of_date: out_of_date,
+    });
+    let s = f.flush();
+    assert!(
+        !s.iter().any(|s| matches!(s, Signal::Rewalk { .. })),
+        "{s:?}"
+    );
+}
+
 #[tokio::test]
 async fn overflow_triggers_a_rescan_until_recovered_and_gitignore_edits_a_rewalk() {
     let mut f = fx();

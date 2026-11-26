@@ -16,7 +16,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Directory entries examined per project walk (larger trees are truncated and reported).
 pub const MAX_ENTRIES: usize = 100_000;
@@ -38,8 +39,16 @@ pub const MAX_GITIGNORE_PATTERNS: usize = 5_000;
 /// without this limit, memory grew with their number. The rules go to the most recently active
 /// projects first; a file that does not fit any more is skipped and counted like any other. At
 /// 17-20 KiB per rule that needs a regular expression this is 350-400 MiB in the worst case
-/// (measured: docs/benchmarks.md); ordinary rules cost a small fraction of that.
+/// (measured: docs/benchmarks.md), plus one project's worth while a project that lacks rules is
+/// walked with its own ([`RuleStore::outside_the_limit`]); ordinary rules cost a small fraction
+/// of that.
 pub const MAX_GITIGNORE_PATTERNS_TOTAL: usize = 20_000;
+
+/// A file whose modification or change time is less than this many seconds before the walk's
+/// `now` is compiled but its rules are not kept for reuse: a rewrite to the same size within
+/// the file system's timestamp step of the read would otherwise go unseen (Git's "racy" rule
+/// for its index; v0.1.1 review I5). Such a file is compiled once more at the next walk.
+pub const RACY_SECS: i64 = 2;
 
 /// What identifies the content of an ignore file without reading it: a file whose device, inode,
 /// size, modification time and change time are unchanged is taken to hold the same rules, and
@@ -47,11 +56,12 @@ pub const MAX_GITIGNORE_PATTERNS_TOTAL: usize = 20_000;
 ///
 /// The change time is the one a rewrite cannot avoid: the kernel sets it at every write and
 /// whenever the modification time is set, and nothing can set it back. With it, a file rewritten
-/// in place to the same size with its modification time restored is seen as changed. What is
-/// left unseen: a rewrite to the same size within the file system's timestamp resolution of the
-/// file's previous change (milliseconds on ext4 and tmpfs), until the file changes again or the
-/// daemon restarts. A change of the change time alone (a `chmod`, a new hard link) compiles the
-/// file again, which is harmless.
+/// in place to the same size with its modification time restored is seen as changed. What the
+/// times cannot show is a rewrite to the same size within one step of the file system's clock
+/// (from nanoseconds up to 1 s on ext4 with small inodes, 2 s for FAT's modification time) of a
+/// read: such a file is not reused at all while it is that recent ([`RACY_SECS`]). A change of
+/// the change time alone (a `chmod`, a new hard link) compiles the file again, which is
+/// harmless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileId {
     dev: u64,
@@ -74,6 +84,13 @@ impl FileId {
             mtime: (md.mtime(), md.mtime_nsec()),
             ctime: (md.ctime(), md.ctime_nsec()),
         })
+    }
+
+    /// The file last changed at least [`RACY_SECS`] before `now` (whole seconds): its rules may
+    /// be kept for reuse. A file changed more recently, or in the future, may be rewritten
+    /// within the same step of the file system's clock without its times showing it.
+    fn settled(&self, now: i64) -> bool {
+        self.mtime.0.max(self.ctime.0).saturating_add(RACY_SECS) < now
     }
 }
 
@@ -103,7 +120,8 @@ struct Layer {
     /// The file's rule lines (every line that can hold a rule): what the limits on rules count,
     /// before anything is compiled.
     rule_lines: usize,
-    /// The file the rules were read from (`None`: rules given as text, never reused).
+    /// The file the rules were read from (`None`: never reused — rules given as text, or a
+    /// file that had changed too recently, [`RACY_SECS`]).
     file: Option<FileId>,
 }
 
@@ -147,6 +165,8 @@ struct Admission<'a> {
     denied_rules: usize,
     /// The layers of the project's previous rules ([`TreeOptions::reuse`]) by location.
     reuse: HashMap<(&'a Path, (usize, u8)), &'a Arc<Layer>>,
+    /// [`TreeOptions::now`]: files changed since `now - RACY_SECS` are not kept for reuse.
+    now: i64,
 }
 
 impl<'a> Admission<'a> {
@@ -160,6 +180,7 @@ impl<'a> Admission<'a> {
                 .iter()
                 .map(|l| ((l.dir.as_path(), l.rank), l))
                 .collect(),
+            now: o.now,
         }
     }
 }
@@ -237,6 +258,7 @@ impl GitIgnore {
     /// A file that is unchanged ([`FileId`]) since its rules were compiled — for this project's
     /// current rules, or for the ones in `adm.reuse` — is not read at all: its layer is taken
     /// over, and the limits decide from the numbers recorded with it, exactly as for a fresh read.
+    /// A file compiled while it is very recent ([`RACY_SECS`]) is not kept for reuse.
     fn load(
         &mut self,
         dir: &Path,
@@ -288,7 +310,8 @@ impl GitIgnore {
             self.set(dir, rank, None);
             return Some(Skipped::ByAllowance);
         }
-        let layer = known.or_else(|| Self::compile(dir, exclude_file, &text?, Some(id)));
+        let reusable = id.settled(adm.now).then_some(id);
+        let layer = known.or_else(|| Self::compile(dir, exclude_file, &text?, reusable));
         self.set(dir, rank, layer);
         None
     }
@@ -296,30 +319,75 @@ impl GitIgnore {
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
     }
+
+    /// The same compiled rules as `other`, file for file (the same layers, not equal copies).
+    pub fn same_layers(&self, other: &GitIgnore) -> bool {
+        self.layers.len() == other.layers.len()
+            && self
+                .layers
+                .iter()
+                .zip(&other.layers)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+    }
+
+    /// These rules, and `other`'s at the locations these have none: what a walk may reuse when
+    /// two earlier sets of rules exist ([`TreeOptions::reuse`]; a layer is still taken over
+    /// only for a file that did not change).
+    pub fn with_fallback(&self, other: &GitIgnore) -> GitIgnore {
+        let here: HashSet<(&Path, (usize, u8))> = self
+            .layers
+            .iter()
+            .map(|l| (l.dir.as_path(), l.rank))
+            .collect();
+        let mut layers: Vec<Arc<Layer>> = self.layers.clone();
+        layers.extend(
+            other
+                .layers
+                .iter()
+                .filter(|l| !here.contains(&(l.dir.as_path(), l.rank)))
+                .cloned(),
+        );
+        layers.sort_by_key(|l| l.rank); // stable: the order `is_ignored` relies on
+        GitIgnore { layers }
+    }
 }
 
 /// The ignore rules that the monitored projects keep, shared by everything that walks project
 /// trees. It does two things:
 ///
-/// - **The limit across projects** ([`MAX_GITIGNORE_PATTERNS_TOTAL`]). Every walk gets its
-///   allowance here, and all projects together never hold more than the limit: a full walk
+/// - **The limit across projects** ([`MAX_GITIGNORE_PATTERNS_TOTAL`]). Every full walk gets
+///   its allowance here, and all projects together never hold more than the limit: a full walk
 ///   [`begin`](Self::begin)s with what the others leave (reserved for it until it
-///   [`settle`](Self::settle)s, so two walks at once cannot both take the last room).
-///   **Who** holds the rules when they do not fit all is decided by recency, not by who came
-///   first: [`rebalance`](Self::rebalance) names the projects to walk again so that the most
-///   recently active ones have theirs. That outcome is a function of the projects alone (their
-///   last activity, their path as the tie-break, the rules they want), not of when they were
-///   walked.
+///   [`settle`](Self::settle)s, so two walks at once cannot both take the last room; a second
+///   full walk of the same project waits for the first). A subtree walk holds no more than the
+///   rules it starts from. **Who** holds the rules when they do not fit all is decided by
+///   recency, not by who came first: [`rebalance`](Self::rebalance) names the projects to walk
+///   again so that the most recently active ones have theirs. That outcome is a function of
+///   the projects alone (their last activity, their path as the tie-break, the rules they
+///   want), not of when they were walked. The one walk that compiles beyond the limit — a
+///   project that lacks rules, walked with its own for that walk alone — runs one at a time
+///   ([`outside_the_limit`](Self::outside_the_limit)).
 /// - **Reuse.** It keeps each project's rules of its last full walk, and hands them to the next
 ///   one, which takes over the compiled rules of every ignore file that did not change (same
-///   device, inode, size, modification time and change time). Without it every scan of a project without watches compiled all its rules
-///   again (memory several times the kept size in a glibc build). A project that is no longer
-///   monitored is dropped ([`retain`](Self::retain)), and with it its rules.
+///   device, inode, size, modification time and change time). Without it every scan of a
+///   project without watches compiled all its rules again (memory several times the kept size
+///   in a glibc build). A project that is no longer monitored is dropped
+///   ([`retain`](Self::retain)), and with it its rules.
 #[derive(Debug)]
 pub struct RuleStore {
     limit: usize,
     projects: Mutex<HashMap<PathBuf, Kept>>,
+    /// Notified whenever a full walk settles (another full walk of that project may start).
+    settled: Condvar,
+    /// Full walks begun so far: [`mark`](Self::mark) and [`Kept::begun`].
+    begins: AtomicU64,
+    /// The thread that runs the walks beyond the limit ([`outside_the_limit`](Self::outside_the_limit)),
+    /// started by the first.
+    beyond: Mutex<Option<std::sync::mpsc::Sender<Job>>>,
 }
+
+/// A walk for [`RuleStore::outside_the_limit`]'s thread.
+type Job = Box<dyn FnOnce() + Send>;
 
 /// What one project keeps.
 #[derive(Debug)]
@@ -335,6 +403,9 @@ struct Kept {
     walked_with: usize,
     /// Set while a full walk runs: the walk's allowance, counted instead of `rules`.
     reserved: Option<usize>,
+    /// The value of [`RuleStore::begins`] its last full walk began with: a list of monitored
+    /// projects read before that does not decide about it ([`RuleStore::retain`]).
+    begun: u64,
 }
 
 impl Kept {
@@ -364,12 +435,19 @@ impl RuleStore {
         Self {
             limit,
             projects: Mutex::new(HashMap::new()),
+            settled: Condvar::new(),
+            begins: AtomicU64::new(0),
+            beyond: Mutex::new(None),
         }
     }
 
-    fn with<T>(&self, f: impl FnOnce(&mut HashMap<PathBuf, Kept>) -> T) -> T {
+    fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, Kept>> {
         // A panic while the lock was held leaves numbers that are still usable.
-        f(&mut self.projects.lock().unwrap_or_else(|e| e.into_inner()))
+        self.projects.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut HashMap<PathBuf, Kept>) -> T) -> T {
+        f(&mut self.lock())
     }
 
     /// What the other projects leave of the limit, at most [`MAX_GITIGNORE_PATTERNS`].
@@ -382,32 +460,45 @@ impl RuleStore {
         MAX_GITIGNORE_PATTERNS.min(self.limit.saturating_sub(others))
     }
 
-    /// The rules project `root` may hold in a walk that keeps nothing (a subtree walk, which
-    /// starts from the project's rules).
-    pub fn room(&self, root: &Path) -> usize {
+    /// What a full walk of `root` would be allowed now (tests).
+    #[cfg(test)]
+    fn room(&self, root: &Path) -> usize {
         self.with(|projects| self.room_in(projects, root))
     }
 
     /// Start a full walk of project `root`, last active at `recency`: what it may keep — what
     /// the other projects leave of the limit, and no more than `at_most` — and its previous
     /// rules to reuse. The allowance stays reserved for it until [`settle`](Self::settle).
+    ///
+    /// One full walk per project at a time: while another one of `root` runs, this waits for it
+    /// to settle (then reuses what it compiled). Two at once would share one reservation, and the
+    /// first to settle would release it while the other still runs (v0.1.1 review L1). Every
+    /// `begin` must be followed by one `settle`, on every path.
     pub fn begin(&self, root: &Path, recency: Option<i64>, at_most: usize) -> Grant {
-        self.with(|projects| {
-            let max_patterns = at_most.min(self.room_in(projects, root));
-            let kept = projects.entry(root.to_path_buf()).or_insert_with(|| Kept {
-                recency,
-                rules: Arc::default(),
-                wanted: 0,
-                walked_with: 0,
-                reserved: None,
-            });
-            kept.recency = recency;
-            kept.reserved = Some(max_patterns);
-            Grant {
-                max_patterns,
-                reuse: (!kept.rules.is_empty()).then(|| Arc::clone(&kept.rules)),
-            }
-        })
+        let mut projects = self.lock();
+        while projects.get(root).is_some_and(|k| k.reserved.is_some()) {
+            projects = self
+                .settled
+                .wait(projects)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        let max_patterns = at_most.min(self.room_in(&projects, root));
+        let begun = self.begins.fetch_add(1, Ordering::SeqCst) + 1;
+        let kept = projects.entry(root.to_path_buf()).or_insert_with(|| Kept {
+            recency,
+            rules: Arc::default(),
+            wanted: 0,
+            walked_with: 0,
+            reserved: None,
+            begun,
+        });
+        kept.recency = recency;
+        kept.reserved = Some(max_patterns);
+        kept.begun = begun;
+        Grant {
+            max_patterns,
+            reuse: (!kept.rules.is_empty()).then(|| Arc::clone(&kept.rules)),
+        }
     }
 
     /// The full walk of `root` that [`begin`](Self::begin) started is over; `tree` is its result
@@ -427,11 +518,69 @@ impl RuleStore {
                 }
             }
         });
+        self.settled.notify_all();
+    }
+
+    /// For [`retain`](Self::retain): take it **before** reading the list of monitored projects.
+    pub fn mark(&self) -> u64 {
+        self.begins.load(Ordering::SeqCst)
     }
 
     /// Forget the projects whose root `keep` rejects (no longer monitored), and their rules.
-    pub fn retain(&self, keep: impl Fn(&Path) -> bool) {
-        self.with(|projects| projects.retain(|root, _| keep(root)));
+    /// `keep` judges by a list of projects read after [`mark`](Self::mark) returned `since`:
+    /// a project whose full walk began after that, or that is being walked, may have joined
+    /// since the list was read and is never dropped by it (v0.1.1 review L2: projects enrolled
+    /// meanwhile were dropped while their rules stayed in use, uncounted).
+    pub fn retain(&self, since: u64, keep: impl Fn(&Path) -> bool) {
+        self.with(|projects| {
+            projects.retain(|root, k| k.reserved.is_some() || k.begun > since || keep(root));
+        });
+    }
+
+    /// Run `f`, a walk that compiles a project's rules beyond the limit across projects for
+    /// itself alone (they must be dropped inside `f`), and wait for its result. All such walks
+    /// run on one thread of their own, one after another: beyond the limit there is at most one
+    /// project's worth of rules at any time, and a glibc build reuses the memory the previous
+    /// one freed (its allocator keeps freed memory per thread: on the blocking pool's changing
+    /// threads, every scan of a project that lacks rules added its rules' worth, measured).
+    /// `None`: `f` panicked. Without that thread (it could not be started), `f` runs here.
+    pub fn outside_the_limit<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        let job: Job = Box::new(move || {
+            let _ = reply.send(f());
+        });
+        let mut worker = self.beyond.lock().unwrap_or_else(|e| e.into_inner());
+        if worker.is_none() {
+            *worker = Self::beyond_the_limit_thread();
+        }
+        let unsent = match worker.as_ref() {
+            Some(w) => w.send(job).err().map(|e| e.0),
+            None => Some(job),
+        };
+        match unsent {
+            // No thread: here, under the lock, so still one at a time.
+            Some(job) => job(),
+            None => drop(worker),
+        }
+        result.recv().ok()
+    }
+
+    /// The thread of [`outside_the_limit`](Self::outside_the_limit): it lives as long as the
+    /// store, and a walk that panics does not end it.
+    fn beyond_the_limit_thread() -> Option<std::sync::mpsc::Sender<Job>> {
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("ccwm-rules".into())
+            .spawn(move || {
+                for job in queue {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            })
+            .ok()?;
+        Some(jobs)
     }
 
     /// The last activity of project `root` is now `recency` (its place in the order).
@@ -479,10 +628,15 @@ impl RuleStore {
         })
     }
 
-    /// Some project does not have all the rules it wants: the only state in which
-    /// [`rebalance`](Self::rebalance) can have anything to do.
+    /// Some project does not have all the rules it wants, or all of them together hold more
+    /// than the limit: the only states in which [`rebalance`](Self::rebalance) can have
+    /// anything to do. (The second cannot arise from walks that begin and settle as they
+    /// should; it is checked so that whatever caused it is corrected, not kept.)
     pub fn contended(&self) -> bool {
-        self.with(|projects| projects.values().any(|k| k.rules.patterns() < k.wanted))
+        self.with(|projects| {
+            projects.values().any(|k| k.rules.patterns() < k.wanted)
+                || projects.values().map(Kept::held).sum::<usize>() > self.limit
+        })
     }
 
     /// Project `root` does not have all the rules it wants.
@@ -544,8 +698,11 @@ pub struct TreeOptions<'a> {
     /// File times after this are clamped to it (a future mtime must not pin a project on top).
     pub now: i64,
     pub max_entries: usize,
-    /// Ignore rules the project may hold: [`MAX_GITIGNORE_PATTERNS`], or less when the limit
-    /// across projects leaves it less ([`RuleStore`]).
+    /// Ignore rules the project may hold. A full walk: what [`RuleStore::begin`] grants (the
+    /// limit across projects), or [`MAX_GITIGNORE_PATTERNS`] for the walk outside that limit
+    /// ([`RuleStore::outside_the_limit`]). A subtree walk ([`walk_from`]): the rules of its
+    /// `base`, no more — it takes over what the project holds and compiles nothing beyond
+    /// that, so any number of them at once cost no rules (v0.1.1 review M1).
     pub max_patterns: usize,
     /// The rules the project has from its last full walk: the compiled rules of every ignore
     /// file that did not change since are taken over instead of being compiled again.
@@ -574,6 +731,23 @@ pub struct Tree {
     /// those of the files that only the walk's allowance kept out. The same whatever the
     /// allowance was (meaningful for a full walk).
     pub ignore_rules_wanted: usize,
+}
+
+impl Tree {
+    /// The walk's allowance left out rules that the project's own limits would have let in: the
+    /// project lacks rules (a full walk), or a subtree walk met an ignore file the project's
+    /// rules do not hold.
+    pub fn left_rules_out(&self) -> bool {
+        self.ignore_rules_wanted > self.ignore.patterns()
+    }
+
+    /// A subtree walk that started from the project's rules `base` found its ignore files not
+    /// as `base` holds them: a new one it left out, or one that changed. The project's rules are
+    /// out of date, and the project is to be walked whole (which reads such files within the
+    /// limit across projects).
+    pub fn rules_out_of_date(&self, base: &GitIgnore) -> bool {
+        self.left_rules_out() || !self.ignore.same_layers(base)
+    }
 }
 
 struct Frame {
@@ -1601,7 +1775,7 @@ mod tests {
         store.settle(c, Some(&walked(c, 0, 0)));
         assert_eq!((store.total(), store.kept(c)), (7, 0));
         // A project that is no longer monitored frees its share.
-        store.retain(|root| root != b);
+        store.retain(store.mark(), |root| root != b);
         assert_eq!((store.room(c), store.total()), (9, 1));
     }
 
@@ -1615,7 +1789,7 @@ mod tests {
         let grant = store.begin(a, None, NO_CAP);
         assert!(Arc::ptr_eq(&grant.reuse.unwrap(), &first.ignore));
         store.settle(a, Some(&first));
-        store.retain(|_| false);
+        store.retain(store.mark(), |_| false);
         assert!(
             store.begin(a, None, NO_CAP).reuse.is_none(),
             "forgotten with the project"
@@ -1711,7 +1885,7 @@ mod tests {
         assert_eq!(store.rebalance(), []);
 
         // A project leaves: the next in the order takes what it frees.
-        store.retain(|root| root != recent);
+        store.retain(store.mark(), |root| root != recent);
         assert_eq!(store.rebalance(), [(old.to_path_buf(), 6)]);
         walk_through(&store, old, Some(100), 6, 6);
         assert_eq!(store.rebalance(), []);
@@ -1775,6 +1949,249 @@ mod tests {
         );
         store.begin(a, Some(100), NO_CAP);
         assert_eq!(store.rebalance(), [(b.to_path_buf(), 8)]);
+    }
+
+    /// v0.1.1 review L1: two full walks of one project from two tasks. The second waits until
+    /// the first has settled, so the project's reservation is never released while a walk of it
+    /// still runs, and all projects together stay within the limit. (Before, the first `settle`
+    /// released the room the second walk was using: another project took it, and the store
+    /// ended at 18 rules of 10.)
+    #[test]
+    fn a_second_full_walk_of_a_project_waits_for_the_first_to_settle() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (a, b) = (Path::new("/p/a"), Path::new("/p/b"));
+        let store = Arc::new(RuleStore::new(10));
+        assert_eq!(store.begin(a, Some(1), NO_CAP).max_patterns, 10);
+        let (began_tx, began) = mpsc::channel();
+        let (end, end_rx) = mpsc::channel::<()>();
+        let second = std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                let grant = store.begin(a, Some(1), NO_CAP);
+                began_tx.send(grant.max_patterns).unwrap();
+                end_rx.recv().unwrap();
+                store.settle(a, Some(&walked(a, grant.max_patterns, 10)));
+            }
+        });
+        assert!(
+            began.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the second walk began while the first one ran"
+        );
+        store.settle(a, Some(&walked(a, 2, 2))); // the first walk ends
+        assert_eq!(
+            began.recv_timeout(Duration::from_secs(10)).unwrap(),
+            10,
+            "then the second one begins, with the project's room"
+        );
+        // It holds that room while it runs: another project gets none of it.
+        let other = store.begin(b, Some(2), NO_CAP);
+        assert_eq!(other.max_patterns, 0);
+        store.settle(b, Some(&walked(b, other.max_patterns, 8)));
+        end.send(()).unwrap();
+        second.join().unwrap();
+        assert_eq!((store.kept(a), store.kept(b), store.total()), (10, 0, 10));
+    }
+
+    /// v0.1.1 review L1: should all projects together ever hold more than the limit (a walk
+    /// that kept more than it was allowed), the store does not count that as settled:
+    /// `contended` says so although every project has what it wants, and `rebalance` takes the
+    /// excess back.
+    #[test]
+    fn rules_held_above_the_limit_are_contended_and_given_back() {
+        let (a, b) = (Path::new("/p/a"), Path::new("/p/b"));
+        let store = RuleStore::new(10);
+        walk_through(&store, a, Some(200), 6, NO_CAP);
+        let grant = store.begin(b, Some(100), NO_CAP);
+        assert_eq!(grant.max_patterns, 4);
+        store.settle(b, Some(&walked(b, 6, 6))); // kept more than it was allowed
+        assert_eq!(store.total(), 12);
+        assert!(!store.lacks_rules(a) && !store.lacks_rules(b));
+        assert!(
+            store.contended(),
+            "nobody lacks rules, but there are too many"
+        );
+        assert_eq!(store.rebalance(), [(b.to_path_buf(), 4)]);
+        walk_through(&store, b, Some(100), 6, 4);
+        assert_eq!(store.total(), 10);
+        assert_eq!(store.rebalance(), []);
+    }
+
+    /// v0.1.1 review L2: `retain` judges by a list of the monitored projects read after
+    /// `mark`. A project that another task enrolled while the list was read (its walk began
+    /// after the mark), and one being walked, are not dropped by that list; a project that left
+    /// before the mark is, and so is any of them by the next list that no longer has it.
+    #[test]
+    fn a_list_read_before_a_walk_never_drops_the_project_it_walked() {
+        let (left, walking, joined) = (
+            Path::new("/p/left"),
+            Path::new("/p/walking"),
+            Path::new("/p/joined"),
+        );
+        let store = RuleStore::new(100);
+        walk_through(&store, left, None, 3, NO_CAP);
+        store.begin(walking, None, 10);
+        let since = store.mark();
+        // The list is read now; none of the three is in it.
+        walk_through(&store, joined, None, 4, NO_CAP);
+        store.retain(since, |_| false);
+        assert_eq!(store.kept(left), 0, "it left before the mark");
+        assert_eq!(store.kept(joined), 4, "enrolled after the mark");
+        store.settle(walking, Some(&walked(walking, 2, 2)));
+        assert_eq!(store.kept(walking), 2, "it was being walked");
+        assert_eq!(store.total(), 6);
+        // The next list decides about them.
+        store.retain(store.mark(), |root| root == walking);
+        assert_eq!((store.kept(joined), store.kept(walking)), (0, 2));
+    }
+
+    /// v0.1.1 review M1: a subtree walk that is allowed only the rules of its base compiles no
+    /// ignore file beyond them. An unchanged file is taken over; a new one is left out and
+    /// counted; a changed one is read again. The last two make the project's rules out of
+    /// date (the project is then walked whole), the first does not.
+    #[test]
+    fn a_subtree_walk_holds_no_more_rules_than_its_base() {
+        let f = fx();
+        let r = &f.root;
+        fs::create_dir_all(r.join(".git")).unwrap();
+        fs::create_dir(r.join("known")).unwrap();
+        fs::write(r.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(r.join("known/.gitignore"), "k.tmp\n").unwrap();
+        let none = HashSet::new();
+        let mut o = opts(&f.ex, &none, true);
+        let full = walk(r, &o).unwrap();
+        assert_eq!(full.ignore.patterns(), 2);
+        o.max_patterns = full.ignore.patterns(); // what a subtree walk gets
+        let base = &full.ignore;
+
+        let same = walk_from(r, &r.join("known"), base, &o).unwrap();
+        assert!(same_layer(base, &same.ignore, &r.join("known"), false));
+        assert!(!same.rules_out_of_date(base), "nothing new or changed");
+
+        fs::create_dir(r.join("new")).unwrap();
+        fs::write(r.join("new/.gitignore"), "n.tmp\n").unwrap();
+        let new = walk_from(r, &r.join("new"), base, &o).unwrap();
+        assert_eq!(new.ignore.patterns(), 2, "nothing compiled");
+        assert!(!new.ignore.is_ignored(&r.join("new/n.tmp"), false));
+        assert_eq!(new.ignore_files_skipped, 1);
+        assert!(new.left_rules_out() && new.rules_out_of_date(base));
+        // Control: with room in the limit, the same walk compiles the file (what every walk of
+        // a new directory did before), and the rules are still out of date.
+        o.max_patterns = MAX_GITIGNORE_PATTERNS;
+        let roomy = walk_from(r, &r.join("new"), base, &o).unwrap();
+        assert!(roomy.ignore.is_ignored(&r.join("new/n.tmp"), false));
+        assert!(roomy.rules_out_of_date(base));
+
+        o.max_patterns = base.patterns();
+        fs::write(r.join("known/.gitignore"), "k2.tmp\n").unwrap();
+        let changed = walk_from(r, &r.join("known"), base, &o).unwrap();
+        assert!(changed.rules_out_of_date(base), "a changed file");
+    }
+
+    /// v0.1.1 review I5: a file whose times are less than [`RACY_SECS`] before the walk's
+    /// `now` may still be rewritten within the same step of the file system's clock without
+    /// its times showing it. Its rules are compiled and apply, but they are not kept for reuse:
+    /// the next walk compiles the file again. Once it is old enough, its rules are reused.
+    #[test]
+    fn an_ignore_file_changed_just_before_the_walk_is_not_reused() {
+        let f = fx();
+        let r = &f.root;
+        fs::create_dir(r.join(".git")).unwrap();
+        let file = r.join(".gitignore");
+        fs::write(&file, "a.tmp\n").unwrap();
+        let id = FileId::of(&fs::File::open(&file).unwrap()).unwrap();
+        let changed = id.mtime.0.max(id.ctime.0);
+        let none = HashSet::new();
+        let mut o = opts(&f.ex, &none, true);
+        o.now = changed + RACY_SECS;
+        let first = walk(r, &o).unwrap();
+        assert!(
+            first.ignore.is_ignored(&r.join("a.tmp"), false),
+            "they apply"
+        );
+        o.reuse = Some(&first.ignore);
+        let again = walk(r, &o).unwrap();
+        assert!(
+            !same_layer(&first.ignore, &again.ignore, r, false),
+            "compiled again"
+        );
+        o.now = changed + RACY_SECS + 1;
+        o.reuse = Some(&again.ignore);
+        let settled = walk(r, &o).unwrap();
+        o.reuse = Some(&settled.ignore);
+        let reused = walk(r, &o).unwrap();
+        assert!(
+            same_layer(&settled.ignore, &reused.ignore, r, false),
+            "old enough"
+        );
+
+        let at = |mtime: i64, ctime: i64| FileId {
+            mtime: (mtime, 999_999_999),
+            ctime: (ctime, 0),
+            ..id
+        };
+        assert!(!at(100, 100).settled(102));
+        assert!(at(100, 100).settled(103));
+        assert!(!at(90, 101).settled(103), "the change time counts");
+        assert!(!at(101, 90).settled(103), "the modification time counts");
+        assert!(!at(500, 500).settled(103), "a future time is never settled");
+    }
+
+    /// v0.1.1 review M2: the walks that compile a project's rules beyond the limit run one at a
+    /// time, whichever task asks: beyond the limit there is never more than one project's worth.
+    #[test]
+    fn walks_beyond_the_limit_run_one_at_a_time() {
+        use std::sync::atomic::AtomicUsize;
+        let store = Arc::new(RuleStore::default());
+        let (inside, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let walks: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, inside, most) =
+                    (Arc::clone(&store), Arc::clone(&inside), Arc::clone(&most));
+                std::thread::spawn(move || {
+                    store.outside_the_limit(move || {
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    });
+                })
+            })
+            .collect();
+        for w in walks {
+            w.join().unwrap();
+        }
+        assert_eq!(most.load(Ordering::SeqCst), 1);
+        // They all ran on the one thread of their own; one that panics does not end it.
+        let thread = || std::thread::current().name().map(str::to_string);
+        assert_eq!(
+            store.outside_the_limit(thread),
+            Some(Some("ccwm-rules".into()))
+        );
+        assert_eq!(
+            store.outside_the_limit(|| panic!("a walk that failed")),
+            None::<()>
+        );
+        assert_eq!(store.outside_the_limit(|| 7), Some(7));
+    }
+
+    #[test]
+    fn rules_with_a_fallback_take_the_other_layers_only_where_they_have_none() {
+        let (p, sub) = (Path::new("/p"), Path::new("/p/sub"));
+        let mut mine = GitIgnore::default();
+        mine.add(p, false, b"*.a\n");
+        let mut other = GitIgnore::default();
+        other.add(p, false, b"*.b\n");
+        other.add(sub, false, b"*.c\n");
+        let both = mine.with_fallback(&other);
+        assert_eq!(both.layers.len(), 2);
+        assert!(same_layer(&both, &mine, p, false));
+        assert!(same_layer(&both, &other, sub, false));
+        assert!(both.is_ignored(Path::new("/p/x.a"), false));
+        assert!(!both.is_ignored(Path::new("/p/x.b"), false));
+        assert!(both.is_ignored(Path::new("/p/sub/x.c"), false));
+        assert!(both.same_layers(&mine.with_fallback(&other)));
+        assert!(!both.same_layers(&mine));
     }
 
     /// A file that grew past the limit loses the rules read earlier: they no longer describe it.

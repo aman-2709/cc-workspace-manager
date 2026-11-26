@@ -1172,7 +1172,8 @@ async fn settings_puts_refuse_broad_roots_and_home_as_the_session_directory() {
         (roots(&[link]), "discovery.roots must not contain /"),
         (
             roots(&["/home/u/../.."]),
-            "discovery.roots must be an absolute path",
+            // v0.1.1 review I1: no promise about `.`, which is accepted (below).
+            "discovery.roots must be an absolute path without `..`",
         ),
         (
             roots(&["relative"]),

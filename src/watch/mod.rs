@@ -105,10 +105,12 @@ pub enum Cmd {
     /// Watch exactly these session directories (Claude Code's `projects/` first, then its
     /// `<encoded-dir>` children), non-recursively; others watched for sessions are dropped.
     WatchSessions(Vec<PathBuf>),
-    /// Internal: a walk of a directory created at runtime finished.
+    /// Internal: a walk of a directory created at runtime finished. `rules_out_of_date`: it met
+    /// an ignore file that the project's rules do not hold ([`Tree::rules_out_of_date`]).
     Walked {
         owner: Owner,
         tree: Tree,
+        rules_out_of_date: bool,
     },
 }
 
@@ -173,6 +175,9 @@ pub struct MonitorStatus {
     /// project or across projects), over all projects (their rules do not apply; see
     /// [`tree::MAX_GITIGNORE_BYTES`] and [`tree::MAX_GITIGNORE_PATTERNS_TOTAL`]).
     pub ignore_files_skipped: u64,
+    /// The names of the projects that lack ignore rules because of the limit across projects
+    /// (sorted): file events in them are judged without those rules; their scans use them.
+    pub ignore_rules_limited: Vec<String>,
     /// Real failures only: no inotify instance, a queue overflow being recovered, or projects
     /// without any watch (polled). Partly watched projects are normal operation (§5.1).
     pub degraded: bool,
@@ -234,7 +239,8 @@ pub struct Settings {
     pub max_user_watches: Option<u64>,
     pub debounce: Duration,
     pub events_per_project: usize,
-    /// The ignore rules the projects keep (the tracker's walks use the same store).
+    /// The ignore rules the projects keep (the tracker's walks use the same store; the monitor
+    /// only reports which projects lack theirs).
     pub rules: Arc<tree::RuleStore>,
 }
 
@@ -510,7 +516,11 @@ impl Monitor {
             Cmd::Retry { id, roots, dirs } => self.retry(&id, &roots, &dirs),
             Cmd::OverflowRecovered => self.recovering = false,
             Cmd::WatchSessions(dirs) => self.watch_sessions(dirs),
-            Cmd::Walked { owner, tree } => self.watch_new_tree(&owner, &tree),
+            Cmd::Walked {
+                owner,
+                tree,
+                rules_out_of_date,
+            } => self.watch_new_tree(&owner, &tree, rules_out_of_date),
         }
     }
 
@@ -719,16 +729,25 @@ impl Monitor {
     }
 
     /// A directory created at runtime was walked: watch it and its eligible subdirectories,
-    /// shallow first (refusals make the project partly watched).
-    fn watch_new_tree(&mut self, owner: &Owner, tree: &Tree) {
+    /// shallow first (refusals make the project partly watched). When the walk met ignore files
+    /// that the project's rules do not hold, the project is walked again (debounced, like a
+    /// changed `.gitignore`): that full walk reads them within the limit across projects, and
+    /// from then on they apply to the events in the new directory.
+    fn watch_new_tree(&mut self, owner: &Owner, tree: &Tree, rules_out_of_date: bool) {
         let Owner::Project(id) = owner else {
             return;
         };
+        if !self.projects.contains_key(id) {
+            return; // removed meanwhile
+        }
         let mut dirs: Vec<&PathBuf> = tree.dirs.iter().collect();
         dirs.sort_by_key(|d| d.components().count());
         let mut limit = None;
         for d in dirs {
             self.watch_dir(id, d, &mut limit);
+        }
+        if rules_out_of_date {
+            self.pending_mut(id).rewalk = true;
         }
     }
 
@@ -1079,6 +1098,13 @@ impl Monitor {
 
     /// Walk a directory created inside project `id` with the project's rules (exclusions, its
     /// ignore layers, depth counted from the project root), then watch the result.
+    ///
+    /// Each such walk runs on a blocking thread of its own, and a moved-in tree or a checkout
+    /// brings many directories at once. So the walk holds no more rules than the project does:
+    /// it takes over the layers of unchanged files and compiles nothing beyond them (v0.1.1
+    /// review M1: with the project's room in the limit instead, 24 directories of 4,900
+    /// expensive rules each took the daemon past 2 GiB). An ignore file it leaves out marks the
+    /// project's rules out of date ([`Cmd::Walked`]).
     fn walk_new_dir(&self, id: &str, dir: &Path, git_aware: bool) {
         let (Some(ex), Some(state)) = (self.exclusions_for(dir), self.projects.get(id)) else {
             return;
@@ -1098,7 +1124,6 @@ impl Monitor {
             self.settings.same_file_system,
             self.clock.now(),
         );
-        let max_patterns = self.settings.rules.room(&root);
         tokio::task::spawn_blocking(move || {
             let opts = TreeOptions {
                 exclusions: &ex,
@@ -1109,12 +1134,17 @@ impl Monitor {
                 repo_root: None,
                 now,
                 max_entries: tree::MAX_ENTRIES,
-                max_patterns,
+                max_patterns: ignore.patterns(),
                 // A subtree walk starts from the project's rules: they are what it reuses.
                 reuse: None,
             };
             if let Ok(tree) = tree::walk_from(&root, &dir, &ignore, &opts) {
-                let _ = tx.blocking_send(Cmd::Walked { owner, tree });
+                let rules_out_of_date = tree.rules_out_of_date(&ignore);
+                let _ = tx.blocking_send(Cmd::Walked {
+                    owner,
+                    tree,
+                    rules_out_of_date,
+                });
             }
         });
     }
@@ -1228,9 +1258,20 @@ impl Monitor {
         }
         let ignore_files_skipped: u64 =
             self.projects.values().map(|p| p.ignore_files_skipped).sum();
+        let mut ignore_rules_limited: Vec<String> = self
+            .projects
+            .values()
+            .filter(|p| self.settings.rules.lacks_rules(&p.root))
+            .map(|p| {
+                p.root
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            })
+            .collect();
+        ignore_rules_limited.sort();
         if ignore_files_skipped > 0 {
             advice.push(format!(
-                "{ignore_files_skipped} .gitignore or .git/info/exclude file(s) were skipped: larger than {} KiB, or the project has more than {} KiB or {} rules of ignore files, or all projects together have more than {} rules (the most recently active projects keep theirs). Their rules do not apply, so files they would ignore count as activity.",
+                "{ignore_files_skipped} .gitignore or .git/info/exclude file(s) were skipped: larger than {} KiB, or the project has more than {} KiB or {} rules of ignore files, or all projects together have more than {} rules (the most recently active projects keep theirs). Their rules do not apply, so files they would ignore count as activity; only the scans of a project that the limit across projects holds back use all of its rules (compiled for that scan alone).",
                 tree::MAX_GITIGNORE_BYTES / 1024,
                 tree::MAX_GITIGNORE_TOTAL_BYTES / 1024,
                 tree::MAX_GITIGNORE_PATTERNS,
@@ -1278,6 +1319,7 @@ impl Monitor {
                 .filter(|o| **o == Owner::Sessions)
                 .count(),
             ignore_files_skipped,
+            ignore_rules_limited,
             degraded: !has_backend || polled > 0 || self.recovering,
             advice,
             projects,

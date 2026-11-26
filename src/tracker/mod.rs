@@ -184,7 +184,8 @@ impl Tracker {
         }
     }
 
-    /// Stop a running scan (shutdown).
+    /// Stop a running scan (shutdown). Send the stop to [`run_reconciler`](Self::run_reconciler)
+    /// **before** this: it wakes the reconciler, which otherwise starts another reconciliation.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
         self.refresh.notify_one();
@@ -296,6 +297,7 @@ impl Tracker {
             }
             self.refresh_polled(rescan_all).await?;
         }
+        self.forget_departed().await?;
         self.rebalance_rules().await?;
 
         let retention = now - self.live().retention_secs;
@@ -503,8 +505,7 @@ impl Tracker {
         let trees = self.walk_many(jobs, &tracked).await;
         let mut plan = Vec::new();
         for (id, tree) in trees {
-            self.record_inferred(&tracked, &id, tree.newest.as_ref())
-                .await;
+            self.record_inferred(&id, tree.newest.as_ref()).await;
             plan.push(WatchProject { id, tree });
         }
         plan.sort_by_key(|p| std::cmp::Reverse(p.tree.newest.as_ref().map(|n| n.0)));
@@ -536,10 +537,14 @@ impl Tracker {
         let mut partial: Vec<(String, PathBuf, crate::watch::PollTarget)> = Vec::new();
         for t in tracked.iter().filter(|t| !t.missing && !t.ignored) {
             let job = (t.id.clone(), PathBuf::from(&t.path));
+            // A partly watched project that lacks ignore rules is walked whole: a subtree walk
+            // has only the rules the project holds, and its newest file must come from all of
+            // them (`WalkContext::walk`).
+            let limited = self.settings.rules.lacks_rules(&job.1);
             match (all, self.monitor_state.of(&t.id)) {
                 (false, Some((Monitoring::Watched, _))) => {}
                 (false, Some((Monitoring::Partial, reason)))
-                    if reason != Some(PollReason::Truncated) =>
+                    if reason != Some(PollReason::Truncated) && !limited =>
                 {
                     if let Some(target) = self.monitor_state.poll_target(&t.id) {
                         partial.push((job.0, job.1, target));
@@ -554,8 +559,7 @@ impl Tracker {
             let trees = self.walk_many(whole, &tracked).await;
             let mut plan = Vec::new();
             for (id, tree) in trees {
-                self.record_inferred(&tracked, &id, tree.newest.as_ref())
-                    .await;
+                self.record_inferred(&id, tree.newest.as_ref()).await;
                 self.git.request(&id);
                 plan.push(WatchProject { id, tree });
             }
@@ -568,9 +572,19 @@ impl Tracker {
             }
         }
         if !partial.is_empty() {
-            for (id, newest, roots, dirs) in self.walk_subtrees(partial, &tracked).await {
-                self.record_inferred(&tracked, &id, newest.as_ref()).await;
-                self.git.request(&id);
+            for polled in self.walk_subtrees(partial, &tracked).await {
+                if polled.rules_out_of_date {
+                    // An ignore file in an unwatched subtree is new or changed: the subtree
+                    // walks had no rules for it, so their newest file proves nothing. The
+                    // project is walked whole instead (within the limit across projects), and
+                    // that walk's time, rules and watches replace the old ones.
+                    self.enroll(&polled.id, false).await?;
+                    continue;
+                }
+                self.record_inferred(&polled.id, polled.newest.as_ref())
+                    .await;
+                self.git.request(&polled.id);
+                let (id, roots, dirs) = (polled.id, polled.roots, polled.dirs);
                 let _ = self.monitor.send(Cmd::Retry { id, roots, dirs }).await;
             }
         }
@@ -584,7 +598,7 @@ impl Tracker {
         &self,
         jobs: Vec<(String, PathBuf, crate::watch::PollTarget)>,
         tracked: &[Tracked],
-    ) -> Vec<(String, Option<(i64, String)>, Vec<PathBuf>, Vec<PathBuf>)> {
+    ) -> Vec<PolledSubtrees> {
         let ctx = self.walk_context(tracked);
         let now = self.clock.now();
         tokio::task::spawn_blocking(move || {
@@ -592,6 +606,7 @@ impl Tracker {
                 .map(|(id, root, target)| {
                     let mut newest: Option<(i64, String)> = None;
                     let mut dirs = Vec::new();
+                    let mut rules_out_of_date = false;
                     for sub in &target.subtrees {
                         if *sub == root.join(".git") {
                             dirs.push(sub.clone());
@@ -600,6 +615,7 @@ impl Tracker {
                         let Some(t) = ctx.walk_from(&root, sub, &target.ignore, now) else {
                             continue; // vanished: forgotten by the retry
                         };
+                        rules_out_of_date |= t.rules_out_of_date(&target.ignore);
                         if t.newest
                             .as_ref()
                             .is_some_and(|n| newest.as_ref().is_none_or(|m| n.0 > m.0))
@@ -609,7 +625,13 @@ impl Tracker {
                         dirs.extend(t.dirs);
                     }
                     dirs.sort_by_key(|d| d.components().count());
-                    (id, newest, target.subtrees, dirs)
+                    PolledSubtrees {
+                        id,
+                        newest,
+                        roots: target.subtrees,
+                        dirs,
+                        rules_out_of_date,
+                    }
                 })
                 .collect()
         })
@@ -638,25 +660,34 @@ impl Tracker {
     }
 
     /// The monitored projects of `tracked` by root, with their last activity (their place in the
-    /// order in which the limit on ignore rules is shared). Projects that are no longer among
-    /// them keep no rules: the store forgets them here, before anything is walked or shared.
-    fn monitored_recency(&self, tracked: &[Tracked]) -> HashMap<PathBuf, Option<i64>> {
-        let monitored: HashMap<PathBuf, Option<i64>> = tracked
+    /// order in which the limit on ignore rules is shared).
+    fn monitored_recency(tracked: &[Tracked]) -> HashMap<PathBuf, Option<i64>> {
+        tracked
             .iter()
             .filter(|t| !t.missing && !t.ignored)
             .map(|t| (PathBuf::from(&t.path), t.activity_at))
-            .collect();
-        self.settings
-            .rules
-            .retain(|root| monitored.contains_key(root));
-        monitored
+            .collect()
+    }
+
+    /// Projects that are no longer monitored (missing, ignored, moved away, forgotten) keep no
+    /// ignore rules: the store forgets them and their share of the limit is free again. Called
+    /// where projects leave — the end of a reconciliation, ignore and un-ignore, a vanished or
+    /// moved project — with a list read here, after the store's mark, so a project that another
+    /// task enrolls meanwhile is never dropped (v0.1.1 review L2: a list read before a walk
+    /// dropped projects enrolled during it, and their rules went on in use, uncounted).
+    async fn forget_departed(&self) -> Result<()> {
+        let rules = &self.settings.rules;
+        let since = rules.mark();
+        let monitored = Self::monitored_recency(&self.tracked().await?);
+        rules.retain(since, |root| monitored.contains_key(root));
+        Ok(())
     }
 
     fn walk_context(&self, tracked: &[Tracked]) -> WalkContext {
         let s = &self.settings.scan;
         WalkContext {
             rules: Arc::clone(&self.settings.rules),
-            recency: self.monitored_recency(tracked),
+            recency: Self::monitored_recency(tracked),
             roots: self.root_exclusions(),
             others: tracked
                 .iter()
@@ -682,8 +713,7 @@ impl Tracker {
             return Ok(());
         }
         let tracked = self.tracked().await?;
-        let recency = self.monitored_recency(&tracked);
-        for (root, at) in &recency {
+        for (root, at) in &Self::monitored_recency(&tracked) {
             rules.set_recency(root, *at);
         }
         let ids: HashMap<&Path, &str> = tracked
@@ -698,8 +728,7 @@ impl Tracker {
             let now = self.clock.now();
             let walked = tokio::task::spawn_blocking(move || ctx.walk(&root, now, allowance)).await;
             if let Ok(Some(tree)) = walked {
-                self.record_inferred(&tracked, id, tree.newest.as_ref())
-                    .await;
+                self.record_inferred(id, tree.newest.as_ref()).await;
                 let id = (*id).to_string();
                 let _ = self.monitor.send(Cmd::Add(WatchProject { id, tree })).await;
             }
@@ -709,28 +738,18 @@ impl Tracker {
 
     /// Record the newest file a walk found as the inferred activity of project `id`.
     ///
-    /// Except when the project lacks ignore rules because of the limit across projects and
-    /// already has a time: a walk without the project's rules cannot tell an ignored file from
-    /// a meaningful one, and a time raised by it would move the project up in the very order
-    /// that decides who gets the rules (a project that just gave its rules up would take them
-    /// back from the next one, and so on). A project of which nothing is known yet does get
-    /// the time: it needs a place in that order.
-    ///
-    /// This is about scan-derived times only. What the watcher observes in such a project
-    /// ([`Signal::Activity`]) does not come through here: it is recorded as in any other
-    /// project, and is what brings the project's rules back.
-    async fn record_inferred(&self, tracked: &[Tracked], id: &str, newest: Option<&(i64, String)>) {
+    /// Every walk that comes here judged its files with all of the project's rules: a full walk
+    /// of a project that lacks rules takes its newest file from a walk with its own
+    /// (`WalkContext::walk`), a partly watched project that lacks rules is walked whole, and a
+    /// subtree walk that met an ignore file the project does not hold is not recorded (the
+    /// project is walked whole). Otherwise a project that gave its rules up would look active
+    /// through the files they hid, move up in the very order that decides who gets the rules,
+    /// and take them back. What the watcher observes ([`Signal::Activity`]) does not come
+    /// through here.
+    async fn record_inferred(&self, id: &str, newest: Option<&(i64, String)>) {
         let Some((at, path)) = newest else {
             return;
         };
-        let rules = &self.settings.rules;
-        if rules.contended()
-            && tracked.iter().any(|t| {
-                t.id == id && t.activity_at.is_some() && rules.lacks_rules(Path::new(&t.path))
-            })
-        {
-            return;
-        }
         let activity = Activity {
             at: *at,
             kind: ActivityKind::Inferred,
@@ -786,8 +805,7 @@ impl Tracker {
             }
         }
         self.writer.store_git(&id, info, self.clock.now()).await?;
-        self.record_inferred(&tracked, &id, tree.newest.as_ref())
-            .await;
+        self.record_inferred(&id, tree.newest.as_ref()).await;
         self.notifier.project(&id);
         let ignored = self
             .reader
@@ -854,17 +872,19 @@ impl Tracker {
             Control::Unignored(id) => self.enroll(&id, false).await?,
         }
         // A project left or joined: the rules may have to go to other projects.
+        self.forget_departed().await?;
         self.rebalance_rules().await
     }
 
     pub async fn on_signal(self: &Arc<Self>, s: Signal) -> Result<()> {
         // Signals after which projects were walked, came or went: the ignore rules may then
         // have to go to other projects. (Plain activity only changes the order; that is taken
-        // up at the next scan.)
+        // up after the next such signal, at the latest at the next scan.)
         let rebalance = !matches!(
             s,
             Signal::Activity { .. } | Signal::Git { .. } | Signal::Rescan
         );
+        let departed = matches!(s, Signal::Vanished { .. } | Signal::Moved { .. });
         match s {
             Signal::Activity {
                 id,
@@ -910,6 +930,9 @@ impl Tracker {
                     }
                 }
             }
+        }
+        if departed {
+            self.forget_departed().await?;
         }
         if rebalance {
             self.rebalance_rules().await?;
@@ -1034,7 +1057,20 @@ fn upsert_of(c: Candidate) -> ProjectUpsert {
     }
 }
 
+/// What the walks of a partly watched project's unwatched subtrees found.
+struct PolledSubtrees {
+    id: String,
+    /// The newest file in them.
+    newest: Option<(i64, String)>,
+    /// The subtree roots, and their directories shallow first (to watch again).
+    roots: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+    /// One of them met an ignore file the project's rules do not hold as it is now.
+    rules_out_of_date: bool,
+}
+
 /// Everything a tree walk needs, owned so it can move to a blocking thread.
+#[derive(Clone)]
 struct WalkContext {
     rules: Arc<tree::RuleStore>,
     /// Last activity of every monitored project, by root.
@@ -1053,19 +1089,58 @@ impl WalkContext {
     /// ([`tree::MAX_GITIGNORE_PATTERNS`] unless the rules are being rebalanced). It replaces
     /// the project's rules: the store says what it may keep and which rules it can reuse, and
     /// is told the result.
+    ///
+    /// When the allowance left rules out (the project lacks rules because of the limit across
+    /// projects), the walk cannot tell the files those rules ignore from meaningful ones. Its
+    /// newest file is then taken from a second walk with the project's own limits, whose rules
+    /// are compiled for that walk alone and dropped when it ends, one such walk at a time
+    /// ([`tree::RuleStore::outside_the_limit`]; v0.1.1 review M2). So every time a walk
+    /// records is one the project's rules allow: a project without its rules still shows its
+    /// real activity (polled projects have no other source), and giving rules up never makes a
+    /// project look active.
     fn walk(&self, root: &Path, now: i64, at_most: usize) -> Option<Tree> {
         let recency = self.recency.get(root).copied().flatten();
-        self.walk_with(root, root, &tree::GitIgnore::default(), now, || {
-            self.rules.begin(root, recency, at_most)
-        })
-        .inspect_err(|()| self.rules.settle(root, None))
-        .ok()
-        .inspect(|tree| self.rules.settle(root, Some(tree)))
+        let mut begun = false;
+        let mut previous = None;
+        let walked = self.walk_with(root, root, &tree::GitIgnore::default(), now, || {
+            begun = true;
+            let grant = self.rules.begin(root, recency, at_most);
+            previous.clone_from(&grant.reuse);
+            grant
+        });
+        if begun {
+            self.rules.settle(root, walked.as_ref().ok());
+        }
+        let mut tree = walked.ok()?;
+        if tree.left_rules_out() {
+            // What it may reuse: the rules it keeps now, and those of its previous walk (a
+            // project that just gave rules up compiles nothing again).
+            let reuse = previous.map_or_else(
+                || tree.ignore.as_ref().clone(),
+                |p| tree.ignore.with_fallback(&p),
+            );
+            let own = || tree::Grant {
+                max_patterns: tree::MAX_GITIGNORE_PATTERNS,
+                reuse: Some(Arc::new(reuse)),
+            };
+            let (ctx, root) = (self.clone(), root.to_path_buf());
+            tree.newest = self
+                .rules
+                .outside_the_limit(move || {
+                    // Its rules are dropped here, on the thread that compiled them.
+                    ctx.walk_with(&root, &root, &tree::GitIgnore::default(), now, own)
+                        .ok()
+                        .and_then(|t| t.newest)
+                })
+                .flatten();
+        }
+        Some(tree)
     }
 
     /// The part of project `root` at and below `start`, with the project's known rules `base`
-    /// (see [`tree::walk_from`]). It keeps nothing: it only asks how many rules the project
-    /// may hold.
+    /// (see [`tree::walk_from`]). It keeps nothing, and holds no more rules than `base`: it
+    /// takes over those of unchanged files and compiles nothing beyond them. A file it would
+    /// have to compile shows in [`Tree::rules_out_of_date`].
     fn walk_from(
         &self,
         root: &Path,
@@ -1074,14 +1149,15 @@ impl WalkContext {
         now: i64,
     ) -> Option<Tree> {
         self.walk_with(root, start, base, now, || tree::Grant {
-            max_patterns: self.rules.room(root),
+            max_patterns: base.patterns(),
             reuse: None,
         })
         .ok()
     }
 
     /// `grant` is asked only when the walk is going to happen (a full walk reserves there).
-    /// `Err(())`: the walk itself failed after that.
+    /// `Err(())`: no walk (no discovery root holds `root`; `grant` was not asked), or the walk
+    /// itself failed after `grant`.
     fn walk_with(
         &self,
         root: &Path,
@@ -1197,5 +1273,125 @@ impl GitQueue {
         {
             self.notifier.project(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Project `p` below a discovery root `home`, in a Git work tree of its own.
+    struct Fx {
+        _t: tempfile::TempDir,
+        home: PathBuf,
+        p: PathBuf,
+    }
+
+    fn fx() -> Fx {
+        let t = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(t.path()).unwrap().join("home");
+        let p = home.join("p");
+        fs::create_dir_all(p.join(".git")).unwrap();
+        Fx { _t: t, home, p }
+    }
+
+    fn context(home: &Path, rules: &Arc<tree::RuleStore>) -> WalkContext {
+        WalkContext {
+            rules: Arc::clone(rules),
+            recency: HashMap::new(),
+            roots: vec![(
+                home.to_path_buf(),
+                Exclusions::new(home, home, &[], &[], &[]).unwrap(),
+            )],
+            others: HashSet::new(),
+            home: home.to_path_buf(),
+            uid: nix::unistd::geteuid().as_raw(),
+            max_depth: 10,
+            same_file_system: true,
+        }
+    }
+
+    fn write_at(path: &Path, text: &str, mtime: u64) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(mtime))
+            .unwrap();
+    }
+
+    /// v0.1.1 review M1, the reconciler's side: the walks of a partly watched project's
+    /// unwatched subtrees hold the rules the project holds and no more. An ignore file that
+    /// appeared there is left out (not compiled) and shows that the project's rules are out of
+    /// date; the store keeps what it had.
+    #[test]
+    fn walks_of_unwatched_subtrees_hold_no_more_rules_than_the_project() {
+        let f = fx();
+        write_at(&f.p.join(".gitignore"), "*.log\n", 100);
+        fs::create_dir_all(f.p.join("deep/er")).unwrap();
+        let rules = Arc::new(tree::RuleStore::default());
+        let ctx = context(&f.home, &rules);
+        let full = ctx
+            .walk(&f.p, i64::MAX, tree::MAX_GITIGNORE_PATTERNS)
+            .unwrap();
+        assert_eq!((full.ignore.patterns(), rules.total()), (1, 1));
+
+        write_at(&f.p.join("deep/.gitignore"), "*.o\n", 100);
+        let sub = ctx
+            .walk_from(&f.p, &f.p.join("deep"), &full.ignore, i64::MAX)
+            .unwrap();
+        assert_eq!(sub.ignore.patterns(), 1, "deep/.gitignore was not compiled");
+        assert!(!sub.ignore.is_ignored(&f.p.join("deep/er/x.o"), false));
+        assert!(sub.rules_out_of_date(&full.ignore));
+        assert_eq!(rules.total(), 1, "a subtree walk keeps nothing");
+        // Control: the same subtree with nothing new is up to date.
+        fs::remove_file(f.p.join("deep/.gitignore")).unwrap();
+        let sub = ctx
+            .walk_from(&f.p, &f.p.join("deep"), &full.ignore, i64::MAX)
+            .unwrap();
+        assert!(!sub.rules_out_of_date(&full.ignore));
+    }
+
+    /// v0.1.1 review M2, at the walk: a project that the limit across projects leaves without
+    /// its rules gets its newest file from a second walk with all of them, compiled for that
+    /// walk alone. The store does not keep them. Control: the walk within the limit alone
+    /// takes a file those rules ignore as the newest.
+    #[test]
+    fn a_project_that_lacks_rules_takes_its_newest_file_from_all_of_them() {
+        let f = fx();
+        write_at(&f.p.join(".gitignore"), "*.tmp\n", 100);
+        write_at(&f.p.join("real.txt"), "r", 500);
+        write_at(&f.p.join("noise.tmp"), "n", 900);
+        let rules = Arc::new(tree::RuleStore::new(0)); // no room for any rule
+        let ctx = context(&f.home, &rules);
+        let tree = ctx
+            .walk(&f.p, i64::MAX, tree::MAX_GITIGNORE_PATTERNS)
+            .unwrap();
+        assert!(tree.left_rules_out());
+        assert_eq!(tree.ignore.patterns(), 0, "it keeps none");
+        assert_eq!(tree.newest, Some((500, "real.txt".to_string())));
+        assert_eq!(rules.total(), 0);
+        assert!(rules.lacks_rules(&f.p));
+
+        let within = ctx
+            .walk_with(&f.p, &f.p, &tree::GitIgnore::default(), i64::MAX, || {
+                tree::Grant {
+                    max_patterns: 0,
+                    reuse: None,
+                }
+            })
+            .unwrap();
+        assert_eq!(within.newest, Some((900, "noise.tmp".to_string())));
+
+        // A project that has all its rules needs no second walk: the same result, one walk.
+        let roomy = Arc::new(tree::RuleStore::default());
+        let tree = context(&f.home, &roomy)
+            .walk(&f.p, i64::MAX, tree::MAX_GITIGNORE_PATTERNS)
+            .unwrap();
+        assert!(!tree.left_rules_out());
+        assert_eq!(tree.newest, Some((500, "real.txt".to_string())));
     }
 }

@@ -246,20 +246,45 @@ Appendix A (all approved on 2026-11-26).
   approved; `MemoryMax=2G` approved for now; the 20,000-rule limit approved, to be allocated by recency; the
   memory finding to be fixed in v0.1.1 with a rule cache; no README changes
 - [x] The rule added with the allocation by recency — a scan of a project that lacks ignore rules because of
-  the limit across projects does not move a known activity time — approved by the maintainer (2026-11-26).
+  the limit across projects does not move a known activity time — approved by the maintainer (2026-11-26);
+  **superseded by the review's M2** (below).
   Scan-derived times only: watcher-observed changes in such a project update its activity as always
   (confirmed, tested in `tests/tracker.rs`, documented in REQUIREMENTS.md §5.2)
 - [x] `st_ctime` (seconds and nanoseconds) in the rule-cache key (maintainer decision, 2026-11-26): a rewrite in
   place to the same size with the modification time restored is now seen; the known-limit note and its test
   updated
+- [x] **The v0.1.1 review** (docs/reviews/v0.1.1-review.md; fixes decided by the maintainer, 2026-11-26; what
+  was run is in ARCHITECTURE.md §13j):
+  - [x] **M1** walks of part of a project's tree (new directories, polled subtrees) hold no more rules than the
+    project; an ignore file they cannot take has the project walked whole. The M1 reproduction (24 directories
+    of 4,900 expensive rules moved in together): peak 98.9 MiB (glibc) / 107.6 MiB (musl), was 2,138 / 2,462 MiB
+  - [x] **M2** a project that lacks ignore rules is scanned with all of them, compiled for that walk alone, one
+    project at a time (replaces the scan-only freeze); `ccwm status` shows "ignore rules limited"
+  - [x] **L1** one full walk per project at a time; `contended` also above the limit. **L2** projects that left
+    are forgotten by a list read after a mark, never one enrolled meanwhile. **L3** WAL truncation retries do
+    not wait, warn once, and the first write after a start truncates. **L4** `OOMPolicy=continue`,
+    `StartLimitIntervalSec=10min`, `StartLimitBurst=10` (verified in transient user units). **L5** the stop is
+    sent before the reconciler is woken. **L6** the documents' wording
+  - [x] Info: **I1** message; **I2** a cut-off listing removes gone sessions from the folders it listed
+    completely, warns once, shows in `ccwm status`; **I5** files changed within 2 s of a read are not
+    reused; **I6** the `/dev/shm` exception recorded in CLAUDE.md; **I7** the purge test kills its daemon on
+    failure. **I3** and **I4** not done (below)
 - [ ] Maintainer: push, CI, tag, the release workflow (docs/release-checklist.md)
 
 After v0.1.1:
 
 - [ ] **Tighten `MemoryMax=`** (2G is approved for now). With the rule cache the worst measured case is the
-  kept rules alone (344 MiB in a glibc build, 395 MiB with the release binary, flat over repeated scans),
-  no longer 0.8–1.7 GiB. Choose the lower value from a new measurement that also covers what is not in the
+  kept rules plus one project's worth while a project that lacks rules is scanned with them (v0.1.1 review
+  M2): 434 MiB in a glibc build, 381–392 MiB with a 480–492 MiB peak with the release binary, flat over
+  repeated scans; no longer 0.8–1.7 GiB. Choose the lower value from a new measurement that also covers what is not in the
   benchmarks: `git status` children on very large repositories, and `claude --version`
+- [ ] **v0.1.1 review I4**: the limits count rule lines whatever they cost; ordinary rules cost almost nothing.
+  Weigh counting (or weighting more) only the rules that need a regular expression, together with the
+  `MemoryMax=` change above
+- [ ] **v0.1.1 review I3** (not done in v0.1.1: it changes the allocation model): the rules of a repository
+  above several projects are compiled and counted once per project. Sharing those layers (one `Arc` per
+  file across projects) would save memory; counting them once makes the shares no longer additive per
+  project, which `RuleStore::rebalance` assumes
 
 ---
 

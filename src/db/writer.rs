@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 const CHANNEL_CAPACITY: usize = 1024;
@@ -543,8 +544,7 @@ impl Writer {
 }
 
 fn run(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>, store_prompts: &AtomicBool) {
-    // A WAL truncation that a reader blocked is owed until it succeeds ([`truncate_wal`]).
-    let mut truncation_owed = false;
+    let mut wal = WalDebt::at_start();
     while let Some(first) = rx.blocking_recv() {
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
@@ -554,7 +554,7 @@ fn run(mut conn: Connection, mut rx: mpsc::Receiver<Cmd>, store_prompts: &Atomic
             }
         }
         let stop = batch.iter().any(|c| matches!(c, Cmd::Shutdown { .. }));
-        apply_batch(&mut conn, batch, store_prompts, &mut truncation_owed);
+        apply_batch(&mut conn, batch, store_prompts, &mut wal);
         if stop {
             break;
         }
@@ -571,27 +571,76 @@ fn deletes_session_text(cmd: &Cmd) -> bool {
 }
 
 /// Checkpoint the write-ahead log and truncate it to zero bytes, so that deleted session text
-/// does not stay in old WAL frames. `true` if the log was truncated.
+/// does not stay in old WAL frames. `Ok(true)` if the log was truncated.
 ///
 /// SQLite reports a checkpoint that could not finish as a **row**, not as an error: its first
-/// column (`busy`) is 1 when a reader still held an older snapshot at the end of `busy_timeout`.
-/// The frames are then still in the file. That is logged, and the caller tries again later
-/// (v0.1.0 review I7: the result used to be ignored, so a truncation that did not happen was
-/// silent).
-fn truncate_wal(conn: &Connection) -> bool {
-    let busy: rusqlite::Result<i64> =
-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0));
-    match busy {
-        Ok(0) => true,
-        Ok(_) => {
-            tracing::warn!(
-                "the write-ahead log was not truncated after session data was deleted: a reader was still using it; trying again after the next write"
-            );
-            false
+/// column (`busy`) is 1 when a reader still held an older snapshot at the end of the busy
+/// timeout. The frames are then still in the file (v0.1.0 review I7: the result used to be
+/// ignored, so a truncation that did not happen was silent). With `wait` the connection's busy
+/// timeout applies (5 s); without, the attempt gives up at once.
+fn truncate_wal(conn: &Connection, wait: bool) -> rusqlite::Result<bool> {
+    let checkpoint = || {
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|busy| busy == 0)
+    };
+    if wait {
+        return checkpoint();
+    }
+    let saved: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+    conn.busy_timeout(Duration::ZERO)?;
+    let done = checkpoint();
+    conn.busy_timeout(Duration::from_millis(u64::try_from(saved).unwrap_or(0)))?;
+    done
+}
+
+/// A WAL truncation that has not happened yet: owed until one succeeds (v0.1.0 review I7). The
+/// attempt after a batch that deleted session text waits for readers as long as any other
+/// statement would (`busy_timeout`); every later attempt gives up at once, so a reader that
+/// keeps blocking costs each later batch one quick try instead of 5 s (v0.1.1 review L3). The
+/// warning is logged once per debt, and its payment once.
+#[derive(Debug, PartialEq, Eq)]
+struct WalDebt {
+    owed: bool,
+    warned: bool,
+}
+
+impl WalDebt {
+    /// What an earlier run left is not known (it may have stopped while it owed a truncation):
+    /// one quick attempt at the first batch pays it.
+    fn at_start() -> Self {
+        Self {
+            owed: true,
+            warned: false,
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "WAL checkpoint after clearing session data failed");
-            false
+    }
+
+    /// After a committed batch; `deleted`: it deleted session text.
+    fn pay(&mut self, conn: &Connection, deleted: bool) {
+        self.owed |= deleted;
+        if !self.owed {
+            return;
+        }
+        match truncate_wal(conn, deleted) {
+            Ok(true) => {
+                if self.warned {
+                    tracing::info!("the write-ahead log was truncated: deleted session data no longer lingers in it");
+                }
+                *self = Self {
+                    owed: false,
+                    warned: false,
+                };
+            }
+            outcome => {
+                if !self.warned {
+                    match outcome {
+                        Err(e) => tracing::warn!(error = %e, "the write-ahead log could not be truncated; trying again after each later write"),
+                        Ok(_) => tracing::warn!("the write-ahead log was not truncated: a reader was still using it, so deleted session data may still be in it; trying again after each later write"),
+                    }
+                    self.warned = true;
+                }
+            }
         }
     }
 }
@@ -599,15 +648,15 @@ fn truncate_wal(conn: &Connection) -> bool {
 type Outcome = Box<dyn FnOnce(Option<&Error>) + Send>;
 
 /// Run each command in a savepoint inside one transaction; send replies after the commit (and,
-/// for a batch that deleted session text, after the WAL checkpoint). `truncation_owed` carries a
-/// WAL truncation that did not succeed to the next batch, whatever that batch does.
+/// for a batch that deleted session text, after the WAL checkpoint). `wal` carries a WAL
+/// truncation that did not succeed to the next batch, whatever that batch does.
 fn apply_batch(
     conn: &mut Connection,
     batch: Vec<Cmd>,
     store_prompts: &AtomicBool,
-    truncation_owed: &mut bool,
+    wal: &mut WalDebt,
 ) {
-    *truncation_owed |= batch.iter().any(deletes_session_text);
+    let deleted = batch.iter().any(deletes_session_text);
     let tx = match conn.transaction() {
         Ok(tx) => tx,
         Err(e) => {
@@ -623,8 +672,8 @@ fn apply_batch(
         pending.push(execute(&tx, cmd, store_prompts));
     }
     let commit_err = tx.commit().err().map(|e| db_err("commit", &e));
-    if *truncation_owed && commit_err.is_none() {
-        *truncation_owed = !truncate_wal(conn);
+    if commit_err.is_none() {
+        wal.pay(conn, deleted); // a batch that was rolled back deleted nothing
     }
     for outcome in pending {
         outcome(commit_err.as_ref());
@@ -1021,8 +1070,11 @@ pub fn reindex_if_parser_changed(conn: &mut Connection, version: u32) -> Result<
             sessions,
             "session parsing rules changed: the session index is rebuilt from the session files"
         );
-        // No reader exists yet when the database is opened; a failure is logged.
-        truncate_wal(conn);
+        // No reader exists yet when the database is opened. Should it fail all the same, the
+        // writer's first batch tries again (`WalDebt::at_start`).
+        if !matches!(truncate_wal(conn, true), Ok(true)) {
+            tracing::warn!("the write-ahead log was not truncated after the session index was cleared; trying again at the first write");
+        }
     }
     Ok(sessions > 0)
 }
@@ -1416,16 +1468,33 @@ mod tests {
         .unwrap();
     }
 
+    fn busy_timeout_ms(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    const OWED_AND_WARNED: WalDebt = WalDebt {
+        owed: true,
+        warned: true,
+    };
+    const PAID: WalDebt = WalDebt {
+        owed: false,
+        warned: false,
+    };
+
     /// v0.1.0 review I7: a checkpoint that a reader's snapshot blocks comes back as a row
     /// (`busy = 1`), not as an error. It must count as "not truncated", stay owed, and succeed
-    /// once the reader is done.
+    /// once the reader is done. v0.1.1 review L3: only the attempt after a deletion waits for
+    /// the reader; the retries after later batches give up at once (they used to wait the full
+    /// busy timeout, 5 s per batch, while the reader stayed), and leave the connection's busy
+    /// timeout as it was. The warning is logged once (`warned`), not at every retry.
     #[test]
     fn a_wal_truncation_blocked_by_a_reader_is_reported_and_stays_owed() {
+        const WAIT: Duration = Duration::from_millis(1_000);
         let t = tempfile::tempdir().unwrap();
         let db = t.path().join("t.db");
         let mut conn = open_writer_connection(&db).unwrap();
-        // The test must not wait for the production timeout (5 s) on every blocked attempt.
-        conn.execute_batch("PRAGMA busy_timeout = 50").unwrap();
+        conn.busy_timeout(WAIT).unwrap();
         write_something(&conn, "first");
         assert!(wal_len(&db) > 0, "control: the write is in the WAL");
 
@@ -1440,27 +1509,70 @@ mod tests {
         assert_eq!(seen, "first");
         write_something(&conn, "second"); // newer than the reader's snapshot
 
-        assert!(!truncate_wal(&conn), "blocked by the reader");
+        // The attempt after a deletion waits for the reader, then reports the busy row.
+        let started = std::time::Instant::now();
+        assert!(!truncate_wal(&conn, true).unwrap(), "blocked by the reader");
+        assert!(started.elapsed() >= WAIT / 2, "{:?}", started.elapsed());
         assert!(wal_len(&db) > 0, "the frames are still in the file");
+        let mut wal = WalDebt {
+            owed: false,
+            warned: false,
+        };
+        wal.pay(&conn, true);
+        assert_eq!(wal, OWED_AND_WARNED, "owed, and warned about");
 
-        // The writer keeps owing the truncation across batches that delete nothing…
+        // The writer keeps owing the truncation across batches that delete nothing, and each
+        // retry gives up at once.
         let store = AtomicBool::new(false);
-        let mut owed = true;
-        apply_batch(&mut conn, Vec::new(), &store, &mut owed);
-        assert!(owed, "still blocked: still owed");
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            apply_batch(&mut conn, Vec::new(), &store, &mut wal);
+            assert!(
+                started.elapsed() < WAIT / 2,
+                "a retry waited for the reader: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(wal, OWED_AND_WARNED, "still blocked: still owed");
+        }
+        assert_eq!(
+            busy_timeout_ms(&conn),
+            i64::try_from(WAIT.as_millis()).unwrap(),
+            "the busy timeout is restored after a retry"
+        );
         // …and pays it once the reader has finished.
         reader.execute_batch("COMMIT").unwrap();
-        apply_batch(&mut conn, Vec::new(), &store, &mut owed);
-        assert!(!owed);
+        apply_batch(&mut conn, Vec::new(), &store, &mut wal);
+        assert_eq!(wal, PAID);
         assert_eq!(wal_len(&db), 0, "truncated to zero bytes");
 
         // Nothing owed, nothing deleted: an ordinary batch leaves the WAL alone.
         write_something(&conn, "third");
         let before = wal_len(&db);
         assert!(before > 0);
-        apply_batch(&mut conn, Vec::new(), &store, &mut owed);
+        apply_batch(&mut conn, Vec::new(), &store, &mut wal);
         assert_eq!(wal_len(&db), before);
-        assert!(truncate_wal(&conn), "no reader: truncated");
+        assert!(truncate_wal(&conn, false).unwrap(), "no reader: truncated");
+        assert_eq!(wal_len(&db), 0);
+    }
+
+    /// v0.1.1 review L3: a daemon that stopped while it owed a truncation left the frames in the
+    /// file, and the debt was only in its memory. A writer starts owing one: its first batch
+    /// truncates whatever the log holds, without waiting and without a warning.
+    #[test]
+    fn a_new_writer_truncates_what_an_earlier_run_left_in_the_wal() {
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("t.db");
+        let earlier = open_writer_connection(&db).unwrap();
+        write_something(&earlier, "left behind");
+        let mut conn = open_writer_connection(&db).unwrap();
+        drop(earlier); // (closing the last connection would checkpoint: keep one open)
+        assert!(
+            wal_len(&db) > 0,
+            "control: the earlier run's frames are in the WAL"
+        );
+        let mut wal = WalDebt::at_start();
+        apply_batch(&mut conn, Vec::new(), &AtomicBool::new(false), &mut wal);
+        assert_eq!(wal, PAID);
         assert_eq!(wal_len(&db), 0);
     }
 }

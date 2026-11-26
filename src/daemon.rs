@@ -457,9 +457,11 @@ async fn run(p: Prepared) -> Result<()> {
     .await;
 
     // Graceful teardown: stop discovery and the watchers, close the socket, flush the writer,
-    // remove runtime files.
-    tracker.cancel();
+    // remove runtime files. The stop goes out before `cancel`, which wakes the reconciler: woken
+    // first, it found no stop and started one more reconciliation, which ingested the sessions
+    // again during shutdown — right after "Clear session index", too (v0.1.1 review L5).
     let _ = stop_tx.send(true);
+    tracker.cancel();
     for t in tasks {
         let _ = t.await;
     }

@@ -14,21 +14,30 @@ A maintenance release: no new features. Tested on the same environment as 0.1.0 
   title". The title is text Claude Code recorded: one worded like a status ("Resuming the session…") could
   be read as the state of the project.
 - **The systemd unit has a memory limit**: `MemoryMax=2G` with `MemorySwapMax=0`, for the daemon and its
-  `git` and `claude` children together. ccwm normally needs 20–30 MiB; at the limit the kernel stops the
-  service and systemd starts it again. `MemorySwapMax=0` is part of it because, with swap, `MemoryMax=`
-  alone only moves the excess to swap. Run `scripts/install.sh` (or `ccwm service install`) to get the
-  new unit; change the limit with a drop-in (`systemctl --user edit ccwm`, see docs/service.md).
+  `git` and `claude` children together. ccwm normally needs 20–30 MiB; at the limit the kernel kills the
+  largest process. A `git` or `claude` child killed that way fails like any failed command and the daemon
+  goes on (`OOMPolicy=continue`); a killed daemon is started again, and after 10 starts in 10 minutes the
+  service stays `failed` (`StartLimitIntervalSec=10min`, `StartLimitBurst=10`) instead of restarting for
+  ever. `MemorySwapMax=0` is part of it because, with swap, `MemoryMax=` alone only moves the excess to
+  swap. Run `scripts/install.sh` (or `ccwm service install`) to get the new unit; change the limit with a
+  drop-in (`systemctl --user edit ccwm`, see docs/service.md).
 - **Ignore rules are limited across projects too**: 20,000 rules for all projects together, next to the
   limits per file and per project. Beyond it ignore files are skipped and counted, as before
   (`ccwm status`). The limit goes to the **most recently active projects**: when the rules do not fit
   all, the least recently active projects are the ones without, whatever order they were found in, and
-  a project that becomes active again gets its rules back at the next scan.
-  A scan of a project that is without its rules for that reason does not move the project's known "last
-  change": without the rules, ignored files cannot be told from meaningful ones. Changes that ccwm sees
-  live in such a project are recorded as always.
+  a project that becomes active again gets its rules back soon after (when the next project is walked,
+  added or removed, or a session file changes; at the latest at the next scan). A project that is
+  without its rules for that reason is still **scanned with all of them**, compiled for that scan alone
+  and dropped, one project at a time: its "last change" is a real one, also for a project without
+  watches. Changes ccwm sees live in it are judged with the rules it keeps. `ccwm status` names such
+  projects ("ignore rules limited").
 - **Compiled ignore rules are kept and reused.** The rules of a `.gitignore` are compiled again only
-  when the file changed (its device, inode, size, modification time or change time). Before, every scan of a project
-  without watches compiled all its rules again.
+  when the file changed (its device, inode, size, modification time or change time), or when it had
+  changed less than 2 s before it was read. Before, every scan of a project without watches compiled all
+  its rules again.
+- **A `.gitignore` in a new directory applies at once.** When a directory with ignore files appears in a
+  watched project (a checkout, a move), the project is walked again and the new rules apply to what
+  happens in it; before, only after the project's next full walk.
 - **The Settings page refuses more.** A discovery root that is `/` or a folder containing your home
   folder, and your home folder itself as the session directory, can no longer be saved from the browser
   (symlinks are resolved first). Edit `config.toml` if you really want such a root.
@@ -41,7 +50,23 @@ A maintenance release: no new features. Tested on the same environment as 0.1.0 
   was using the log. The result is now checked, logged, and the truncation repeated after the next
   write until it succeeds.
 - With more than 100,000 session files, the sessions beyond that number were removed from the index as
-  if their files were gone. A listing that was cut off no longer removes anything.
+  if their files were gone. A listing that was cut off no longer removes anything from the folders it
+  cut off; folders it listed completely still lose the sessions whose files are gone. The state is
+  logged once (not at every session change) and shown in `ccwm status`.
+- Directories created in or moved into a watched project could take the daemon's memory past 2 GiB:
+  each was walked on a thread of its own with room to compile a project's worth of ignore rules (24
+  directories of 4,900 expensive rules: 2.1–2.5 GiB). Such walks now compile no rules (peak 99–108 MiB
+  in the same case).
+- Two full walks of one project at once could let all projects together hold more ignore rules than the
+  limit, and a project enrolled during a walk could be forgotten while its rules were still in use. One
+  walk per project at a time now, and projects are forgotten only when a list read after the walk says
+  they left.
+- While another program held a read transaction on ccwm's database, every write waited 5 s for the WAL
+  truncation it still owed. Retries no longer wait, the warning is logged once, and a truncation owed when
+  ccwm stopped is done at the next start.
+- A shutdown could start one more reconciliation, which re-indexed the sessions right after "Clear
+  session index" (and made an acceptance test fail now and then).
+- The settings error for a path no longer claims that `.` is refused (it is accepted: `/a/./b` is `/a/b`).
 
 ### Tests
 - Purge with ccwm's directories inside the home folder next to other applications' data; purge refused
@@ -57,14 +82,20 @@ A maintenance release: no new features. Tested on the same environment as 0.1.0 
 
 ### Known limitations
 - Ignore rules that need a regular expression cost 17–20 KiB each. With 20,000 of them, the most the
-  limits allow, ccwm keeps 343.7 MiB (a glibc build) or 391.4 MiB (the release binary), and stays there
-  over repeated scans (docs/benchmarks.md). An ignore file that changes is compiled again next to the
-  rules it replaces. The unit's memory limit (2G) is far above that and will be lowered.
+  limits allow, and two more projects that lack their rules, ccwm holds 434 MiB (a glibc build) or
+  381–392 MiB with a 480–492 MiB peak (the release binary), flat over repeated scans; each scan that
+  walks the two projects compiles their rules again (1.3–1.8 s each). An ignore file that changes is
+  compiled again next to the rules it replaces (docs/benchmarks.md). The unit's memory limit (2G) is far
+  above that and will be lowered.
 - The limit across projects goes to the most recently active projects, so a tree of projects with huge
-  ignore files and recent file times can take it from older projects until those are active again.
-- The rule cache trusts a file's device, inode, size, modification time and change time. A `.gitignore`
-  rewritten to the same size within the file system's timestamp resolution of its previous change
-  (milliseconds on ext4) keeps its old rules until it changes again or ccwm restarts.
+  ignore files and recent file times can take it from older projects until those are active again. In a
+  project without its rules, a change to a file they would ignore counts as activity when ccwm sees it
+  live.
+- The limits count rule lines, whatever a rule costs; the rules of a repository above several projects are
+  counted (and compiled) once per project.
+- The rule cache trusts a file's device, inode, size, modification time and change time. On a file system
+  without a change time of its own (FAT), a `.gitignore` rewritten to the same size with its modification
+  time restored keeps its old rules until it changes again or ccwm restarts.
 - The memory limit needs the cgroup memory controller for your user manager (present on Ubuntu 24.04).
 - Not run: CI on this version, the release workflow, a fresh-account install from the archive.
 - Everything listed under 0.1.0 still applies, except "the ignore-file limits apply per project, not

@@ -104,8 +104,11 @@ Everything is in the `sandbox` section of `/api/v1/service/status` and in `ccwm 
 **systemd unit.** The user unit adds `NoNewPrivileges`, `UMask=0077`, `LockPersonality`,
 `RestrictRealtime`, `RestrictSUIDSGID`, `RestrictNamespaces` and `SystemCallArchitectures=native`, and a
 memory limit for the daemon and its children together: `MemoryMax=2G` with `MemorySwapMax=0` (v0.1.1; see
-"Ignore rules cost memory" under the residual risks for what it is sized for). These directives were
-verified with the real daemon in a user unit. `ProtectSystem`, `ProtectHome` and
+"Ignore rules cost memory" under the residual risks for what it is sized for). `OOMPolicy=continue`: a `git`
+or `claude` child that the kernel kills at the limit fails like any other failed command and the daemon
+goes on (with the default policy the whole unit was stopped with it). `StartLimitIntervalSec=10min` with
+`StartLimitBurst=10`: a daemon that keeps failing ends in the `failed` state instead of being restarted for
+ever (v0.1.1 review L4). These directives were verified with the real daemon in a user unit. `ProtectSystem`, `ProtectHome` and
 `PrivateTmp` are not used: in a user unit they need a user namespace, in which root-owned paths appear to
 be owned by `nobody`, and ccwm's ownership checks then (correctly) refuse to start. See
 [docs/service.md](docs/service.md).
@@ -172,8 +175,13 @@ not apply. The limits exist because compiled rules stay in memory: a hostile rep
 `.gitignore` files took the daemon to hundreds of megabytes (v0.1.0 review M2), and a directory tree also
 chooses how many projects it holds. The limit across projects goes to the most recently active
 projects; the least recently active ones are the ones that lose their rules, whatever order the
-projects were found in. The compiled rules of a file are kept and reused until the file changes (its
-device, inode, size, modification time or change time), so a scan compiles nothing for files that are as they were. The repository whose rules apply is searched no higher than the project's
+projects were found in. A project without its rules for that reason is still **scanned** with all of
+them, compiled for that walk alone (one project at a time, then dropped), so its recorded activity is real;
+file events in it are judged with the rules it keeps. A walk of part of a project's tree (a new directory,
+an unwatched subtree) holds no more rules than the project and compiles none; a new ignore file has the
+project walked whole, within the limits. The compiled rules of a file are kept and reused until the file
+changes (its device, inode, size, modification time or change time), so a scan compiles nothing for files
+that are as they were. The repository whose rules apply is searched no higher than the project's
 discovery root, and its `.git` must be owned by you, as Git itself requires. ccwm's own directories are
 never watched, so its writes never count as activity.
 
@@ -311,28 +319,33 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
 - **Ignore rules cost memory.** The limits above bound the rules ccwm keeps: 5,000 per project and
   20,000 for all projects together. Only rules that need a regular expression are expensive (17–20 KiB
   each; ordinary ones cost almost nothing), so the worst case — every rule of that kind, as a hostile tree
-  would have it — is about 75 MiB for one project and 345–395 MiB for all (measured with release builds,
-  [docs/benchmarks.md](docs/benchmarks.md)). The rules of a file are compiled once and reused until the
-  file changes, so scanning the same projects again and again leaves memory where it is (measured over
-  ten scans with every project polled: 344 MiB in a glibc build, 381 MiB with the release binary; before
-  the rules were cached, a glibc build grew to 1.66 GiB in four such scans). What still costs extra, for a
-  moment: an ignore file that changed is compiled next to the rules it replaces (at most one project's
-  worth at a time), and when the rules move from one project to another (the limit across projects, by
-  recency) the project that gives up goes first. **Who can take the rules:** a tree of projects with huge
-  ignore files and recent file times can take the whole limit across projects, because the limit goes to
-  the most recently active projects; older projects then lose their ignore rules until they are active
-  again (files their rules would ignore count as activity meanwhile; `ccwm status` reports the skipped
-  files). The process as a whole is bounded by the systemd unit: `MemoryMax=2G` with `MemorySwapMax=0` (on
-  a host with swap, `MemoryMax=` alone only moves the excess to swap). At the limit the kernel stops the
-  service and systemd starts it again after 5 s, for as long as the cause is there
-  ([docs/troubleshooting.md](docs/troubleshooting.md)). The limit needs the cgroup memory controller for
+  would have it — is about 75–100 MiB for one project and 345–395 MiB kept for all, plus one project's
+  worth while a project that lacks its rules is scanned with them (one such walk at a time): measured
+  with release builds, 434 MiB in a glibc build and a 480–492 MiB peak with the release binary
+  ([docs/benchmarks.md](docs/benchmarks.md)). Walks of new directories compile no rules at all (v0.1.1
+  review M1: 24 directories moved in at once took 2.1–2.5 GiB before; now 99–108 MiB). The rules of a
+  file are compiled once and reused until the file changes, so scanning the same projects again and
+  again leaves memory where it is (ten scans with every project polled: 433→434 MiB glibc, 381.6→381.5
+  MiB with the release binary). What still costs extra, for a moment: an ignore file that changed is
+  compiled next to the rules it replaces (at most one project's worth at a time), and when the rules move
+  from one project to another (the limit across projects, by recency) the project that gives up goes
+  first. **Who can take the rules:** a tree of projects with huge ignore files and recent file times can
+  take the whole limit across projects, because the limit goes to the most recently active projects;
+  older projects then lose their ignore rules until they are active again (their scans still use all of
+  their rules; in file events, files those rules would ignore count as activity meanwhile; `ccwm status`
+  names them under "ignore rules limited"). The process as a whole is bounded by the systemd unit:
+  `MemoryMax=2G` with `MemorySwapMax=0` (on a host with swap, `MemoryMax=` alone only moves the excess to
+  swap). At the limit the kernel kills the unit's largest process: a `git` or `claude` child fails like
+  any failed command (`OOMPolicy=continue`), a killed daemon is started again after 5 s, and after 10
+  starts in 10 minutes the service stays `failed` ([docs/troubleshooting.md](docs/troubleshooting.md)). The limit needs the cgroup memory controller for
   your user manager (present on Ubuntu 24.04); **without systemd (`ccwm serve` in a terminal) there is no
   such limit**. Not measured: a pattern built to make the matcher itself use as much memory as it can;
   the measurements used one pattern shape (`*1?b[c-d]*.x`). The cache trusts a file's device, inode, size,
   modification time and change time. The change time cannot be set back, so a file rewritten in place
-  with its old size and modification time is still noticed; a rewrite to the same size within the file
-  system's timestamp resolution of the previous change (milliseconds on ext4) is not, until the file
-  changes again or the daemon restarts (that affects what counts as activity, nothing else).
+  with its old size and modification time is still noticed, and a file that changed less than 2 s before
+  it was read is not reused at all (a rewrite within one step of the file system's clock would not show in
+  its times). Not noticed: on a file system without a change time of its own (FAT), a same-size rewrite
+  with the modification time restored (that affects what counts as activity, nothing else).
 - **POSIX ACLs** (v0.1.0 review L4). The check that refuses to start when an ancestor of ccwm's
   directories, or the config file, "could be modified by another user" reads the owner and the mode bits.
   It does not read access control lists: with an extended ACL the group bits show the ACL mask, so a

@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 /// The sessions directory inside Claude Code's config directory.
 pub const PROJECTS_DIR: &str = "projects";
 /// Every listing stops after this many session files (far above the 819 seen on the
-/// maintainer's machine); the rest is counted as skipped and the listing is marked
-/// [`Listing::truncated`].
+/// maintainer's machine); the rest is counted as skipped and the directories it was in are
+/// marked ([`Listing::cut`]).
 pub const MAX_FILES: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,10 +35,19 @@ pub struct Listing {
     pub skipped: u64,
     /// Directories that could not be read.
     pub errors: u64,
-    /// The listing stopped at [`MAX_FILES`]: session files exist that are not in `files`. A file
-    /// that is absent from such a listing is **not** known to be gone (v0.1.0 review I8: the
-    /// sessions the limit dropped used to be deleted from the index as gone).
-    pub truncated: bool,
+    /// The directories of `dirs` in which the listing reached [`MAX_FILES`]: they hold session
+    /// files that are not in `files`, so a file absent from them is **not** known to be gone
+    /// (v0.1.0 review I8: the sessions the limit dropped used to be deleted from the index as
+    /// gone). The other directories were listed completely, also in a listing that was cut
+    /// off elsewhere (v0.1.1 review I2).
+    pub cut: Vec<PathBuf>,
+}
+
+impl Listing {
+    /// The listing stopped at [`MAX_FILES`]: session files exist that are not in `files`.
+    pub fn truncated(&self) -> bool {
+        !self.cut.is_empty()
+    }
 }
 
 /// `<name>.jsonl` with a lower-case UUID stem. Claude Code writes lower case; other spellings are
@@ -81,6 +90,7 @@ fn list_dir(dir: &mut DirHandle, path: &Path, out: &mut Listing, max_files: usiz
         out.errors += 1;
         return;
     }
+    let mut cut = false;
     for e in entries {
         match (e.kind, session_id_of(&e.name)) {
             (Kind::File, Some(id)) if out.files.len() < max_files => out.files.push(SessionFile {
@@ -88,13 +98,16 @@ fn list_dir(dir: &mut DirHandle, path: &Path, out: &mut Listing, max_files: usiz
                 path: path.join(&e.name),
             }),
             (Kind::File, Some(_)) => {
-                out.truncated = true;
+                cut = true;
                 out.skipped += 1;
             }
             _ => out.skipped += 1,
         }
     }
     out.dirs.push(path.to_path_buf());
+    if cut {
+        out.cut.push(path.to_path_buf());
+    }
 }
 
 /// List every session under `projects` (`<config dir>/projects`, canonical). `None` if the
@@ -213,20 +226,44 @@ mod tests {
         }
         fs::write(projects.join("-b/notes.txt"), "x").unwrap();
         let all = list_all_capped(&projects, 3).unwrap();
-        assert_eq!((all.files.len(), all.skipped, all.truncated), (3, 1, false));
+        assert_eq!(
+            (all.files.len(), all.skipped, all.truncated()),
+            (3, 1, false)
+        );
         let cut = list_all_capped(&projects, 2).unwrap();
-        assert_eq!((cut.files.len(), cut.skipped, cut.truncated), (2, 2, true));
+        assert_eq!(
+            (cut.files.len(), cut.skipped, cut.truncated()),
+            (2, 2, true)
+        );
         assert_eq!(
             cut.dirs.len(),
             2,
             "both directories are still watch targets"
         );
+        // v0.1.1 review I2: only the directory the limit was reached in is marked; the one
+        // before it was listed completely.
+        let order: Vec<&Path> = cut.dirs.iter().map(PathBuf::as_path).collect();
+        assert_eq!(cut.cut.len(), 1, "{order:?}");
+        assert_eq!(cut.cut[0], *order[1], "the second directory listed");
         let none = list_all_capped(&projects, 0).unwrap();
         assert_eq!(
-            (none.files.len(), none.skipped, none.truncated),
+            (none.files.len(), none.skipped, none.truncated()),
             (0, 4, true)
         );
-        assert!(!list_all(&projects).unwrap().truncated);
+        assert_eq!(none.cut.len(), 2, "every directory with a session file");
+        assert!(!list_all(&projects).unwrap().truncated());
+
+        // In a fixed order (a listing follows the order of the directory's entries): a
+        // directory listed after the limit was reached is still complete when the limit left
+        // nothing of it out.
+        fs::create_dir_all(projects.join("-empty")).unwrap();
+        let mut out = Listing::default();
+        for d in ["-b", "-empty"] {
+            let dir = projects.join(d);
+            list_dir(&mut DirHandle::open_root(&dir).unwrap(), &dir, &mut out, 1);
+        }
+        assert_eq!(out.cut, [projects.join("-b")]);
+        assert_eq!(out.dirs, [projects.join("-b"), projects.join("-empty")]);
     }
 
     #[test]

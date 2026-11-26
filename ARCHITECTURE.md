@@ -380,32 +380,68 @@ modification time restored still differs).
 - *Reuse (the rule cache).* The store keeps each project's rules of its last full walk. `begin(root, recency,
   at_most)` hands them to the next full walk (`TreeOptions::reuse`), and `load` takes over the layer of every
   file whose `FileId` is unchanged without reading the file; only changed and new files are compiled, and
-  layers of files that are gone are not carried over. A subtree walk starts from the project's rules (a copy
-  costs a pointer per file) and reuses them the same way. Location is part of the identity (the directory and
-  whether it is `info/exclude`): compiled rules are relative to their directory, and hard links give several
-  locations one inode. `retain` drops projects that are no longer monitored, rules included.
+  layers of files that are gone are not carried over. A file whose modification or change time is less than
+  `RACY_SECS` (2 s) before the walk's `now` is compiled but not kept for reuse (Git's "racy" rule: a rewrite
+  to the same size within one step of the file system's clock would not show in the times; v0.1.1 review
+  I5). Location is part of the identity (the directory and whether it is `info/exclude`): compiled rules are
+  relative to their directory, and hard links give several locations one inode. `Tracker::forget_departed`
+  drops projects that are no longer monitored, rules included.
+- *Subtree walks* (a directory created at runtime, `Monitor::walk_new_dir`; an unwatched subtree of a partly
+  watched project at a scan, `Tracker::walk_subtrees`) start from the project's rules (a copy costs a pointer
+  per file) and may hold **no more rules than those** (`max_patterns: base.patterns()`): they take over the
+  layers of unchanged files and compile nothing beyond them, so any number of them at once cost no rules
+  (v0.1.1 review M1: with the project's room in the limit, every new directory compiled up to 5,000 rules on
+  a blocking thread of its own, and 24 directories moved in together took the daemon past 2 GiB). A changed
+  file at a known place is read again within its old layer's rules. When such a walk meets an ignore file
+  the project's rules do not hold as it is (`Tree::rules_out_of_date`: a file it left out, or a layer that
+  differs from the base), the project is walked **whole**: from the monitor as a debounced `Rewalk`, from a
+  scan by `enroll` instead of recording the subtree walk's newest file. That full walk reads the file within
+  the limit across projects, and from then on its rules apply to the events in the new directory (before,
+  only after the project's next full walk).
 - *The limit across projects.* `begin` gives a full walk what the other projects leave of the limit (at most
   the project limit, at most `at_most`) and keeps that reserved until `settle`: all projects together never
-  hold more than the limit, also when two are walked at once. A subtree walk asks for `room`.
+  hold more than the limit, also when two are walked at once. **One full walk per project at a time:** a
+  second `begin` for a root that is being walked waits (a `Condvar`) until the first settles, then reuses
+  what it compiled (v0.1.1 review L1: two walks of one root shared one reservation, the first `settle`
+  released it while the second still ran, and the store ended at 18 rules of a limit of 10). Every `begin`
+  is followed by exactly one `settle` (`WalkContext::walk` settles only a walk that began).
+- *Who is forgotten.* `RuleStore::retain(since, keep)` judges by a list of monitored projects read after
+  `mark()` returned `since`, and never drops a project being walked or one whose walk began after the mark
+  (v0.1.1 review L2: a list read before a walk dropped projects that the other task enrolled meanwhile;
+  their rules stayed in the monitor, uncounted). `Tracker::forget_departed` reads that list where projects
+  leave: the end of a reconciliation, ignore and un-ignore, `Vanished` and `Moved`.
 - *By recency.* Who holds the rules when they do not fit is a function of the projects alone
   (`RuleStore::rebalance`): ordered by last activity (most recent first, unknown last, the path between
   equals), each project gets all it wants while it fits in what is left, the first that does not fit
   completely gets what is left, the ones after it nothing. `rebalance` returns the walks that get there:
   projects that hold more than their share first (least recent first), then projects that may hold more
   (most recent first), each with its allowance. `Tracker::rebalance_rules` runs them (`Cmd::Add` replaces the
-  project in the monitor); it is called at the end of every reconciliation, after the signals that walk or
-  remove projects, and after ignore/un-ignore, and returns at once unless some project lacks rules
-  (`contended`). Walk batches go in the order of `tracked_projects` (recency first), so a start with known
-  activity gets the shares right in the first pass.
-- *No feedback from the allocation into the order.* A walk of a project that lacks rules cannot tell ignored
-  files from meaningful ones; `Tracker::record_inferred` takes its newest file only for a project that has no
-  activity yet. Without that rule a project that gave its rules up became "recent" through the files its
-  rules used to hide and took the rules back from the next project (seen in `tests/tracker.rs`: the shares
-  changed across a restart). **Only scan-derived times are held back.** What the watcher observes in such a
-  project (`Signal::Activity` → `Writer::record_activity`, kind `observed`) does not pass through
-  `record_inferred` and is recorded as in any other project; that activity moves the project up and its
-  rules come back at the next scan (tested in the same tracker test, in one state: the scan leaves the time,
-  the watcher event moves it).
+  project in the monitor); it is called at the end of every reconciliation, after every signal other than
+  `Activity`, `Git` and `Rescan` (a `Sessions` signal comes with every change of a session file, so the
+  rules can move far more often than once per scan), and after ignore/un-ignore, and returns at once unless
+  some project lacks rules or all together hold more than the limit (`contended`; the second cannot arise
+  from walks that begin and settle as they should, and is corrected if it does). A change of activity alone
+  moves the rules after the next such call, at the latest at the next scan. Walk batches go in the order of
+  `tracked_projects` (recency first), so a start with known activity gets the shares right in the first pass.
+- *A project that lacks rules is scanned with all of them* (v0.1.1 review M2, replacing the earlier rule that
+  such a scan never moves a known time). A walk within the allowance cannot tell the files the missing rules
+  ignore from meaningful ones. `WalkContext::walk`: when a full walk left rules out (`Tree::left_rules_out`),
+  its newest file comes from a **second walk with the project's own limits**, whose rules are compiled for
+  that walk alone and dropped when it ends (it reuses the rules the project keeps and those of its previous
+  walk, so a project that just gave rules up compiles nothing), and such walks run **one at a time**
+  (`RuleStore::outside_the_limit`, a mutex): beyond the limit there is never more than one project's worth.
+  A partly watched project that lacks rules is walked whole at a scan (a subtree walk has only the rules it
+  keeps). So every time a walk records is one the project's rules allow: a polled project — whose scans are
+  its only source of activity — still shows its real changes and, through them, gets its rules back;
+  giving rules up never makes a project look active (the feedback seen in `tests/tracker.rs`, where the
+  shares changed across a restart, cannot arise); and a project's first walk under contention records a
+  time its rules allow (v0.1.1 review L6). The cost: a project that lacks rules has them compiled at every
+  scan that walks it (up to 1.2 s and one project's worth of memory for 5,000 rules that need a regular
+  expression). What the watcher observes is judged with the rules a project **keeps**: in a project that
+  lacks some, a change to a file those rules would ignore is recorded as activity (the watcher cannot tell
+  either), and can move the project up and its rules back (v0.1.1 review L6; once it holds them, such files
+  stop counting). `MonitorStatus::ignore_rules_limited` names the projects that lack rules; `ccwm status`
+  shows them ("ignore rules limited").
 
 ## 7b. M3 sessions and session-based discovery
 
@@ -724,7 +760,16 @@ check verified, `ccwm status` works, `systemctl --user stop` ⇒ clean shutdown 
 with `MemoryMax=200M` and four projects of 5,000 expensive ignore rules each (about 390 MiB): `oom-kill`
 about 2 s after each start, `auto-restart`, restarted after 5 s, again and again (`NRestarts` 0, 1, 2 within
 22 s) until stopped. (4) The same content under `MemoryMax=2G`: runs, `memory.current` 384 MiB, peak 389 MiB,
-no swap, no restart. Earlier (M1) acceptance list:
+no swap, no restart. **v0.1.1 review L4, `OOMPolicy=continue` and the start limit** (transient user units
+`ccwm-l4-oom-*` with every directive of the unit, `MemoryMax=64M`, the static release binary in a synthetic
+environment, a fake `claude` whose `--version` allocates 300 MiB): with `OOMPolicy=continue` the child was
+killed (`memory.events`: `oom_kill 1`), the daemon kept its process id, `NRestarts=0`, `ActiveState=active`,
+`ccwm status` answered (`claude: failed`, `fully_enforced`, seccomp `socket_denied`); control without it
+(the user manager's default, `OOMPolicy=stop`): `Result=oom-kill`, restarted (`NRestarts=1` within 10 s).
+`StartLimitBurst=3` on a transient unit running `/bin/false` with `Restart=on-failure`, `RestartSec=1`:
+after 3 restarts "Start request repeated too quickly", `ActiveState=failed`. The unit's own values (10 starts
+in 10 minutes) are checked by `systemd-analyze verify` and the directive test, not by a crash loop. Earlier
+(M1) acceptance list:
 Accepted in a transient user unit: `NoNewPrivileges`, `Nice`, `IOSchedulingClass=idle`, `UMask`, `PrivateTmp`,
 `ProtectSystem=strict`, `ProtectHome=read-only`, `ProtectKernelTunables`, `RestrictNamespaces`,
 `RestrictAddressFamilies`, `MemoryDenyWriteExecute`, `LockPersonality`, `SystemCallArchitectures`,
@@ -954,6 +999,37 @@ rustc 1.94.0, systemd 255).
   gitleaks, actionlint on the workflows, shellcheck on the scripts. **CI has not run on this commit** (nothing
   pushed).
 
+## 13j. v0.1.1 review fixes (what was actually run, 2026-11-26)
+
+The fixes of docs/reviews/v0.1.1-review.md, as decided by the maintainer. Same host as §13i.
+
+- **Each fix against its test (mutation run in a copy of the tree):** sixteen changes that each take one fix
+  back out; every one makes at least one of the new tests fail: the allowance of new-directory walks
+  (`tests/watch.rs`, the walk's own result is inspected: one rule, not two) and of polled-subtree walks
+  (unit test of `WalkContext::walk_from`) — the `room()`-constant mutation of the review, M18; the rewalk
+  from the monitor and from a scan (`tests/watch.rs`, two `tests/tracker.rs` tests); the second walk of a
+  project that lacks rules (a unit test and two tracker tests); the routing of a partly watched such project
+  to a whole walk; `forget_departed` (the retain-removal mutation, M19: `tests/tracker.rs`, a project
+  ignored, un-ignored and deleted); the mark in `retain`; the wait in `begin`; `contended` above the limit;
+  the 2 s rule; the retries without waiting and the debt at start of the WAL truncation; per-folder
+  completeness of a cut-off session listing (two mutations; one survived the first version of its test,
+  which depended on the order of directory entries: the test now lists in a fixed order); the
+  `ignore_rules_limited` status.
+- **M1 reproduction** (the review's appendix, release builds of `f68a4de` and of the fix): 24 directories of
+  4,900 expensive rules moved into one watched project. Before: glibc peak 2,138.3 MiB (the review: 2,137);
+  after: glibc 98.9 MiB, musl 107.6 MiB; 23 skipped files reported (before: 0).
+- **M2 cost** (`scripts/bench.py --only ignore`, docs/benchmarks.md): the first version ran the second walks
+  under a mutex on the blocking pool, and the glibc build grew by one project's worth per scan (428 → 1,042.5
+  MiB in ten polled scans, musl flat at 381.6 MiB). With a thread of their own (`RuleStore::outside_the_limit`,
+  thread `ccwm-rules`): glibc 432.9 → 434.1 MiB, musl 381.6 → 381.5 MiB (peak 479.9), 2.5–3.6 s per scan.
+- **L4:** §13. **L5:** `m3_acceptance…` run 100 times in a row after the swap, 0 failures (the review: 4 of 40
+  before).
+- **Checks:** `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+  `CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_LANDLOCK_ABI=8 CCWM_REQUIRE_INOTIFY=1 cargo test`. CI has not run on
+  this commit.
+
+---
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -1072,7 +1148,10 @@ of the worst-case fixture in both builds; no README changes.
 (directory, and whether it is `info/exclude`): compiled rules are relative to their directory, and hard links
 give several locations one inode. The shares by recency: each project all it wants while it fits, the first
 that does not fit completely gets the rest, the ones after it nothing (file granularity inside that one
-project only). Rules follow a change of activity at the next scan, not at once. **One rule came with it** (REQUIREMENTS.md §5.2, Appendix A; approved by the maintainer on 2026-11-26): a walk
+project only). Rules follow a change of activity after the next walk, change of the project list or session
+change, at the latest at the next scan (first written as "at the next scan"; v0.1.1 review L6). **One rule
+came with it** (REQUIREMENTS.md §5.2, Appendix A; approved by the maintainer on 2026-11-26; **superseded by
+the review's M2**, below): a walk
 of a project that lacks rules because of the limit across projects does not move a known activity time. Without
 it the allocation fed back into its own order — a project that gave its rules up looked active through the files
 its rules used to hide and took the rules back from the next one; the tracker test showed different shares after
@@ -1082,6 +1161,22 @@ with huge ignore files and recent file times outranks older projects for the lim
 for deeper watches). **`st_ctime` in the cache key (maintainer decision,
 2026-11-26):** seconds and nanoseconds, next to the modification time. Left over: a rewrite to the same size
 within the file system's timestamp resolution of the previous change; the cache is not keyed by content.
+
+**The v0.1.1 review (docs/reviews/v0.1.1-review.md), decided by the maintainer (2026-11-26):** M1 — walks of
+part of a project's tree reuse only the rules the project holds, and a new ignore file triggers a full walk
+under the limit across projects; M2 — a project that lacks rules is scanned with rules compiled for that walk
+only (one project at a time, never cached, dropped after the walk), and `ccwm status` shows "ignore rules
+limited"; this replaces the scan-only freeze approved earlier that day; L1, L2, L3, L6 as the review proposed;
+L4 — `OOMPolicy=continue` and a start limit, verified with the real daemon; L5 — the stop before the wake-up;
+the Info items as proposed. **Choices made in the fix, for review:** the second walks run on one thread of
+their own rather than under a mutex (measured: the mutex let a glibc build keep one project's worth per scan);
+a partly watched project that lacks rules is walked whole at a scan; a changed ignore file at a known place
+is read again within its old layer's rules by a subtree walk (it is then out of date, and the project is
+walked whole); a second full walk of a project waits for the first instead of the two sharing a reservation;
+`StartLimitIntervalSec=10min`, `StartLimitBurst=10` (manual starts count); the 2 s rule of I5 compares the
+file's times with the walk's `now`, in whole seconds. **Not done, recorded in ROADMAP.md "After v0.1.1":** I3
+(counting a repository's rules once across projects would make the shares non-additive), I4 (weighting
+expensive rules).
 
 Open:
 - **O2:** a `claude` binary outside the sandbox read set cannot be executed: reported as `failed` (the usual

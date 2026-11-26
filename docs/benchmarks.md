@@ -110,27 +110,54 @@ add the storage's read time. That was not measured.
 
 ### Ignore rules at their limits
 
-Measured on 2026-11-26 with `ccwm 0.1.1` (`scripts/bench.py --only ignore`), on the same host. This is not
-normal use: it is the most that ccwm's limits on ignore files allow (256 KiB per file, 5,000 rules per
-project, 20,000 rules for all projects), with rules that all need a regular expression — the expensive
-kind; ordinary rules such as `target/` or `*.log` cost almost nothing. Six projects, each with a `.git`
-and a `.gitignore` of 5,000 rules of the shape `*1x7?b[c-d]*.x`, so four projects fill the limit across
-projects and the files of two are skipped. Two builds: `target/release` (glibc) and the static
-`x86_64-unknown-linux-musl` binary that releases ship.
+Measured on 2026-11-26 with `ccwm 0.1.1` after the fixes of its review (`scripts/bench.py --only ignore`),
+on the same host. This is not normal use: it is the most that ccwm's limits on ignore files allow (256 KiB
+per file, 5,000 rules per project, 20,000 rules for all projects), with rules that all need a regular
+expression — the expensive kind; ordinary rules such as `target/` or `*.log` cost almost nothing. Six
+projects, each with a `.git` and a `.gitignore` of 5,000 rules of the shape `*1x7?b[c-d]*.x`, so four
+projects fill the limit across projects and two lack their rules. Two builds: `target/release` (glibc)
+and the static `x86_64-unknown-linux-musl` binary that releases ship.
 
 | | glibc build | musl binary (release) |
 |---|---|---|
 | ignore files skipped / rules kept | 2 / 20,000 | 2 / 20,000 |
-| first scan finished after start (the rules are compiled in it) | 5.3 s | 5.7 s |
-| RSS with every project watched (peak) | **343.7 MiB** (343.7 MiB) | **391.4 MiB** (394.8 MiB) |
-| every project polled (`watch.budget = 1`): ten more scans, each | 0.1 s | 0.1 s |
-| RSS after the first and after the tenth of those scans | **343.8 MiB → 344.7 MiB** | **380.6 MiB → 380.7 MiB** |
-| peak RSS in that run | 344.7 MiB | 384.3 MiB |
+| first scan finished after start (the rules are compiled in it) | 8.3 s | 10.6 s |
+| RSS with every project watched (peak) | **433.4 MiB** (433.4 MiB) | **392.0 MiB** (491.9 MiB) |
+| every project polled (`watch.budget = 1`): ten more scans, each | 2.5–3.2 s | 2.8–3.6 s |
+| RSS after the first and after the tenth of those scans | **432.9 MiB → 434.1 MiB** | **381.6 MiB → 381.5 MiB** |
+| peak RSS in that run | 434.1 MiB | 479.9 MiB |
 
-That is 17–20 KiB per rule kept, and it stays there: the compiled rules of an ignore file are kept and
-used again until the file changes (its device, inode, size, modification time or change time), so a scan of projects
-whose ignore files are as they were compiles nothing. Polled projects are the case that shows it: they
-are walked again at every scan.
+The kept rules take 17–20 KiB each, and that stays: the compiled rules of an ignore file are kept and
+used again until the file changes (its device, inode, size, modification time or change time), so a scan
+of projects whose ignore files are as they were compiles nothing for them. Polled projects are the case
+that shows it: they are walked again at every scan.
+
+**The two projects without their rules** are scanned with all of them all the same (v0.1.1 review M2): at
+every scan that walks them, their rules are compiled for that walk alone, one project at a time, on one
+thread of their own, and dropped. That is what the scans cost now (2.5–3.6 s instead of 0.1 s), and the
+memory above the kept rules: one project's worth, about 100 MiB here. The musl binary gives it back after
+each walk (381.5 MiB between scans, 479.9 MiB at the peak). The glibc build keeps it in that thread's
+arena and uses it again for the next such walk: 433–434 MiB, flat. Before the walks had a thread of their
+own, they ran on the blocking pool's changing threads, and the glibc build kept one more project's worth
+per scan: 428 MiB after start, 1,042.5 MiB after ten scans, still growing (the musl binary was flat then
+too: 381.6 MiB, peak 479.7 MiB). Until the review, such a project was not scanned with its rules at all,
+and its activity stayed where it was (the first table of 0.1.1: 343.7 MiB glibc, 391.4 MiB musl, 0.1 s per
+scan).
+
+**Directories moved into a project** (v0.1.1 review M1; release builds of the review's commit and of the
+fix, the review's reproduction: one watched project, 24 directories that each hold a `.gitignore` of 4,900
+such rules, moved in together):
+
+| | before the fix | after |
+|---|---|---|
+| glibc: RSS before, peak, 30 s later | 14.5 MiB, **2,138.3 MiB**, 1,788.4 MiB | 14.9 MiB, **98.9 MiB**, 96.6 MiB |
+| musl: RSS before, peak, 30 s later | 11 MiB, **2,462 MiB**, 21 MiB (the review's run) | 11.1 MiB, **107.6 MiB**, 103.1 MiB |
+| ignore files reported as skipped | 0 | 23 |
+
+Each new directory used to be walked with what the limit left the project, on a blocking thread of its
+own, so 24 of them compiled 24 times 4,900 rules at once. Now such a walk holds no more rules than the
+project and compiles none; the project is walked again once, which reads the first file (4,900 rules, about
+85 MiB) and skips the other 23 within the project's limit of 5,000 rules.
 
 **Before the rules were cached** (the first 0.1.1 build, same fixture) every such scan compiled all 20,000
 rules again, 5–6 s each, next to the ones they replaced. The musl binary gave the memory back (peak 775 MiB,
@@ -146,7 +173,7 @@ file again, next to the rules it replaces, one project at a time).
 
 The systemd unit carries a hard limit all the same, `MemoryMax=2G` with `MemorySwapMax=0`
 ([service.md](service.md#the-unit)): far above normal use (17–26 MiB in the tables above) and above this
-worst case. With the cache it can be lower; that is planned (ROADMAP.md). A short re-run of the
+worst case (about 490 MiB at the peak). With the cache it can be lower; that is planned (ROADMAP.md). A short re-run of the
 500-project scenario with 0.1.1 gave 21.6 MiB after start and a 25.8 MiB peak in the 10,000-file burst
 (0.1.0: 21.4 and 25.0).
 
@@ -156,8 +183,11 @@ worst case. With the cache it can be lower; that is planned (ROADMAP.md). A shor
 cargo build --release --bins
 scripts/bench.py --bin target/release                        # ~15 minutes (10 of them idle)
 scripts/bench.py --bin target/release --idle 0 --only burst,exhaustion
-scripts/bench.py --bin target/release --only ignore          # the ignore-rule limits, under a minute
+scripts/bench.py --bin target/release --only ignore          # the ignore-rule limits, about two minutes
 ```
+
+The directories-moved-in measurement is the procedure in the appendix of
+[reviews/v0.1.1-review.md](reviews/v0.1.1-review.md) (M1); it is not part of `bench.py`.
 
 The script prints one JSON document (host, method, every measurement). Keep raw results out of the
 repository (`/bench-results/` is gitignored).

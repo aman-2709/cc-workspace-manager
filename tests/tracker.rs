@@ -290,8 +290,9 @@ impl Stack {
     }
 
     async fn stop(self) {
-        self.tracker.cancel();
+        // The daemon's order: the stop first, then `cancel` (which wakes the reconciler).
         let _ = self.stop.send(true);
+        self.tracker.cancel();
         for t in self.tasks {
             let _ = t.await;
         }
@@ -653,8 +654,8 @@ async fn the_limit_on_ignore_rules_goes_to_the_most_recently_active_projects() {
     );
     // The rules apply where they are kept and not where they were given up: a new file that
     // they name is activity only in the project without rules. There it is activity like any
-    // other: what the watcher observes in a project without its rules is recorded as always
-    // (only scans leave such a project's time alone, see below).
+    // other: the watcher judges events with the rules a project keeps, and this one keeps none
+    // (only scans use all of a project's rules, see below).
     let oldest_id = s.by_path(oldest).await.unwrap().id;
     let before = s.row(&oldest_id).await;
     assert_eq!(
@@ -697,9 +698,10 @@ async fn the_limit_on_ignore_rules_goes_to_the_most_recently_active_projects() {
     })
     .await;
     // Giving its rules up did not make `b-middle` look active: the walk that dropped them saw
-    // `one.tmp` as an ordinary file, but a walk without the project's rules never moves a time
-    // that is known. (Otherwise `b-middle` would now be as recent as `a-oldest` and take the
-    // rules back from `c-newest`: the restart below would find other shares.)
+    // `one.tmp` as an ordinary file, but the time a walk records comes from all of the
+    // project's rules (a second walk, compiled for it alone), and they ignore `one.tmp`.
+    // (Otherwise `b-middle` would now be as recent as `a-oldest` and take the rules back from
+    // `c-newest`: the restart below would find other shares.)
     let row = s.row(&s.by_path(middle).await.unwrap().id).await;
     assert_ne!(row.activity_path.as_deref(), Some("one.tmp"), "{row:?}");
     assert!(row.activity_at.unwrap() <= now - 1_990, "{row:?}");
@@ -716,11 +718,11 @@ async fn the_limit_on_ignore_rules_goes_to_the_most_recently_active_projects() {
     })
     .await;
 
-    // `b-middle` is now the project without its rules, with a known time. Both halves of the
-    // rule, in that one state:
-    // - a scan does not move its time. The scan of this start walked it without its rules and
-    //   found `one.tmp` (written above, when its rules still hid it) as its newest file, far
-    //   newer than what is recorded: the recorded time and file are as they were.
+    // `b-middle` is now the project without its rules, with a known time. In that one state:
+    // - a scan does not take an ignored file for activity. The scan of this start walked it
+    //   within the limit, without its rules, where `one.tmp` (written above, when its rules
+    //   still hid it) is its newest file, far newer than what is recorded; the time it records
+    //   comes from all of its rules: the recorded time and file are as they were.
     let middle_id = s.by_path(middle).await.unwrap().id;
     s.wait_watched(&middle_id).await;
     let frozen = s.row(&middle_id).await;
@@ -759,6 +761,337 @@ async fn the_limit_on_ignore_rules_goes_to_the_most_recently_active_projects() {
     s.wait_scans(scans + 1).await;
     s.wait("the rules to come back with real activity", 15, || async {
         kept(&s) == [4, 4, 0]
+    })
+    .await;
+    s.stop().await;
+}
+
+/// Projects for the tests of the limit on ignore rules: each a work tree with a `CLAUDE.md`
+/// and a `.gitignore` of four rules, its files last changed `age` seconds before `now`.
+const FOUR_RULES: &str = "one.tmp\ntwo.tmp\nthree.tmp\nfour.tmp\n";
+
+fn projects_with_rules(home: &Path, now: i64, ages: &[(&str, i64)]) -> Vec<PathBuf> {
+    ages.iter()
+        .map(|(name, age)| {
+            let r = home.join(name);
+            marker(&r, "# project");
+            fs::create_dir(r.join(".git")).unwrap();
+            fs::write(r.join(".gitignore"), FOUR_RULES).unwrap();
+            for file in ["CLAUDE.md", ".gitignore"] {
+                set_mtime(&r.join(file), now - age);
+            }
+            r
+        })
+        .collect()
+}
+
+fn set_mtime(path: &Path, at: i64) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(at).unwrap()))
+        .unwrap();
+}
+
+/// v0.1.1 review M2: a project without watches that lacks its ignore rules (the limit across
+/// projects gives them to a more recent project) is scanned with all of them, compiled for that
+/// scan alone. Its real activity is seen — scans are a polled project's only source — and a
+/// file its rules ignore is not taken for activity. The rules are not kept, and `ccwm status`
+/// names the project. Then that real activity makes it the most recent project, and the rules
+/// move to it. (Before: the scan of such a project never moved its time, so it never got its
+/// rules back; with them simply dropped instead, `one.tmp` would have been its latest file.)
+#[tokio::test]
+async fn a_polled_project_that_lacks_ignore_rules_is_scanned_with_them_and_shows_real_activity() {
+    let _g = inotify_lock().lock().await;
+    let e = env();
+    let clock = now_clock();
+    let now = clock.now();
+    let roots = projects_with_rules(&e.home, now, &[("a-older", 3_000), ("b-newer", 1_000)]);
+    let (older, newer) = (&roots[0], &roots[1]);
+    let opts = Opts {
+        budget: 1, // one watch: the root of the most recent project; `a-older` is polled
+        ignore_rules: 4,
+        ..Opts::default()
+    };
+    let Some(s) = Stack::start_with(&e.home, &e.data, clock, opts).await else {
+        return;
+    };
+    s.wait_scans(1).await;
+    let older_id = s.wait_registered(older).await.id;
+    s.wait(
+        "the rules to be with the more recent project",
+        15,
+        || async { (s.rules.kept(older), s.rules.kept(newer)) == (0, 4) },
+    )
+    .await;
+    s.wait("a-older polled and named as limited", 15, || async {
+        let m = s.monitor.snapshot();
+        s.monitor.of(&older_id).map(|m| m.0) == Some(Monitoring::Polled)
+            && m.ignore_rules_limited == ["a-older"]
+    })
+    .await;
+    let before = s.row(&older_id).await;
+    assert!(before.activity_at.unwrap() <= now - 2_990, "{before:?}");
+
+    // A file its rules ignore, newer than anything else; and a real change, older than that.
+    let ignored = older.join("one.tmp");
+    fs::write(&ignored, "ignored").unwrap();
+    set_mtime(&ignored, s.clock.now() - 5);
+    let real = older.join("notes.txt");
+    fs::write(&real, "real").unwrap();
+    set_mtime(&real, s.clock.now() - 10);
+    let scans = s.status.snapshot().scans_finished;
+    s.tracker.request_refresh();
+    s.wait_scans(scans + 1).await;
+    let row = s.row(&older_id).await;
+    assert_eq!(
+        (row.activity_path.as_deref(), row.activity_kind.as_deref()),
+        (Some("notes.txt"), Some("inferred")),
+        "{row:?}"
+    );
+    assert_eq!(row.activity_at, Some(s.clock.now() - 10), "{row:?}");
+
+    // That activity makes it the more recent project: the rules follow it.
+    s.wait("the rules to follow the real activity", 15, || async {
+        (s.rules.kept(older), s.rules.kept(newer)) == (4, 0)
+    })
+    .await;
+    assert_eq!(
+        s.rules.total(),
+        4,
+        "the rules of the scan alone were not kept"
+    );
+    s.wait("b-newer named as limited now", 15, || async {
+        s.monitor.snapshot().ignore_rules_limited == ["b-newer"]
+    })
+    .await;
+    s.stop().await;
+}
+
+/// v0.1.1 review M2, a partly watched project that lacks its ignore rules: its unwatched
+/// subtrees are not walked on their own (a subtree walk has only the rules the project keeps,
+/// here none), the project is walked whole, with all of its rules for its time. A file they
+/// ignore in an unwatched subtree is not activity; a real change there is.
+#[tokio::test]
+async fn a_partly_watched_project_that_lacks_ignore_rules_is_walked_whole() {
+    let _g = inotify_lock().lock().await;
+    let e = env();
+    let clock = now_clock();
+    let roots = projects_with_rules(
+        &e.home,
+        clock.now(),
+        &[("a-older", 3_000), ("b-newer", 1_000)],
+    );
+    let older = &roots[0];
+    fs::create_dir_all(older.join("deep/er")).unwrap();
+    let opts = Opts {
+        budget: 3, // both roots and their parent; nothing below them
+        ignore_rules: 4,
+        ..Opts::default()
+    };
+    let Some(s) = Stack::start_with(&e.home, &e.data, clock, opts).await else {
+        return;
+    };
+    s.wait_scans(1).await;
+    let id = s.wait_registered(older).await.id;
+    s.wait("a-older partly watched, without its rules", 15, || async {
+        s.monitor.of(&id).map(|m| m.0) == Some(Monitoring::Partial) && s.rules.lacks_rules(older)
+    })
+    .await;
+    let ignored = older.join("deep/er/one.tmp");
+    fs::write(&ignored, "ignored").unwrap();
+    set_mtime(&ignored, s.clock.now() - 5);
+    let scans = s.status.snapshot().scans_finished;
+    s.tracker.request_refresh();
+    s.wait_scans(scans + 1).await;
+    let row = s.row(&id).await;
+    assert_ne!(
+        row.activity_path.as_deref(),
+        Some("deep/er/one.tmp"),
+        "a file its rules ignore: {row:?}"
+    );
+    let real = older.join("deep/er/notes.txt");
+    fs::write(&real, "real").unwrap();
+    set_mtime(&real, s.clock.now() - 10);
+    let scans = s.status.snapshot().scans_finished;
+    s.tracker.request_refresh();
+    s.wait_scans(scans + 1).await;
+    let row = s.row(&id).await;
+    assert_eq!(
+        (row.activity_path.as_deref(), row.activity_at),
+        (Some("deep/er/notes.txt"), Some(s.clock.now() - 10)),
+        "{row:?}"
+    );
+    s.stop().await;
+}
+
+/// v0.1.1 review M1, the reconciler's side: an ignore file that appears in an unwatched subtree
+/// of a partly watched project. The scan's subtree walk compiles nothing; the project's rules
+/// are out of date, so the project is walked whole, which reads the new file. A file it ignores
+/// is not taken for the project's latest change (the subtree walk alone, without the file's
+/// rules, would have taken it).
+#[tokio::test]
+async fn a_new_ignore_file_in_an_unwatched_subtree_has_the_project_walked_whole() {
+    let _g = inotify_lock().lock().await;
+    let e = env();
+    let clock = now_clock();
+    let p = e.home.join("dev/p");
+    marker(&p, "# p");
+    set_mtime(&p.join("CLAUDE.md"), clock.now() - 100);
+    fs::create_dir(p.join(".git")).unwrap();
+    fs::create_dir_all(p.join("top")).unwrap();
+    fs::create_dir_all(p.join("deep/x/y")).unwrap();
+    // Budget: the root, its parent `dev`, `.git` and the top level (`top`, `deep`).
+    let Some(s) = Stack::start_with_budget(&e.home, &e.data, clock, 5).await else {
+        return;
+    };
+    let t = s.wait_registered(&p).await;
+    s.wait("partly watched", 15, || async {
+        s.monitor
+            .poll_target(&t.id)
+            .is_some_and(|target| target.subtrees == [p.join("deep/x")])
+    })
+    .await;
+    assert_eq!(s.rules.kept(&p), 0);
+
+    fs::write(p.join("deep/x/.gitignore"), "secret.txt\n").unwrap();
+    set_mtime(&p.join("deep/x/.gitignore"), s.clock.now() - 50);
+    let secret = p.join("deep/x/y/secret.txt");
+    fs::write(&secret, "s").unwrap();
+    set_mtime(&secret, s.clock.now() - 5);
+    let scans = s.status.snapshot().scans_finished;
+    s.tracker.request_refresh();
+    s.wait_scans(scans + 1).await;
+    s.wait(
+        "the project walked whole with the new rules",
+        15,
+        || async { s.rules.kept(&p) == 1 },
+    )
+    .await;
+    let row = s.row(&t.id).await;
+    assert_eq!(
+        row.activity_path.as_deref(),
+        Some("deep/x/.gitignore"),
+        "the newest file its rules do not ignore: {row:?}"
+    );
+    s.stop().await;
+}
+
+/// v0.1.1 review L2: a project that leaves monitoring frees its share of the limit on ignore
+/// rules for the next project in the order — ignored, and missing after its directory was
+/// deleted — and takes it back when it returns as the more recent one. (Without the store
+/// forgetting such projects, `a-older` never got the rules: the share stayed counted for a
+/// project nobody monitored.)
+#[tokio::test]
+async fn a_project_that_leaves_frees_its_share_of_the_ignore_rules() {
+    let _g = inotify_lock().lock().await;
+    let e = env();
+    let clock = now_clock();
+    let roots = projects_with_rules(
+        &e.home,
+        clock.now(),
+        &[("a-older", 3_000), ("b-newer", 1_000)],
+    );
+    let (older, newer) = (&roots[0], &roots[1]);
+    let opts = Opts {
+        ignore_rules: 4,
+        ..Opts::default()
+    };
+    let Some(s) = Stack::start_with(&e.home, &e.data, clock, opts).await else {
+        return;
+    };
+    s.wait_scans(1).await;
+    let b = s.wait_registered(newer).await;
+    let kept = |s: &Stack| (s.rules.kept(older), s.rules.kept(newer));
+    s.wait("the rules to be with b-newer", 15, || async {
+        kept(&s) == (0, 4)
+    })
+    .await;
+
+    s.writer.set_ignored(&b.path, true, 1).await.unwrap();
+    s.tracker
+        .on_control(Control::Ignored(b.id.clone()))
+        .await
+        .unwrap();
+    s.wait("an ignored project to free its share", 15, || async {
+        kept(&s) == (4, 0)
+    })
+    .await;
+    s.writer.set_ignored(&b.path, false, 2).await.unwrap();
+    s.tracker
+        .on_control(Control::Unignored(b.id.clone()))
+        .await
+        .unwrap();
+    s.wait("the more recent project to take it back", 15, || async {
+        kept(&s) == (0, 4)
+    })
+    .await;
+    s.wait_watched(&b.id).await;
+
+    fs::remove_dir_all(newer).unwrap();
+    s.wait("b-newer missing", 15, || async {
+        s.by_path(newer).await.is_some_and(|t| t.missing)
+    })
+    .await;
+    s.wait("a missing project to free its share", 15, || async {
+        kept(&s) == (4, 0)
+    })
+    .await;
+    assert_eq!(s.rules.total(), 4);
+    s.stop().await;
+}
+
+/// v0.1.1 review M1, end to end: a directory with its own `.gitignore` moved into a watched
+/// project. The walk of the new directory compiles nothing; the project is walked again, and
+/// that walk reads the new file within the limit across projects. From then on its rules
+/// apply to the events in the new directory. (Before, they applied only after the project's
+/// next full walk, whenever that came.)
+#[tokio::test]
+async fn ignore_files_in_a_directory_moved_into_a_project_apply_after_a_rewalk() {
+    let _g = inotify_lock().lock().await;
+    let e = env();
+    let p = e.home.join("dev/p");
+    marker(&p, "# p");
+    fs::create_dir(p.join(".git")).unwrap();
+    let staging = e.home.join(".staging/vendor");
+    fs::create_dir_all(staging.join("src")).unwrap();
+    fs::write(staging.join(".gitignore"), "*.o\n").unwrap();
+    fs::write(staging.join("src/lib.c"), "c").unwrap();
+    let Some(s) = Stack::start(&e.home, &e.data, now_clock()).await else {
+        return;
+    };
+    let t = s.wait_registered(&p).await;
+    s.wait_watched(&t.id).await;
+    assert_eq!(s.rules.kept(&p), 0);
+
+    fs::rename(&staging, p.join("vendor")).unwrap();
+    s.wait(
+        "the project walked again with the new rules",
+        15,
+        || async { s.rules.kept(&p) == 1 },
+    )
+    .await;
+    s.wait("the new directory watched", 15, || async {
+        s.monitor
+            .of(&t.id)
+            .is_some_and(|m| m.0 == Monitoring::Watched)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await; // the move's own activity lands
+    s.clock.advance(100);
+    fs::write(p.join("vendor/src/lib.o"), "object").unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let row = s.row(&t.id).await;
+    assert_ne!(
+        row.activity_path.as_deref(),
+        Some("vendor/src/lib.o"),
+        "a file the new rules ignore is not activity: {row:?}"
+    );
+    // Control: a file they do not ignore, in the same directory, is.
+    fs::write(p.join("vendor/src/lib.h"), "header").unwrap();
+    s.wait("activity in the new directory", 10, || async {
+        s.row(&t.id).await.activity_path.as_deref() == Some("vendor/src/lib.h")
     })
     .await;
     s.stop().await;

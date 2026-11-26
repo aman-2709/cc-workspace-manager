@@ -91,6 +91,10 @@ disable-linger "$USER"` turns it off.
 `ccwm service install` writes this unit. Run `systemctl --user cat ccwm` to see what is installed.
 
 ```ini
+[Unit]
+StartLimitIntervalSec=10min
+StartLimitBurst=10
+
 [Service]
 Type=exec
 ExecStart=%h/.local/bin/ccwm serve
@@ -101,6 +105,7 @@ RestartPreventExitStatus=10 11
 TimeoutStopSec=10
 MemoryMax=2G
 MemorySwapMax=0
+OOMPolicy=continue
 UMask=0077
 Nice=10
 IOSchedulingClass=idle
@@ -128,10 +133,12 @@ Notes:
   shell can.
 - **`MemoryMax=2G` and `MemorySwapMax=0`** (since 0.1.1): the most memory the daemon and its `git` and
   `claude` children may use together, with no swap on top. It is a backstop, not a working size: ccwm
-  normally needs 20–30 MiB, and the worst case its own limits allow was measured at 395 MiB with the release
-  binary ([benchmarks.md](benchmarks.md#ignore-rules-at-their-limits)). If the limit is ever reached, the
-  kernel stops the service and systemd starts it again after 5 s
-  ([troubleshooting.md](troubleshooting.md#the-service-keeps-restarting-out-of-memory)). `MemorySwapMax=0`
+  normally needs 20–30 MiB, and the worst case its own limits allow was measured at about 490 MiB at the
+  peak with the release binary (392 MiB of kept rules, plus one project's worth while a project without
+  its rules is scanned with them; [benchmarks.md](benchmarks.md#ignore-rules-at-their-limits)). If the
+  limit is ever reached, the kernel kills the largest process of the unit: a `git` or `claude` child then
+  fails like any failed command and the daemon goes on (`OOMPolicy=continue`); a killed daemon is started
+  again after 5 s ([troubleshooting.md](troubleshooting.md#the-service-keeps-restarting-out-of-memory)). `MemorySwapMax=0`
   belongs to it: on a machine with swap, `MemoryMax=` alone does not stop anything, it only moves the excess
   to swap. To use another limit, add a drop-in with `systemctl --user edit ccwm`:
   ```ini
@@ -143,6 +150,16 @@ Notes:
   controller** for your user manager: `cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers`
   must list `memory` (it does on Ubuntu 24.04). Without it, systemd accepts the directives and they do
   nothing. A daemon started by hand (`ccwm serve`) has no such limit.
+- **`OOMPolicy=continue`** (since 0.1.1): systemd's default for a process of the unit that the kernel
+  kills at the limit is to stop the whole unit. ccwm treats a `git` or `claude` that fails as a status,
+  so only the process that was killed ends. Verified with the real daemon in a transient user unit under
+  `MemoryMax=64M`: a `claude --version` that allocated 300 MiB was killed, the daemon kept running with
+  the same process id; with the default policy the unit failed with `oom-kill` and was restarted.
+- **`StartLimitIntervalSec=10min` and `StartLimitBurst=10`** (since 0.1.1, in `[Unit]`): a daemon that
+  fails ten times in ten minutes stays stopped (`failed`, shown by `ccwm status`) instead of being
+  restarted for ever; with `RestartSec=5`, systemd's own default (5 starts in 10 s) can never be reached.
+  Starts by hand (`ccwm start`, `ccwm restart`) count too. After fixing the cause:
+  `systemctl --user reset-failed ccwm`, then `ccwm start`.
 - **What is not used, and why.** `ProtectSystem=`, `ProtectHome=` and `PrivateTmp=` make systemd run a
   *user* service inside a user namespace. There, root-owned paths such as `/` and `/home` appear to be
   owned by `nobody` (uid 65534). ccwm refuses to trust directories other users could own, so it would not

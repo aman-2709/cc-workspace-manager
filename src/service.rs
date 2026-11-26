@@ -1161,8 +1161,10 @@ fn strip(v: &mut serde_json::Value, arrays: &[&str], key: &str) {
     }
 }
 
-/// A path value of `PUT /settings` (`key` names it in the error): absolute and without `.` or
-/// `..`, with symlinks resolved when it exists, so that a link to `/` is judged as `/`.
+/// A path value of `PUT /settings` (`key` names it in the error): absolute and without `..`,
+/// with symlinks resolved when it exists, so that a link to `/` is judged as `/`. A `.`
+/// component is allowed: `Path::components` drops it, and `/home/u/./dev` is `/home/u/dev`
+/// (v0.1.1 review I1: the message promised a check of `.` that never ran).
 fn settable_path(key: &str, value: &str) -> Result<PathBuf, ApiError> {
     use std::path::Component;
     let p = Path::new(value);
@@ -1171,7 +1173,7 @@ fn settable_path(key: &str, value: &str) -> Result<PathBuf, ApiError> {
             .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
     if !plain {
         return Err(ApiError::invalid(format!(
-            "{key} must be an absolute path without `.` or `..`"
+            "{key} must be an absolute path without `..`"
         )));
     }
     Ok(std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))

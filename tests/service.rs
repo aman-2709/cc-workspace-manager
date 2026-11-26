@@ -523,6 +523,20 @@ fn purge_removes_exactly_ccwms_directories_when_they_live_inside_the_home_folder
     );
 }
 
+/// A daemon a test started itself, killed if the test fails before it is stopped (v0.1.1
+/// review I7: a failed run left one running for 14 minutes on a deleted synthetic home, holding
+/// an inotify instance, which this host has few of).
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 /// v0.1.0 review, test-coverage gap 4: `--purge` refuses while a daemon still holds the
 /// instance lock (one started outside systemd, which `disable --now` cannot stop): nothing is
 /// deleted, the question is not even asked, and the daemon keeps running on its data. Control:
@@ -535,7 +549,8 @@ fn purge_is_refused_while_a_daemon_outside_systemd_holds_the_lock() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut daemon = c.spawn().unwrap();
+    let mut guard = KillOnDrop(c.spawn().unwrap());
+    let daemon = &mut guard.0;
     wait_until("the daemon", 15, || w.daemon_pid().is_some());
     wait_until("a finished scan", 30, || {
         w.socket_call("discovery.status")["scans_finished"].as_u64() >= Some(1)
