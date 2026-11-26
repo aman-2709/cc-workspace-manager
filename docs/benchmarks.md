@@ -108,12 +108,49 @@ that every file was parsed to its last byte: the checkpoint offset equals the fi
 not partial, and the end-of-file title was stored. With a cold page cache, reading 500 MiB from disk would
 add the storage's read time. That was not measured.
 
+### Ignore rules at their limits
+
+Measured on 2026-11-26 with `ccwm 0.1.1` (`scripts/bench.py --only ignore`), on the same host. This is not
+normal use: it is the most that ccwm's limits on ignore files allow (256 KiB per file, 5,000 rules per
+project, 20,000 rules for all projects), with rules that all need a regular expression — the expensive
+kind; ordinary rules such as `target/` or `*.log` cost almost nothing. Six projects, each with a `.git`
+and a `.gitignore` of 5,000 rules of the shape `*1x7?b[c-d]*.x`, so four projects fill the limit across
+projects and the files of two are skipped. Two builds: `target/release` (glibc) and the static
+`x86_64-unknown-linux-musl` binary that releases ship.
+
+| | glibc build | musl binary (release) |
+|---|---|---|
+| ignore files skipped / rules kept | 2 / 20,000 | 2 / 20,000 |
+| first scan finished after start (the rules are compiled in it) | 8.0 s | 7.4 s |
+| CPU until quiet | 7.7 s | 7.3 s |
+| RSS with every project watched (peak) | **343.5 MiB** (343.5 MiB) | **391.3 MiB** (394.4 MiB) |
+| every project polled (`watch.budget = 1`): two more scans, each | 6.5 s, 6.6 s | 5.6 s, 5.7 s |
+| RSS after those scans | **1,001.9 MiB** | 384.7 MiB |
+| peak RSS | 1,001.9 MiB | **754.8 MiB** |
+
+That is 17–20 KiB per rule kept. A polled project is walked again at every scan, and its new rules are
+built before the old ones are dropped: twice the memory for a moment. The musl binary gives it back (it
+peaked at 755–775 MiB and returned to 385–399 MiB). **The glibc build does not**: in a longer run of the
+same content it held 672, 1,002, 1,332 and 1,661 MiB after scans 1 to 4, then stayed there for two more
+(the musl binary: 395–399 MiB after each of six scans, peak 775 MiB). With a smaller set (6 projects of 500
+such rules, about 60 MiB kept) the glibc build reached 633 MiB after 30 scans and stayed there for ten more;
+the musl binary went from 63 MiB to 82 MiB over 40 scans and had not levelled off. Not measured: a pattern
+built to make the matcher use as much memory as it can, and scans beyond those counts.
+
+What follows from it: the limits bound what ccwm *keeps*; while projects are polled and hold expensive
+rules, the process can use several times that. The systemd unit therefore carries a hard limit,
+`MemoryMax=2G` with `MemorySwapMax=0` ([service.md](service.md#the-unit)): above everything measured with the
+release binary, and far above normal use (17–26 MiB in the tables above). A short re-run of the 500-project
+scenario with 0.1.1 gave 21.6 MiB after start and a 25.8 MiB peak in the 10,000-file burst (0.1.0: 21.4 and
+25.0).
+
 ## Reproducing
 
 ```bash
 cargo build --release --bins
 scripts/bench.py --bin target/release                        # ~15 minutes (10 of them idle)
 scripts/bench.py --bin target/release --idle 0 --only burst,exhaustion
+scripts/bench.py --bin target/release --only ignore          # the ignore-rule limits, under a minute
 ```
 
 The script prints one JSON document (host, method, every measurement). Keep raw results out of the

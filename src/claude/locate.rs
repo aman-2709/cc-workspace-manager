@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 /// The sessions directory inside Claude Code's config directory.
 pub const PROJECTS_DIR: &str = "projects";
 /// Every listing stops after this many session files (far above the 819 seen on the
-/// maintainer's machine); the rest is counted as skipped.
+/// maintainer's machine); the rest is counted as skipped and the listing is marked
+/// [`Listing::truncated`].
 pub const MAX_FILES: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,10 +30,15 @@ pub struct Listing {
     /// The `<encoded-dir>` directories that were listed completely (watch targets; files that
     /// disappeared from them are gone).
     pub dirs: Vec<PathBuf>,
-    /// Entries that are not top-level session files (subagent directories, memory, aliases…).
+    /// Entries that are not top-level session files (subagent directories, memory, aliases…),
+    /// and session files beyond [`MAX_FILES`].
     pub skipped: u64,
     /// Directories that could not be read.
     pub errors: u64,
+    /// The listing stopped at [`MAX_FILES`]: session files exist that are not in `files`. A file
+    /// that is absent from such a listing is **not** known to be gone (v0.1.0 review I8: the
+    /// sessions the limit dropped used to be deleted from the index as gone).
+    pub truncated: bool,
 }
 
 /// `<name>.jsonl` with a lower-case UUID stem. Claude Code writes lower case; other spellings are
@@ -67,8 +73,9 @@ pub fn dedupe(files: &mut Vec<SessionFile>, indexed: impl Fn(&str) -> Option<Pat
     (before - files.len()) as u64
 }
 
-/// List one `<encoded-dir>` (opened from `parent` by name, or as a root).
-fn list_dir(dir: &mut DirHandle, path: &Path, out: &mut Listing) {
+/// List one `<encoded-dir>` (opened from `parent` by name, or as a root); at most `max_files`
+/// session files in the whole listing.
+fn list_dir(dir: &mut DirHandle, path: &Path, out: &mut Listing, max_files: usize) {
     let (entries, errors) = dir.entries();
     if !errors.is_empty() {
         out.errors += 1;
@@ -76,10 +83,14 @@ fn list_dir(dir: &mut DirHandle, path: &Path, out: &mut Listing) {
     }
     for e in entries {
         match (e.kind, session_id_of(&e.name)) {
-            (Kind::File, Some(id)) if out.files.len() < MAX_FILES => out.files.push(SessionFile {
+            (Kind::File, Some(id)) if out.files.len() < max_files => out.files.push(SessionFile {
                 id,
                 path: path.join(&e.name),
             }),
+            (Kind::File, Some(_)) => {
+                out.truncated = true;
+                out.skipped += 1;
+            }
             _ => out.skipped += 1,
         }
     }
@@ -89,6 +100,11 @@ fn list_dir(dir: &mut DirHandle, path: &Path, out: &mut Listing) {
 /// List every session under `projects` (`<config dir>/projects`, canonical). `None` if the
 /// directory does not exist or cannot be opened.
 pub fn list_all(projects: &Path) -> Option<Listing> {
+    list_all_capped(projects, MAX_FILES)
+}
+
+/// [`list_all`] with another limit than [`MAX_FILES`] (tests: the real limit is far out of reach).
+pub fn list_all_capped(projects: &Path, max_files: usize) -> Option<Listing> {
     let mut root = DirHandle::open_root(projects).ok()?;
     let mut out = Listing::default();
     let (entries, errors) = root.entries();
@@ -103,7 +119,7 @@ pub fn list_all(projects: &Path) -> Option<Listing> {
             continue;
         };
         match root.open_child(&e.name, id) {
-            Ok(mut dir) => list_dir(&mut dir, &projects.join(name), &mut out),
+            Ok(mut dir) => list_dir(&mut dir, &projects.join(name), &mut out, max_files),
             Err(_) => out.errors += 1,
         }
     }
@@ -119,7 +135,7 @@ pub fn list_some(projects: &Path, dirs: &[PathBuf]) -> Listing {
             continue;
         }
         if let Ok(mut h) = DirHandle::open_root(d) {
-            list_dir(&mut h, d, &mut out);
+            list_dir(&mut h, d, &mut out, MAX_FILES);
         }
     }
     out
@@ -179,6 +195,38 @@ mod tests {
         );
         assert_eq!(some.files.len(), 1);
         assert_eq!(some.dirs, [enc]);
+    }
+
+    /// v0.1.0 review I8: a listing that stopped at the file limit says so, and counts what it
+    /// left out; one that fits does not.
+    #[test]
+    fn a_listing_cut_off_at_the_file_limit_is_marked_truncated() {
+        let t = tempfile::tempdir().unwrap();
+        let projects = fs::canonicalize(t.path()).unwrap().join(PROJECTS_DIR);
+        for (dir, id) in [
+            ("-a", A),
+            ("-b", B),
+            ("-b", "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+        ] {
+            fs::create_dir_all(projects.join(dir)).unwrap();
+            fs::write(projects.join(dir).join(format!("{id}.jsonl")), "{}\n").unwrap();
+        }
+        fs::write(projects.join("-b/notes.txt"), "x").unwrap();
+        let all = list_all_capped(&projects, 3).unwrap();
+        assert_eq!((all.files.len(), all.skipped, all.truncated), (3, 1, false));
+        let cut = list_all_capped(&projects, 2).unwrap();
+        assert_eq!((cut.files.len(), cut.skipped, cut.truncated), (2, 2, true));
+        assert_eq!(
+            cut.dirs.len(),
+            2,
+            "both directories are still watch targets"
+        );
+        let none = list_all_capped(&projects, 0).unwrap();
+        assert_eq!(
+            (none.files.len(), none.skipped, none.truncated),
+            (0, 4, true)
+        );
+        assert!(!list_all(&projects).unwrap().truncated);
     }
 
     #[test]

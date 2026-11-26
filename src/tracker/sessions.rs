@@ -64,26 +64,13 @@ impl Tracker {
             .map_err(|e| crate::error::Error::new(format!("session scan failed: {e}")))?
         };
 
-        // Files that are gone: in a directory that was listed completely, or in a directory that
-        // no longer exists (full ingest), or everything when `projects/` itself is gone.
-        let gone: Vec<String> = match &scanned.listing {
-            Some(l) => {
-                let present: HashSet<&Path> = l.files.iter().map(|f| f.path.as_path()).collect();
-                let listed: HashSet<&Path> = l.dirs.iter().map(PathBuf::as_path).collect();
-                states
-                    .values()
-                    .filter(|s| {
-                        let p = Path::new(&s.file_path);
-                        let parent = p.parent().unwrap_or(p);
-                        !present.contains(p)
-                            && (listed.contains(parent) || (full && !parent.exists()))
-                    })
-                    .map(|s| s.file_path.clone())
-                    .collect()
-            }
-            None if scanned.absent => states.values().map(|s| s.file_path.clone()).collect(),
-            None => Vec::new(),
-        };
+        let gone = gone_files(scanned.listing.as_ref(), scanned.absent, full, &states);
+        if scanned.listing.as_ref().is_some_and(|l| l.truncated) {
+            tracing::warn!(
+                limit = locate::MAX_FILES,
+                "more session files than one listing holds: the rest is not indexed, and no session is dropped from the index as gone"
+            );
+        }
         let mut affected = Vec::new();
         if !gone.is_empty() {
             affected.extend(self.writer.delete_sessions(gone).await?);
@@ -290,6 +277,38 @@ impl Tracker {
     }
 }
 
+/// The indexed session files (`states`) that are gone: absent from a directory that was listed,
+/// or in a directory that no longer exists (`full` ingest), or everything when `projects/` itself
+/// is gone (`absent`). Nothing when the listing is unknown (`None`, not `absent`) or was cut off
+/// at the file limit: a file missing from an incomplete listing may still exist (v0.1.0 review
+/// I8).
+fn gone_files(
+    listing: Option<&Listing>,
+    absent: bool,
+    full: bool,
+    states: &HashMap<String, SessionState>,
+) -> Vec<String> {
+    let all = || states.values().map(|s| s.file_path.clone()).collect();
+    match listing {
+        Some(l) if l.truncated => Vec::new(),
+        Some(l) => {
+            let present: HashSet<&Path> = l.files.iter().map(|f| f.path.as_path()).collect();
+            let listed: HashSet<&Path> = l.dirs.iter().map(PathBuf::as_path).collect();
+            states
+                .values()
+                .filter(|s| {
+                    let p = Path::new(&s.file_path);
+                    let parent = p.parent().unwrap_or(p);
+                    !present.contains(p) && (listed.contains(parent) || (full && !parent.exists()))
+                })
+                .map(|s| s.file_path.clone())
+                .collect()
+        }
+        None if absent => all(),
+        None => Vec::new(),
+    }
+}
+
 /// List and parse (blocking). A session that is not assigned to a project stops being read
 /// once its first cwd shows it never can be ([`Context::never_a_project`]).
 fn scan(
@@ -345,5 +364,94 @@ fn scan(
         absent,
         parsed,
         duplicates,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    const IDS: [&str; 3] = [
+        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    ];
+
+    fn indexed(files: &[PathBuf]) -> HashMap<String, SessionState> {
+        files
+            .iter()
+            .zip(IDS)
+            .map(|(path, id)| {
+                let state = SessionState {
+                    id: id.to_string(),
+                    file_path: path.to_string_lossy().into_owned(),
+                    project_id: None,
+                    unassigned: None,
+                    aggregate: parse::Aggregate::default(),
+                    checkpoint: parse::Checkpoint::default(),
+                };
+                (id.to_string(), state)
+            })
+            .collect()
+    }
+
+    /// v0.1.0 review I8: the sessions a listing left out at its file limit are still there; they
+    /// must not be dropped from the index as gone. Controls: a complete listing does find a
+    /// deleted file, a vanished directory and a vanished `projects/`.
+    #[test]
+    fn sessions_missing_from_a_listing_cut_off_at_the_limit_are_not_gone() {
+        let t = tempfile::tempdir().unwrap();
+        let projects = fs::canonicalize(t.path()).unwrap().join(PROJECTS_DIR);
+        let dir = projects.join("-synthetic-dev-x");
+        fs::create_dir_all(&dir).unwrap();
+        let files: Vec<PathBuf> = IDS
+            .iter()
+            .map(|id| dir.join(format!("{id}.jsonl")))
+            .collect();
+        for f in &files {
+            fs::write(f, "{}\n").unwrap();
+        }
+        let states = indexed(&files);
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        let path = |i: usize| files[i].to_string_lossy().into_owned();
+
+        // Every file exists; the listing holds only two of the three.
+        let cut = locate::list_all_capped(&projects, 2).unwrap();
+        assert!(cut.truncated && cut.files.len() == 2);
+        for full in [true, false] {
+            assert!(gone_files(Some(&cut), false, full, &states).is_empty());
+        }
+        // Control: the same listing without the mark would drop the third session.
+        let unmarked = Listing {
+            truncated: false,
+            ..locate::list_all_capped(&projects, 2).unwrap()
+        };
+        assert_eq!(gone_files(Some(&unmarked), false, true, &states).len(), 1);
+
+        // A complete listing: nothing is gone until a file is deleted.
+        let complete = locate::list_all(&projects).unwrap();
+        assert!(gone_files(Some(&complete), false, true, &states).is_empty());
+        fs::remove_file(&files[1]).unwrap();
+        let complete = locate::list_all(&projects).unwrap();
+        assert_eq!(gone_files(Some(&complete), false, true, &states), [path(1)]);
+        // …but not when that listing is cut off: the deleted file may be one it left out.
+        let cut = locate::list_all_capped(&projects, 1).unwrap();
+        assert!(gone_files(Some(&cut), false, true, &states).is_empty());
+
+        // The directory vanished: gone in a full ingest only (a partial one did not look there).
+        fs::remove_dir_all(&dir).unwrap();
+        let empty = locate::list_all(&projects).unwrap();
+        assert_eq!(
+            sorted(gone_files(Some(&empty), false, true, &states)),
+            sorted(vec![path(0), path(1), path(2)])
+        );
+        assert!(gone_files(Some(&empty), false, false, &states).is_empty());
+        // `projects/` itself: everything when it is absent, nothing when it is only unreadable.
+        assert_eq!(gone_files(None, true, true, &states).len(), 3);
+        assert!(gone_files(None, false, true, &states).is_empty());
     }
 }

@@ -171,12 +171,11 @@ pub fn verify(program: &PathBuf) -> CliCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
+    /// A stand-in `claude`, run right after it is written (hence `write_executable`).
     fn fake(dir: &std::path::Path, body: &str) {
-        let p = dir.join("claude");
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!("#!/bin/sh\n{body}\n");
+        crate::synth::write_executable(&dir.join("claude"), &script).unwrap();
     }
 
     #[test]

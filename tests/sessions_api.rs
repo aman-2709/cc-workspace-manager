@@ -512,14 +512,89 @@ async fn privacy_mode_removes_paths_names_urls_titles_prompts_and_commands_from_
     batch.add(cc_workspace_manager::events::Change::Status);
     e.service.publish(batch).await.unwrap();
     let mut seen = 0;
+    let mut full_live = String::new();
     while let Ok(msg) = rx.try_recv() {
         let private = msg.for_client(true);
         for c in canaries {
             assert!(!private.contains(c), "a live update leaks {c}: {private}");
         }
+        full_live.push_str(msg.for_client(false));
         seen += 1;
     }
     assert!(seen >= 2, "project and discovery events were published");
+    // Control: a client without privacy mode does receive what a project event carries (the
+    // path and the session title), so the check above can fail.
+    for c in ["/home/u/CANARYNAME-proj", "CANARY TITLE"] {
+        assert!(full_live.contains(c), "{c} missing from the live updates");
+    }
+}
+
+/// v0.1.0 review, test-coverage gap 5: the paths of the status and Settings payloads that no
+/// fixture held, so that stripping them could not fail a test: the discovery roots, the
+/// unreadable folders, the development roots and the configuration file's path. Each is seeded
+/// with a canary, must be absent in privacy mode (REST and live updates) and present without it.
+#[tokio::test]
+async fn privacy_mode_hides_the_discovery_and_configuration_paths() {
+    use cc_workspace_manager::discovery::status::{RootStatus, Unreadable};
+    let e = env().await;
+    let token = e.login().await;
+    e.service.discovery.update(|d| {
+        d.roots = vec![RootStatus {
+            path: "/srv/CANARY-ROOT-STATUS".into(),
+            state: "ok",
+        }];
+        d.unreadable = vec![Unreadable {
+            path: "~/CANARY-UNREADABLE".into(),
+            reason: "permission",
+        }];
+        d.scope = "dev_roots";
+        d.dev_roots = vec!["~/CANARY-DEV-ROOT".into()];
+    });
+    let discovery = ["CANARY-ROOT-STATUS", "CANARY-UNREADABLE", "CANARY-DEV-ROOT"];
+    let get = |path: &'static str| {
+        let (e, token) = (&e, token.clone());
+        async move {
+            let (s, v) = json(e.get(path, Some(&token)).await).await;
+            assert_eq!(s, 200, "{path}: {v}");
+            v
+        }
+    };
+    let private = get("/api/v1/discovery/status?privacy=1").await;
+    let full = get("/api/v1/discovery/status").await.to_string();
+    for c in discovery {
+        assert!(!private.to_string().contains(c), "leaks {c}: {private}");
+        assert!(full.contains(c), "{c} missing without privacy mode");
+    }
+    // What is not a path stays: how many, and why.
+    assert_eq!(private["roots"], serde_json::json!([{"state": "ok"}]));
+    assert_eq!(
+        private["unreadable"],
+        serde_json::json!([{"reason": "permission"}])
+    );
+    assert_eq!(private["dev_roots"], serde_json::json!([]));
+    assert_eq!(private["scope"], "dev_roots");
+
+    let private = get("/api/v1/settings?privacy=1").await;
+    assert!(!private.to_string().contains("CANARY"), "{private}");
+    assert!(private["effective"].get("config_path").is_none());
+    let full = get("/api/v1/settings").await;
+    let shown = full["effective"]["config_path"].as_str().unwrap();
+    assert!(shown.ends_with("/CANARY-CONFIG-DIR/config.toml"), "{shown}");
+
+    // The same status as a live update.
+    let mut rx = e.service.hub.subscribe();
+    let mut batch = cc_workspace_manager::events::Batch::default();
+    batch.add(cc_workspace_manager::events::Change::Status);
+    e.service.publish(batch).await.unwrap();
+    let (mut private_live, mut full_live) = (String::new(), String::new());
+    while let Ok(msg) = rx.try_recv() {
+        private_live.push_str(msg.for_client(true));
+        full_live.push_str(msg.for_client(false));
+    }
+    for c in discovery {
+        assert!(!private_live.contains(c), "a live update leaks {c}");
+        assert!(full_live.contains(c), "{c} missing from the live updates");
+    }
 }
 
 #[tokio::test]
@@ -1066,6 +1141,88 @@ async fn settings_puts_accept_only_the_settings_page_keys_and_safe_values() {
     assert_eq!(
         v["restart_required"],
         serde_json::json!(["server.port", "sessions.dir"])
+    );
+}
+
+/// v0.1.0 review I6: the browser API refuses a discovery root that is `/` or contains the home
+/// folder (a read rule over everything at the next start), and the home folder itself as the
+/// session directory (a hard boundary over the default root). Symlinks are resolved first. The
+/// home folder as a root, and roots elsewhere, stay settable (the controls).
+#[tokio::test]
+async fn settings_puts_refuse_broad_roots_and_home_as_the_session_directory() {
+    let e = env().await;
+    let token = e.login().await;
+    let (s, _) = put_settings(&e, &token, "", r#"{"ui":{"theme":"light"}}"#).await;
+    assert_eq!(s, 200);
+    let before = std::fs::read(&e.config_path).unwrap();
+    // A link whose target is `/`: judged by where it leads, not by its name.
+    let t = common::tempdir();
+    let link = t.path().join("looks-harmless");
+    std::os::unix::fs::symlink("/", &link).unwrap();
+    let link = link.to_str().unwrap();
+    let roots = |list: &[&str]| serde_json::json!({"discovery": {"roots": list}}).to_string();
+    let session_dir = |dir: &str| serde_json::json!({"sessions": {"dir": dir}}).to_string();
+    for (bad, message) in [
+        (roots(&["/"]), "discovery.roots must not contain /"),
+        (roots(&["/home"]), "discovery.roots must not contain /"),
+        (
+            roots(&["/home/u/dev", "/"]),
+            "discovery.roots must not contain /",
+        ),
+        (roots(&[link]), "discovery.roots must not contain /"),
+        (
+            roots(&["/home/u/../.."]),
+            "discovery.roots must be an absolute path",
+        ),
+        (
+            roots(&["relative"]),
+            "discovery.roots must be an absolute path",
+        ),
+        (
+            session_dir("/home/u"),
+            "sessions.dir must not be /, your home folder",
+        ),
+        (
+            session_dir("/home"),
+            "sessions.dir must not be /, your home folder",
+        ),
+        (
+            session_dir(link),
+            "sessions.dir must not be /, your home folder",
+        ),
+    ] {
+        let (s, v) = put_settings(&e, &token, "", &bad).await;
+        assert_eq!((s, code(&v)), (400, "invalid_argument"), "{bad}: {v}");
+        let said = v["error"]["message"].as_str().unwrap();
+        assert!(said.starts_with(message), "{bad}: {said}");
+    }
+    assert_eq!(
+        std::fs::read(&e.config_path).unwrap(),
+        before,
+        "nothing was saved"
+    );
+
+    for good in [
+        roots(&["/home/u"]),
+        roots(&["/home/u/dev", "/srv/code"]),
+        roots(&["/home/u/./dev"]), // the same path as /home/u/dev
+        roots(&[]),
+        session_dir("/home/u/.claude-other"),
+    ] {
+        let (s, v) = put_settings(&e, &token, "", &good).await;
+        assert_eq!(s, 200, "{good}: {v}");
+    }
+    let saved = cc_workspace_manager::config::Config::parse(
+        &std::fs::read_to_string(&e.config_path).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        saved.discovery.roots.is_empty(),
+        "the last root list was saved"
+    );
+    assert_eq!(
+        saved.sessions.dir.as_deref(),
+        Some(Path::new("/home/u/.claude-other"))
     );
 }
 

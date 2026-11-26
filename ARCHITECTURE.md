@@ -240,7 +240,9 @@ NULL`, resolved again at the next ingest); `CachePrompt` is a no-op unless `Writ
 `AtomicBool` the writer thread reads **inside the transaction** (the service sets it from the config at start,
 clears it before `ClearPromptCache`, sets it when the setting turns on); after a batch that contains
 `ClearPromptCache` or `ClearSessionIndex` commits, the writer runs `PRAGMA wal_checkpoint(TRUNCATE)` before it
-replies. `session_counts` adds the top 10 `(reason, first_cwd, n)` of unassigned sessions.
+replies. v0.1.1: the pragma's result row is read (`busy = 1` means a reader blocked it; that is not an
+SQL error); a truncation that did not happen is logged and stays owed, and the writer tries it again
+after every later batch until it succeeds (`truncate_wal`). `session_counts` adds the top 10 `(reason, first_cwd, n)` of unassigned sessions.
 
 ### Parser version (M4)
 `claude::parse::PARSER_VERSION` (2 = M3.1 rules; an M3 database has no entry) is compared with
@@ -327,7 +329,12 @@ the project's ignore rules; `.git` is retried, never walked), their newest file 
 `.git/info/exclude` layers when the project is in a Git work tree below home — since M2.1 also the
 `info/exclude` and `.gitignore` files from a work-tree root *above* the project root, layers ranked by
 depth — ≤100 000 entries, future mtimes
-clamped to now) → newest file = *inferred* activity → Git inspection → for a newly inserted project while
+clamped to now; ignore files within the limits of REQUIREMENTS.md §5.2: per file and per project in
+`GitIgnore::load`, across projects through `tree::IgnoreBudget`, one instance shared by the tracker's walks
+and the monitor: a full walk `reserve`s what the project may keep — the limit minus the other projects'
+rules, at most the project limit — and `settle`s for what it kept, so two walks at once cannot both take
+the last room; a subtree walk only asks for the `room`; the tracker drops the entries of projects that are
+no longer monitored before each batch of walks) → newest file = *inferred* activity → Git inspection → for a newly inserted project while
 missing projects exist: **move matching** (exactly one missing project with the same HEAD commit and the same
 sanitized remote, or — without a commit — the same marker hash and no Git head; ambiguity ⇒ no match) ⇒ the old id
 moves to the new path and the new row is deleted → Git cache stored → `Cmd::Add` to the monitor.
@@ -432,7 +439,7 @@ Errors: `{"error":{"code":"…","message":"…"}}` — codes `invalid_argument 4
 ### Browser endpoints (M1)
 | | | |
 |---|---|---|
-| `GET /health` | Public | `{"status":"ok","version":"0.1.0","commit":"<12 hex>[-dirty]"\|"unknown"}` — never proof of identity |
+| `GET /health` | Public | `{"status":"ok","version":"0.1.1","commit":"<12 hex>[-dirty]"\|"unknown"}` — never proof of identity |
 | `POST /auth/exchange` | Public + Origin | `{"bootstrap_token"}` → `{"session_token","expires_at","rotate_after"}`; bad/used/expired ⇒ identical 401 |
 | `POST /auth/rotate` | Bearer (authenticated by the service; the only route an overdue token may use) | → new `session_token` (+ times); the old token stays valid 60 s |
 | `POST /auth/logout` | Session | revokes the session → 204 |
@@ -465,6 +472,9 @@ unhardened_status_allowed}`, `queues{git_in_flight,websocket_clients}`.
 `project` (`{"project":…}`), `project_removed` (`{"id"}`), `stats`, `discovery`, `monitoring`, `resync` (a lagging
 client, or lost changes: fetch a fresh snapshot). Revalidation on revocation (logout, revoke-all, hourly purge) and
 every 10 s ⇒ 4401. The UI reconnects with back-off 1 s…30 s and refetches after every `ready`.
+v0.1.1: the session's `select!` is `biased` — revocation, the periodic check, client messages, then events —
+so nothing is forwarded once a revocation is signalled; every send (events, `ready`, the close frame) has
+`ws::SEND_TIMEOUT` (5 s), after which the session ends.
 M3: the auth message may carry `"privacy": true`; later `{"type":"privacy","on":bool}` switches the subscription.
 The publisher builds each `project` and `discovery` event twice (full and privacy variant, `events::Msg`); each
 client receives the variant of its subscription.
@@ -512,7 +522,7 @@ owned by the user, verified; socket `0600`; path must be ≤ 107 bytes or startu
 3. One request line (≤ 4 KiB, 2 s read timeout) → one response line → close.
 
 ```
-{"op":"ping"}                → {"ok":{"version":"0.1.0"}}
+{"op":"ping"}                → {"ok":{"version":"0.1.1"}}
 {"op":"auth.bootstrap"}      → {"ok":{"bootstrap_token":"…","expires_in":30,"port":8765}}
 {"op":"auth.revoke_all"}     → {"ok":{"revoked":3}}
 {"op":"service.status"}      → {"ok":{…same body as GET /service/status…}}
@@ -669,7 +679,17 @@ With `ProtectSystem=strict` + `ProtectHome=read-only` (+ `ReadWritePaths`) and, 
 systemd 255 runs the user service in a user namespace: `/tmp` (and `/`, `/home`) appear owned by uid 65534, and
 ccwm refuses to start ("/tmp is owned by uid 65534, not by you or root") — correct behaviour of the §11.3 trust
 checks, so these directives are not used. `systemd-analyze --user verify` accepts the generated unit (its only
-complaint: `%h/.local/bin/ccwm` absent in the real home). Earlier (M1) acceptance list:
+complaint: `%h/.local/bin/ccwm` absent in the real home). **v0.1.1, `MemoryMax=2G` + `MemorySwapMax=0`**
+(transient user units, Ubuntu 24.04, systemd 255, the user manager has the `cpu memory pids` controllers):
+(1) a plain process under `MemoryMax=64M` allocating 300 MiB **survived** (71 MiB resident, 246 MiB in swap;
+`memory.swap.max = max`); with `MemorySwapMax=0` added it ended with result `oom-kill`. Hence both directives.
+(2) The static release binary with every directive of the unit: `memory.max = 2147483648`,
+`memory.swap.max = 0` in the unit's cgroup, `fully_enforced`, seccomp `socket_denied`, the (fake) `claude`
+check verified, `ccwm status` works, `systemctl --user stop` ⇒ clean shutdown in 0.01 s. (3) The same binary
+with `MemoryMax=200M` and four projects of 5,000 expensive ignore rules each (about 390 MiB): `oom-kill`
+about 2 s after each start, `auto-restart`, restarted after 5 s, again and again (`NRestarts` 0, 1, 2 within
+22 s) until stopped. (4) The same content under `MemoryMax=2G`: runs, `memory.current` 384 MiB, peak 389 MiB,
+no swap, no restart. Earlier (M1) acceptance list:
 Accepted in a transient user unit: `NoNewPrivileges`, `Nice`, `IOSchedulingClass=idle`, `UMask`, `PrivateTmp`,
 `ProtectSystem=strict`, `ProtectHome=read-only`, `ProtectKernelTunables`, `RestrictNamespaces`,
 `RestrictAddressFamilies`, `MemoryDenyWriteExecute`, `LockPersonality`, `SystemCallArchitectures`,
@@ -835,6 +855,60 @@ over from M4. Host as in §1 (Linux 7.0, Landlock ABI 8, git 2.43.0, rustc 1.94.
   process spawns to that binary); scripts in `tests/git.rs` are now written by a child shell
   (`common::write_executable`): 80 consecutive runs of the binary passed.
 
+## 13i. v0.1.1 verification notes (what was actually run, 2026-11-26)
+
+A maintenance release: the items of ROADMAP.md "v0.1.1". Host as in §1 (Linux 7.0, Landlock ABI 8, git 2.43.0,
+rustc 1.94.0, systemd 255).
+
+- **Session titles (UI):** `tests/ui/app.test.js` (`sessionParts`, `sessionSummary`). In Chrome against a
+  synthetic daemon with a session titled "Resuming the previous session": cards and table rows show the title
+  in quotation marks and italics (`font-style: italic` computed), the line's tooltip starts with
+  "Session title:", the same words are there for screen readers (`.sr-only`), and privacy mode shows no
+  quotation. Not checked in Firefox.
+- **Limit on ignore rules across projects:** unit tests of `IgnoreBudget` (arithmetic, the project limit,
+  eight walks reserving at once never exceed the limit) and of a walk with less room than the project limit;
+  `tests/tracker.rs` with the real tracker and monitor and a limit of six rules: one of two four-rule
+  projects is skipped and counted, gets its rules when the other is ignored, and the other is then the one
+  without room; `tests/process.rs` with the real daemon and the real limits: six projects of 5,000 rules,
+  two files skipped and reported, every project listed.
+- **Memory, measured** (`scripts/bench.py --only ignore`, release builds, docs/benchmarks.md): 20,000 rules
+  that need a regular expression cost 344 MiB (glibc build) / 395 MiB (the static musl release binary) once
+  kept. With every project polled (a watch budget of 1), each scan walks every project again: the musl binary
+  peaks at 775 MiB and is back at 395 MiB after the scan; **the glibc build keeps what it freed** — 672,
+  1,002, 1,332, 1,661 MiB after scans 1 to 4, then level for two more; with 3,000 rules (60 MiB kept) it
+  reached 633 MiB after 30 scans and stayed there for ten more. The musl binary crept from 63 to 82 MiB over
+  40 scans with 3,000 rules, not yet level. The limit therefore bounds what is kept, not the process in
+  polled mode: that is `MemoryMax=`'s job. Not built: reusing the compiled rules of an unchanged ignore file
+  across walks, which would remove the churn (a proposal, §14).
+- **`MemoryMax=`:** see §13.
+- **I3:** `tests/http.rs`: a sign-out and an event made ready at the same instant (one runtime thread, no
+  await between them), 16 rounds: the close frame 4401 comes first every time; a client that stops reading
+  while 24 MiB are published and is then signed out: its session ends within the send timeout. With the old
+  loop (unordered `select!`, no timeout) both fail: an event arrives first in round 1, and the stalled
+  session never ends (checked by putting the old code back once).
+- **I7:** unit test in `db/writer.rs`: a second connection holds a read transaction, the checkpoint returns
+  `busy = 1`, `truncate_wal` reports failure, the truncation stays owed across batches and happens (WAL 0
+  bytes) once the reader commits.
+- **I8:** unit tests: a listing cut off at a (lowered) limit is marked; `gone_files` returns nothing for it,
+  and the same listing without the mark would drop a session (control).
+- **I6:** `tests/sessions_api.rs`: `/`, `/home`, a list containing `/`, a symlink to `/` and `..` paths are
+  refused as roots, home and `/home` as the session directory; home as a root and roots elsewhere are saved.
+- **Test-coverage gaps 4–8:** purge with ccwm's directories inside home next to other applications' data;
+  purge refused while a daemon outside systemd holds the lock (and done once it stopped); canaries for the
+  discovery roots, unreadable folders, development roots, the configuration path and `git.program`, with a
+  control without privacy mode, also for live updates; every directive of the unit pinned as a literal;
+  skips that fail in CI; `same_file_system` in both walks across the `/dev` → `/dev/shm` boundary (each
+  device check removed once: the test fails); the swap race asserts that a swap raced; the child-environment
+  test sets `XDG_RUNTIME_DIR` itself; a secret across the truncation point; `package-release.sh`,
+  `sha256sum -c`, reproducibility, the archive's file list and modes, and `install.sh` run from the extracted
+  archive without an argument (with a stand-in binary; the real musl build is not part of the test).
+- **Script writes:** `synth::write_executable` (a child shell writes the file) is now the only way a test
+  writes a script it runs at once; `tests/common` re-exports it.
+- **Checks:** `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+  `CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_LANDLOCK_ABI=8 CCWM_REQUIRE_INOTIFY=1 cargo test`, `cargo deny check`,
+  gitleaks, actionlint on the workflows, shellcheck on the scripts. **CI has not run on this commit** (nothing
+  pushed).
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -933,6 +1007,18 @@ documented rather than checked) were not part of this approval. **Verified by th
 the `socket`/`socketpair` denial active, `ccwm doctor` reports the `claude` check ok (Claude Code 2.1.332, `--resume`
 supported, checked by the daemon in its sandbox): the real binary's `--version` and `--help` succeed under the filter.
 **v0.1.0 is released** (tag `v0.1.0` at `975bf10`).
+
+**v0.1.1 (2026-11-26; built on the maintainer's go-ahead, the choices below are for review).** Chosen during the
+work: the limit across projects at **20,000 rules** (four full projects; 344–395 MiB kept in the worst case),
+first come, first served; **`MemoryMax=2G`**, sized above the worst measured case of the release binary (775 MiB)
+with room for Git children, and **`MemorySwapMax=0`**, which was not asked for but without which the limit does
+not limit on a host with swap (§13); the WebSocket send timeout of **5 s**; refusing home as the session
+directory and `..` in root paths as well as broad roots; a WAL truncation that failed is retried after every
+later batch (not only logged); `CCWM_REQUIRE_LANDLOCK_ABI` in CI. **Found, not fixed (outside the list):** in
+polled mode every scan compiles every project's ignore rules again, and a glibc build does not return the freed
+memory (§13i) — proposal: keep the compiled rules of an ignore file whose content did not change (compare a hash
+of the file), which removes the churn for both allocators and the repeated CPU cost. The README item of the
+request was an unfilled placeholder; only version numbers and the status line were changed there.
 
 Open:
 - **O2:** a `claude` binary outside the sandbox read set cannot be executed: reported as `failed` (the usual

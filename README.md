@@ -6,7 +6,7 @@ CC Workspace Manager is an **independent, unofficial** open-source project. Clau
 
 `ccwm` is a small local daemon with a browser dashboard. It finds the folders on your machine that are Claude Code projects: those your Claude Code sessions started in, and those containing a `CLAUDE.md`. It shows which ones you worked on recently, their Git state, and where you left off. It also gives you the command to resume the last session. It is a project-centric workspace manager, not a token or cost dashboard.
 
-> **Status: v0.1.0, pre-release.** Feature-complete for v0.1. Tested only on Linux x86_64 (Ubuntu 24.04, kernel 7.0, systemd 255, Git 2.43). See [CHANGELOG.md](CHANGELOG.md) for what has not been run yet.
+> **Status: v0.1.1.** Feature-complete for v0.1. Tested only on Linux x86_64 (Ubuntu 24.04, kernel 7.0, systemd 255, Git 2.43). See [CHANGELOG.md](CHANGELOG.md) for what has not been run yet.
 
 ![Card view (synthetic data)](docs/screenshots/cards.jpg)
 
@@ -34,8 +34,8 @@ Releases ship one static binary for **Linux x86_64** (`x86_64-unknown-linux-musl
 
 ```bash
 sha256sum -c SHA256SUMS                                   # the archive and SHA256SUMS from the release page
-tar -xzf ccwm-0.1.0-x86_64-unknown-linux-musl.tar.gz
-cd ccwm-0.1.0-x86_64-unknown-linux-musl
+tar -xzf ccwm-0.1.1-x86_64-unknown-linux-musl.tar.gz
+cd ccwm-0.1.1-x86_64-unknown-linux-musl
 scripts/install.sh      # ~/.local/bin/ccwm + a systemd user service that starts at login; no root
 ccwm open               # opens the dashboard, signed in
 ```

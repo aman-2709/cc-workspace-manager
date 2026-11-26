@@ -48,6 +48,8 @@ pub struct Settings {
     pub full_scan: bool,
     /// The session integration; `None` disables it (tests of the M2 machinery).
     pub sessions: Option<SessionSettings>,
+    /// The limit on ignore rules across projects; the monitor's settings hold the same one.
+    pub ignore_budget: Arc<tree::IgnoreBudget>,
 }
 
 #[derive(Clone)]
@@ -630,7 +632,18 @@ impl Tracker {
 
     fn walk_context(&self, tracked: &[Tracked]) -> WalkContext {
         let s = &self.settings.scan;
+        // Projects that are no longer monitored keep no rules: their part of the limit across
+        // projects is free again before anything is walked.
+        let monitored: HashSet<&Path> = tracked
+            .iter()
+            .filter(|t| !t.missing && !t.ignored)
+            .map(|t| Path::new(&t.path))
+            .collect();
+        self.settings
+            .ignore_budget
+            .retain(|root| monitored.contains(root));
         WalkContext {
+            budget: Arc::clone(&self.settings.ignore_budget),
             roots: self.root_exclusions(),
             others: tracked
                 .iter()
@@ -941,6 +954,7 @@ fn upsert_of(c: Candidate) -> ProjectUpsert {
 
 /// Everything a tree walk needs, owned so it can move to a blocking thread.
 struct WalkContext {
+    budget: Arc<tree::IgnoreBudget>,
     roots: Vec<(PathBuf, Exclusions)>,
     others: HashSet<PathBuf>,
     home: PathBuf,
@@ -972,6 +986,14 @@ impl WalkContext {
         let mut others = self.others.clone();
         others.remove(root);
         let repo = tree::git_worktree_root(root, discovery_root, &self.home, self.uid);
+        // A full walk replaces the project's rules: it reserves its share of the limit across
+        // projects and settles for what it kept. A subtree walk keeps nothing.
+        let full = start == root;
+        let max_patterns = if full {
+            self.budget.reserve(root)
+        } else {
+            self.budget.room(root)
+        };
         let opts = TreeOptions {
             exclusions: ex,
             other_projects: &others,
@@ -981,8 +1003,14 @@ impl WalkContext {
             repo_root: repo.as_deref(),
             now,
             max_entries: tree::MAX_ENTRIES,
+            max_patterns,
         };
-        tree::walk_from(root, start, base, &opts).ok()
+        let tree = tree::walk_from(root, start, base, &opts).ok();
+        if full {
+            let kept = tree.as_ref().map_or(0, |t| t.ignore.patterns());
+            self.budget.settle(root, kept);
+        }
+        tree
     }
 }
 

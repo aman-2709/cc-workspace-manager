@@ -102,8 +102,10 @@ is listed under `unverified` (not under `unconfined`) in the report, shown as `u
 Everything is in the `sandbox` section of `/api/v1/service/status` and in `ccwm doctor`.
 
 **systemd unit.** The user unit adds `NoNewPrivileges`, `UMask=0077`, `LockPersonality`,
-`RestrictRealtime`, `RestrictSUIDSGID`, `RestrictNamespaces` and `SystemCallArchitectures=native`. These
-directives were verified with the real daemon in a user unit. `ProtectSystem`, `ProtectHome` and
+`RestrictRealtime`, `RestrictSUIDSGID`, `RestrictNamespaces` and `SystemCallArchitectures=native`, and a
+memory limit for the daemon and its children together: `MemoryMax=2G` with `MemorySwapMax=0` (v0.1.1; see
+"Ignore rules cost memory" under the residual risks for what it is sized for). These directives were
+verified with the real daemon in a user unit. `ProtectSystem`, `ProtectHome` and
 `PrivateTmp` are not used: in a user unit they need a user namespace, in which root-owned paths appear to
 be owned by `nobody`, and ccwm's ownership checks then (correctly) refuse to start. See
 [docs/service.md](docs/service.md).
@@ -114,7 +116,10 @@ is sent. The token is checked again whenever sessions are revoked (sign-out, `cc
 the hourly purge) and every 10 s, so a socket whose token expired, was rotated out (after its 60 s
 grace) or is overdue for rotation is closed with 4401. Revalidation is a normal authenticated use of
 the session, so an open tab slides the session's 30-day expiry forward (intended); it cannot keep a
-token alive past the 24 h rotation rule, because an overdue token fails revalidation.
+token alive past the 24 h rotation rule, because an overdue token fails revalidation. A revocation is
+acted on before any event that is waiting at the same moment, and a client that does not take a message
+within 5 s is disconnected: a client that stops reading cannot hold its socket open past a revocation
+(v0.1.0 review I3).
 
 **Git (REQUIREMENTS.md §6).** Only allowlisted read commands run: `--version`, `rev-parse`,
 `config --get-regexp` (filter drivers; promisor remotes after a failed `status`) / `config --get`,
@@ -160,11 +165,13 @@ symlinks are never followed (`IN_DONT_FOLLOW`). The `notify` crate asks for `IN_
 still a real directory and drops the watch otherwise (tested with a regular file and a symlink). File contents read by monitoring:
 `.gitignore` files and `.git/info/exclude` (through the parent directory's descriptor), to
 evaluate ignore rules in-process; ccwm never runs `git check-ignore`. These reads are bounded per file
-and per project: at most 256 KiB per file, and 1 MiB and 5,000 rules for all ignore files of one project.
-A file over a limit is skipped whole (never read in part), counted, and reported in the monitoring
-status and `ccwm status`; its rules then do not apply. The limits exist because compiled rules stay in
-memory: a hostile repository with many large `.gitignore` files took the daemon to hundreds of
-megabytes (v0.1.0 review M2). The repository whose rules apply is searched no higher than the project's
+per project and across projects: at most 256 KiB per file, 1 MiB and 5,000 rules for all ignore files of
+one project, and 20,000 rules for all projects together (v0.1.1). A file over a limit is skipped whole
+(never read in part), counted, and reported in the monitoring status and `ccwm status`; its rules then do
+not apply. The limits exist because compiled rules stay in memory: a hostile repository with many large
+`.gitignore` files took the daemon to hundreds of megabytes (v0.1.0 review M2), and a directory tree also
+chooses how many projects it holds. The limit across projects is first come, first served: the projects
+walked first keep their rules. The repository whose rules apply is searched no higher than the project's
 discovery root, and its `.git` must be owned by you, as Git itself requires. ccwm's own directories are
 never watched, so its writes never count as activity.
 
@@ -178,7 +185,9 @@ continuation links); prompt text is read from the session file when you open a p
 caches the redacted last prompt in ccwm's database. Turning it off first forbids caching inside the database
 writer (so a prompt read still in flight cannot be stored afterwards), then deletes the cache. Deletions of
 session data (turning the setting off, "Clear session index") overwrite the deleted content (`secure_delete`) and
-checkpoint and truncate the write-ahead log, so the text does not linger in free pages or old WAL frames. Backups
+checkpoint and truncate the write-ahead log, so the text does not linger in free pages or old WAL frames. If a
+reader is still using the log at that moment the truncation cannot happen: that is logged, and it is tried again
+after every later write until it succeeds (v0.1.0 review I7; before, the result was not looked at). Backups
 or snapshots of the data directory taken earlier are outside ccwm's control. Session text is never logged and
 never rendered as HTML. The branch, Claude Code version and entrypoint are stored without control characters and
 cut to 256 characters; a cwd longer than 4,096 bytes is ignored. A session whose cwd can never name a project
@@ -229,10 +238,10 @@ mode 0600; it can change discovery roots, so it is as sensitive as the file itse
 after a restart (the sandbox's read set is fixed at startup). It accepts **only the keys of the Settings page**
 (REQUIREMENTS.md §9); everything else — `git.allow_unhardened_status`, `watch.debounce_ms`,
 `activity.events_per_project` — changes only by editing `config.toml`, so a stolen browser token cannot weaken the
-hardening persistently. It also refuses port 0 and a session directory that is `/` or contains your home folder.
-It does not refuse your home folder itself as the session directory, nor a discovery root that is `/` or contains
-your home folder: both take effect only after a restart, and the sandbox report then lists such a root as a broad
-read rule.
+hardening persistently. It also refuses port 0; a session directory that is `/`, your home folder, or a folder
+that contains it; and a discovery root that is `/` or a folder that contains your home folder (v0.1.0 review I6;
+symlinks are resolved before the check). Your home folder itself stays a valid root. A broader root can still be
+written into `config.toml` by hand; the sandbox report then lists it as a broad read rule.
 Saves are serialized from merge to apply, and the page sends only the fields you changed, so a stale Settings tab
 cannot revert a change made elsewhere.
 
@@ -297,11 +306,23 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
   project when its Git HEAD and remote (or its `CLAUDE.md` hash) match; all of these are content
   anyone who can write in a discovery root controls, so in a shared or group-writable root another
   user could make a directory inherit a missing project's id, history and ignore state.
-- **Ignore rules cost memory per project.** The `.gitignore` limits above bound one project: in the
-  worst case (5,000 rules that each need a regular expression) about 75 MiB and 1.2 s of CPU per walk,
-  measured with a release build. A repository that contains many projects, each with its own `.git` and
-  marker, gets that budget once per project, as it gets watches and database rows per project. There is
-  no limit across projects, and the systemd unit sets no `MemoryMax=`.
+- **Ignore rules cost memory.** The limits above bound the rules ccwm **keeps**: 5,000 per project and
+  20,000 for all projects together. Only rules that need a regular expression are expensive (17–20 KiB
+  each; ordinary ones cost almost nothing), so the worst case — every rule of that kind, as a hostile tree
+  would have it — is about 75 MiB for one project and 350–400 MiB for all (measured with release builds,
+  [docs/benchmarks.md](docs/benchmarks.md)). **More than that is in use for a while when projects are
+  walked again**: the new rules are built next to the ones they replace. For watched projects that is one
+  project at a time. Projects *without* watches (polled: no inotify instance, or the budget is used up) are
+  all walked at every scan: the release binary then peaked at 775 MiB and went back to 395 MiB after each
+  scan. **A build from source against glibc does not give that memory back**: with the same content it
+  grew to 1.66 GiB over four scans, and with a smaller rule set to about ten times what it keeps before it
+  levelled off. The rule limits therefore do not bound the process by themselves; the systemd unit does:
+  `MemoryMax=2G` with `MemorySwapMax=0` (on a host with swap, `MemoryMax=` alone only moves the excess to
+  swap). At the limit the kernel stops the service and systemd starts it again after 5 s, for as long as
+  the cause is there ([docs/troubleshooting.md](docs/troubleshooting.md)). The limit needs the cgroup
+  memory controller for your user manager (present on Ubuntu 24.04); **without systemd (`ccwm serve` in a
+  terminal) there is no such limit**. Not measured: a pattern built to make the matcher itself use as much
+  memory as it can; the measurements used one pattern shape (`*1?b[c-d]*.x`).
 - **POSIX ACLs** (v0.1.0 review L4). The check that refuses to start when an ancestor of ccwm's
   directories, or the config file, "could be modified by another user" reads the owner and the mode bits.
   It does not read access control lists: with an extended ACL the group bits show the ACL mask, so a

@@ -1,5 +1,7 @@
 //! Runs the dependency-free JavaScript unit tests when `node` is available (it is not a build
-//! requirement; without it the test prints a notice and passes).
+//! requirement; without it the test prints a notice and passes, except in CI, where it fails).
+
+mod common;
 
 use std::process::Command;
 
@@ -11,7 +13,7 @@ fn ui_helper_tests_pass_under_node() {
         .current_dir(dir)
         .output()
     else {
-        eprintln!("NOTICE: node is not installed; skipping JavaScript helper tests");
+        common::skipped_coverage("node is not installed; skipping JavaScript helper tests");
         return;
     };
     assert!(

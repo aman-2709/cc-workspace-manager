@@ -17,12 +17,20 @@ use std::process::{Command, Output, Stdio};
 pub const UNIT_NAME: &str = "ccwm.service";
 /// Where the unit expects the binary (`%h/.local/bin/ccwm`), relative to the home directory.
 pub const BINARY_IN_HOME: &str = ".local/bin/ccwm";
+/// `MemoryMax=` of the unit: the most memory the daemon and its `git` / `claude` children may
+/// use together. A backstop, not a working size: ccwm normally needs 20–30 MiB, and the worst
+/// case its ignore-rule limits allow was measured at 775 MiB with the release binary
+/// (docs/benchmarks.md). Above it the kernel stops the service instead of letting it take the
+/// machine's memory. `MemorySwapMax=0` goes with it: where there is swap, `MemoryMax=` alone
+/// only moves the excess there (verified in a user unit, ARCHITECTURE.md §13).
+pub const MEMORY_MAX: &str = "2G";
 
 /// The unit file `ccwm service install` writes. Only directives verified to work in a **user**
 /// unit with the real daemon are used (ARCHITECTURE.md §13); `ProtectSystem`/`ProtectHome` and
 /// `PrivateTmp` need user namespaces in user units and are left out (Landlock confines the daemon
 /// instead). `MemoryDenyWriteExecute` is left out because it is inherited by `claude --version`,
-/// whose JavaScript runtime needs writable executable memory.
+/// whose JavaScript runtime needs writable executable memory. The memory limit ([`MEMORY_MAX`])
+/// takes effect where the user manager has the cgroup memory controller (it does on Ubuntu 24.04).
 pub fn unit_text() -> String {
     format!(
         "# Written by `ccwm service install`; `ccwm service uninstall` removes it.\n\
@@ -40,6 +48,12 @@ pub fn unit_text() -> String {
          # Port in use ({EXIT_PORT_IN_USE}) and another instance running ({EXIT_ALREADY_RUNNING}): restarting cannot help.\n\
          RestartPreventExitStatus={EXIT_PORT_IN_USE} {EXIT_ALREADY_RUNNING}\n\
          TimeoutStopSec=10\n\
+         # A hard limit on the memory of the daemon and its git and claude children together, with\n\
+         # no swap on top. ccwm normally needs 20-30 MiB: reaching the limit means something is\n\
+         # wrong, and the kernel then stops the service (systemd starts it again).\n\
+         # To change it, use a drop-in: `systemctl --user edit ccwm` (docs/service.md).\n\
+         MemoryMax={MEMORY_MAX}\n\
+         MemorySwapMax=0\n\
          UMask=0077\n\
          Nice=10\n\
          IOSchedulingClass=idle\n\
@@ -283,24 +297,49 @@ pub fn path_var() -> Option<OsString> {
 mod tests {
     use super::*;
 
+    /// Every directive of the unit, written out here (not compared with `unit_text()` itself):
+    /// dropping or changing one fails this test. The list is the one in SECURITY.md,
+    /// docs/service.md and REQUIREMENTS.md §13 (v0.1.0 review, test-coverage gap 6).
     #[test]
     fn the_unit_runs_the_installed_binary_and_never_restarts_on_the_dedicated_codes() {
         let u = unit_text();
-        for want in [
-            "ExecStart=%h/.local/bin/ccwm serve\n",
-            "Restart=on-failure\n",
-            "RestartSec=5\n",
-            "RestartPreventExitStatus=10 11\n",
-            "TimeoutStopSec=10\n",
-            "UMask=0077\n",
-            "Nice=10\n",
-            "IOSchedulingClass=idle\n",
-            "NoNewPrivileges=yes\n",
-            "WantedBy=default.target\n",
-            "Type=exec\n",
-        ] {
-            assert!(u.contains(want), "{want:?} missing:\n{u}");
+        let directives = [
+            "Type=exec",
+            "ExecStart=%h/.local/bin/ccwm serve",
+            "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin",
+            "Restart=on-failure",
+            "RestartSec=5",
+            "RestartPreventExitStatus=10 11",
+            "TimeoutStopSec=10",
+            "MemoryMax=2G",
+            "MemorySwapMax=0",
+            "UMask=0077",
+            "Nice=10",
+            "IOSchedulingClass=idle",
+            "NoNewPrivileges=yes",
+            "LockPersonality=yes",
+            "RestrictRealtime=yes",
+            "RestrictSUIDSGID=yes",
+            "RestrictNamespaces=yes",
+            "SystemCallArchitectures=native",
+        ];
+        for want in directives {
+            assert!(
+                u.lines().any(|l| l == want),
+                "{want:?} is not a line of the unit:\n{u}"
+            );
         }
+        // …and nothing else: the [Service] section holds exactly these, in this order.
+        let service: Vec<&str> = u
+            .lines()
+            .skip_while(|l| *l != "[Service]")
+            .skip(1)
+            .take_while(|l| !l.starts_with('['))
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert_eq!(service, directives);
+        assert!(u.contains("\n[Install]\nWantedBy=default.target\n"), "{u}");
+        assert!(u.contains("\n[Unit]\nDescription="), "{u}");
         for never in [
             "PrivateDevices",
             "ProtectHome",

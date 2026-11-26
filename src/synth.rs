@@ -86,6 +86,34 @@ fn write(p: &Path, text: &str) -> io::Result<()> {
     fs::write(p, text)
 }
 
+/// Write an executable script **without this process ever holding it open for writing**. For
+/// tests that run a script right after writing it: a child that another test thread forks
+/// inherits every open descriptor until it execs, and executing a file that any process still has
+/// open for writing fails with `ETXTBSY` ("text file busy"), so a script written with `fs::write`
+/// and run at once fails now and then (seen as `GitMissing` for a stand-in `git`). A shell writes
+/// the file instead and has exited when this returns.
+pub fn write_executable(path: &Path, content: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut sh = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    // Dropped at the end of the statement: the shell's `cat` then sees the end of its input.
+    sh.stdin
+        .take()
+        .ok_or_else(|| io::Error::other("no pipe to the shell"))?
+        .write_all(content.as_bytes())?;
+    if sh.wait()?.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "the shell could not write {}",
+            path.display()
+        )))
+    }
+}
+
 fn project(home: &Path, rel: &str) -> io::Result<PathBuf> {
     let dir = home.join(rel);
     write(
@@ -440,6 +468,29 @@ mod tests {
             assert!(env.home.join(rel).join(".git/objects").is_dir(), "{rel}");
         }
         assert!(env.home.join("dev/monorepo/NOTES.txt").is_file());
+    }
+
+    #[test]
+    fn an_executable_script_is_written_by_a_child_and_runs_at_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let script = t.path().join("with space.sh");
+        write_executable(&script, "#!/bin/sh\nprintf '%s' \"$1\"\n").unwrap();
+        assert_eq!(
+            fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let out = std::process::Command::new(&script)
+            .arg("ran")
+            .output()
+            .unwrap();
+        assert_eq!(out.stdout, b"ran");
+        // Written again (a test that replaces its stand-in): the new content, still executable.
+        write_executable(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        let status = std::process::Command::new(&script).status().unwrap();
+        assert_eq!(status.code(), Some(7));
+        let missing = t.path().join("no-such-dir/x.sh");
+        assert!(write_executable(&missing, "#!/bin/sh\n").is_err());
     }
 
     #[test]

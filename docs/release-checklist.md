@@ -59,9 +59,10 @@ date and the result.
 
 ## 3. Tag and release (owner)
 
-- [ ] 👤 `git tag -s v0.1.0 -m "ccwm 0.1.0"` on the verified commit, then `git push origin v0.1.0`.
+- [ ] 👤 `git tag -s v<version> -m "ccwm <version>"` on the verified commit, then `git push origin v<version>`
+  (the workflow refuses a tag that does not match the version in `Cargo.toml`).
 - [ ] The **Release** workflow builds the musl binary and `THIRD_PARTY_LICENSES`, packages
-  `ccwm-0.1.0-x86_64-unknown-linux-musl.tar.gz` + `SHA256SUMS`, and creates a **draft** release
+  `ccwm-<version>-x86_64-unknown-linux-musl.tar.gz` + `SHA256SUMS`, and creates a **draft** release
   (`environment: release`; add a required reviewer in the repository settings for a further gate).
 - [ ] 👤 Download the draft's assets, run `sha256sum -c SHA256SUMS`, and compare with the local build (the
   archive is reproducible for the same commit, toolchain and `SOURCE_DATE_EPOCH`).

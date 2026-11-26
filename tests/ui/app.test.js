@@ -204,7 +204,7 @@ test("reconnect back-off doubles up to 30 s and the socket URL is same-origin", 
 
 // ---- M3 helpers -----------------------------------------------------------------------------------
 const {
-  withServerDefaults, privacySuffix, sessionSummary, resumeWarningText, durationText, promptStateText, describeScope, settingsPatch,
+  withServerDefaults, privacySuffix, sessionParts, sessionSummary, resumeWarningText, durationText, promptStateText, describeScope, settingsPatch,
 } = require("../../web/app.js");
 
 test("buildQuery adds has_sessions and privacy only when set", () => {
@@ -232,9 +232,31 @@ test("session summaries: title, untitled, hidden title and no session", () => {
   const now = Math.floor(new Date(2027, 0, 15, 12, 0, 0).getTime() / 1000); // local noon: same calendar day
   assert.strictEqual(sessionSummary({ count: 0, latest: null }, now), "No Claude Code session recorded");
   assert.strictEqual(sessionSummary(null, now), "No Claude Code session recorded");
-  assert.strictEqual(sessionSummary({ count: 2, latest: { title: "Fix it", title_source: "ai_title", last_activity_at: now - 30 } }, now), "Fix it · just now · 2 sessions");
+  assert.strictEqual(sessionSummary({ count: 2, latest: { title: "Fix it", title_source: "ai_title", last_activity_at: now - 30 } }, now), "Session title: “Fix it” · just now · 2 sessions");
   assert.strictEqual(sessionSummary({ count: 1, latest: { title_source: null, last_activity_at: null } }, now), "Untitled session · time unknown · 1 session");
   assert.strictEqual(sessionSummary({ count: 1, latest: { title_source: "ai_title", last_activity_at: now - 7200 } }, now), "Latest session 2 h ago · 1 session", "privacy mode: no title");
+});
+
+test("a session title is kept apart from ccwm's own words, so it can be shown as a quotation", () => {
+  const now = Math.floor(new Date(2027, 0, 15, 12, 0, 0).getTime() / 1000);
+  // The case seen in real use: an AI title worded like a status of the project.
+  const statusLike = { count: 3, latest: { title: "Resuming the previous session", title_source: "ai_title", last_activity_at: now - 30 } };
+  assert.deepStrictEqual(sessionParts(statusLike, now), { title: "Resuming the previous session", rest: "just now · 3 sessions" });
+  assert.strictEqual(sessionSummary(statusLike, now), "Session title: “Resuming the previous session” · just now · 3 sessions");
+  // ccwm's own words are never in the title part: nothing is quoted without a recorded title.
+  for (const [sessions, rest] of [
+    [null, "No Claude Code session recorded"],
+    [{ count: 0, latest: null }, "No Claude Code session recorded"],
+    [{ count: 1, latest: { title_source: null, last_activity_at: null } }, "Untitled session · time unknown · 1 session"],
+    [{ count: 1, latest: { title: "", title_source: "ai_title", last_activity_at: now - 7200 } }, "Latest session 2 h ago · 1 session"],
+    [{ count: 1, latest: { title_source: "ai_title", last_activity_at: now - 7200 } }, "Latest session 2 h ago · 1 session"],
+  ]) {
+    assert.deepStrictEqual(sessionParts(sessions, now), { title: null, rest });
+    assert.strictEqual(sessionSummary(sessions, now), rest, "the tooltip of a line without a title is the line");
+  }
+  // A title that itself contains quotation marks or the separator stays one part.
+  const odd = { count: 1, latest: { title: "Say “done” · really", title_source: "ai_title", last_activity_at: now - 30 } };
+  assert.strictEqual(sessionParts(odd, now).title, "Say “done” · really");
 });
 
 test("resume warnings, durations and prompt states read as sentences", () => {

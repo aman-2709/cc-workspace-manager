@@ -43,6 +43,8 @@ struct Opts {
     full_scan: bool,
     /// Claude Code's config directory: enables the session integration.
     claude_dir: Option<PathBuf>,
+    /// Ignore rules all projects may keep together (the daemon's limit by default).
+    ignore_rules: usize,
 }
 
 impl Default for Opts {
@@ -51,6 +53,7 @@ impl Default for Opts {
             budget: 1000,
             full_scan: true,
             claude_dir: None,
+            ignore_rules: watch::tree::MAX_GITIGNORE_PATTERNS_TOTAL,
         }
     }
 }
@@ -62,6 +65,8 @@ struct Stack {
     writer: Arc<Writer>,
     monitor: SharedMonitor,
     clock: Arc<FakeClock>,
+    /// The limit on ignore rules across projects, as the tracker and the monitor share it.
+    ignore_budget: Arc<watch::tree::IgnoreBudget>,
     stop: tokio_watch::Sender<bool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -182,6 +187,7 @@ impl Stack {
         opts: Opts,
     ) -> Option<Self> {
         let budget = opts.budget;
+        let ignore_budget = Arc::new(watch::tree::IgnoreBudget::new(opts.ignore_rules));
         let db = data.join("t.db");
         let writer = Arc::new(Writer::spawn(&db).unwrap());
         let reader = Reader::open(&db, 2).unwrap();
@@ -239,6 +245,7 @@ impl Stack {
                     temp_dirs: vec![],
                     claude: None,
                 }),
+                ignore_budget: Arc::clone(&ignore_budget),
             },
         );
         let monitor = Monitor::new(
@@ -255,6 +262,7 @@ impl Stack {
                 max_user_watches: None,
                 debounce: Duration::from_millis(100),
                 events_per_project: 50,
+                ignore_budget: Arc::clone(&ignore_budget),
             },
             clock.clone(),
             signals_tx,
@@ -275,6 +283,7 @@ impl Stack {
             writer,
             monitor: monitor_state,
             clock,
+            ignore_budget,
             stop,
             tasks,
         })
@@ -577,6 +586,84 @@ async fn git_status_follows_edits_and_ignore_stops_monitoring() {
         .await
         .unwrap();
     s.wait_watched(&p.id).await;
+    s.stop().await;
+}
+
+/// The limit on ignore rules across projects, through the real tracker and monitor: with room
+/// for six rules and two projects of four rules each, the project walked first keeps its rules
+/// and the other one's `.gitignore` is skipped and counted. When the first project is no longer
+/// monitored its share is free: the other project's next walk keeps its rules, and the first
+/// one, monitored again, is now the one without room.
+#[tokio::test]
+async fn projects_share_one_limit_on_ignore_rules_first_come_first_served() {
+    let _g = inotify_lock().lock().await;
+    let e = env();
+    const RULES: &str = "one.tmp\ntwo.tmp\nthree.tmp\nfour.tmp\n";
+    let roots = [e.home.join("a"), e.home.join("b")];
+    for r in &roots {
+        marker(r, "# project");
+        fs::create_dir(r.join(".git")).unwrap(); // a work tree: `.gitignore` applies
+        fs::write(r.join(".gitignore"), RULES).unwrap();
+    }
+    let opts = Opts {
+        ignore_rules: 6,
+        ..Opts::default()
+    };
+    let Some(s) = Stack::start_with(&e.home, &e.data, now_clock(), opts).await else {
+        return;
+    };
+    let skipped = || s.monitor.snapshot().ignore_files_skipped;
+    let (a, b) = (
+        s.wait_registered(&roots[0]).await,
+        s.wait_registered(&roots[1]).await,
+    );
+    s.wait_watched(&a.id).await;
+    s.wait_watched(&b.id).await;
+    assert_eq!(skipped(), 1, "{:?}", s.monitor.snapshot().advice);
+    assert_eq!(s.ignore_budget.total(), 4, "one project's rules are kept");
+    let advice = s.monitor.snapshot().advice.join(" ");
+    assert!(
+        advice.contains("1 .gitignore or .git/info/exclude file(s) were skipped")
+            && advice.contains("all projects together have more than"),
+        "{advice}"
+    );
+    // The keeper has the whole limit as its room; the other one only what the keeper leaves.
+    let (keeper, loser) = if s.ignore_budget.room(&roots[0]) == 6 {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    assert_eq!(s.ignore_budget.room(Path::new(&keeper.path)), 6);
+    assert_eq!(s.ignore_budget.room(Path::new(&loser.path)), 2);
+
+    // The keeper is ignored: its rules are gone, and the loser's next walk (its `.gitignore`
+    // was written again) finds room.
+    s.writer.set_ignored(&keeper.path, true, 1).await.unwrap();
+    s.tracker
+        .on_control(Control::Ignored(keeper.id.clone()))
+        .await
+        .unwrap();
+    s.wait("unwatched", 5, || async {
+        s.monitor.of(&keeper.id).is_none()
+    })
+    .await;
+    fs::write(Path::new(&loser.path).join(".gitignore"), RULES).unwrap();
+    s.wait("the other project's rules to be kept", 15, || async {
+        skipped() == 0 && s.ignore_budget.room(Path::new(&loser.path)) == 6
+    })
+    .await;
+    assert_eq!(s.ignore_budget.total(), 4);
+
+    // Monitored again, the former keeper is the one without room: first come, first served.
+    s.writer.set_ignored(&keeper.path, false, 2).await.unwrap();
+    s.tracker
+        .on_control(Control::Unignored(keeper.id.clone()))
+        .await
+        .unwrap();
+    s.wait_watched(&keeper.id).await;
+    assert_eq!(skipped(), 1);
+    assert_eq!(s.ignore_budget.total(), 4);
+    assert_eq!(s.ignore_budget.room(Path::new(&keeper.path)), 2);
     s.stop().await;
 }
 

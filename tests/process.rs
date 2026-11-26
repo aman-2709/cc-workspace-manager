@@ -25,12 +25,7 @@ fn command(env: &SynthEnv) -> Command {
     let stub = env.root.join("stub-bin");
     if !stub.join("systemctl").exists() {
         std::fs::create_dir_all(&stub).unwrap();
-        std::fs::write(stub.join("systemctl"), "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(
-            stub.join("systemctl"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        common::write_executable(&stub.join("systemctl"), "#!/bin/sh\nexit 1\n");
     }
     let mut c = Command::new(BIN);
     c.env_clear()
@@ -310,8 +305,14 @@ fn assert_daemon_confined(r: &serde_json::Value) {
     assert_eq!(r["thread_probes"]["worker"], "eacces", "{r}");
     assert_eq!(r["thread_probes"]["blocking"], "eacces", "{r}");
     assert_eq!(r["no_new_privs"], true, "{r}");
+    // TCP confinement needs ABI 4. The daemon's own ABI number is not enough to excuse its
+    // absence: where the kernel's ABI is known from outside (CI's probe), that one decides.
+    let known_abi: u64 = std::env::var("CCWM_REQUIRE_LANDLOCK_ABI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     assert!(
-        r["network"] == "tcp_only" || r["abi"].as_u64() < Some(4),
+        r["network"] == "tcp_only" || (r["abi"].as_u64() < Some(4) && known_abi < 4),
         "{r}"
     );
     assert_eq!(r["daemon_probes"]["write"], "eacces", "{r}");
@@ -1637,13 +1638,10 @@ fn acceptance_5_no_external_network_connections() {
 fn fake_claude(env: &SynthEnv) -> String {
     let bin = env.home.join(".local/bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let p = bin.join("claude");
-    std::fs::write(
-        &p,
+    common::write_executable(
+        &bin.join("claude"),
         "#!/bin/sh\ncase \"$1\" in\n  --version) printf '9.9.9 (Synthetic Claude Code)\\n' ;;\n  --help) printf 'Usage: claude [options]\\n  -r, --resume [id]  Resume a conversation\\n' ;;\n  *) exit 2 ;;\nesac\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     format!("{}:/usr/bin:/bin", bin.display())
 }
 
@@ -1807,6 +1805,25 @@ fn m3_acceptance_sessions_resume_privacy_and_acceptance_2_8_10() {
             .contains(&home),
         "control: without privacy the service status names the claude program in home"
     );
+    // The program paths of the service status, one by one (v0.1.0 review, test-coverage gap 5:
+    // nothing checked `git.program`, which is outside home): there without privacy mode, gone
+    // with it, while the rest of each section stays.
+    let full = d.get_json(&token, "/api/v1/service/status");
+    let private = d.get_json(&token, "/api/v1/service/status?privacy=1");
+    let mut sections = vec![("claude", "state")];
+    if real_git {
+        sections.push(("git", "version"));
+    }
+    for (section, kept) in sections {
+        let program = full[section]["program"].as_str().unwrap_or_default();
+        assert!(program.starts_with('/'), "control: {section}: {full}");
+        assert!(private[section].get("program").is_none(), "{private}");
+        assert!(
+            !private.to_string().contains(program),
+            "{section}: {private}"
+        );
+        assert_eq!(private[section][kept], full[section][kept], "{section}");
+    }
 
     // Settings are saved under the sandbox; `--port 0` is a command-line override, not saved.
     let settings = d.get_json(&token, "/api/v1/settings");
@@ -2144,6 +2161,65 @@ fn a_hostile_repository_cannot_grow_the_daemon_through_gitignore_files() {
     let (code, log) = d.stop();
     assert_eq!(code, Some(0), "{log}");
     assert!(started.elapsed() < Duration::from_secs(5), "slow shutdown");
+}
+
+/// The limit on ignore rules across projects, in the real daemon with its real limits: more
+/// projects than fit, each with a `.gitignore` as large as one project may have. The projects
+/// walked first keep their rules; the files of the others are skipped, counted and reported,
+/// and every project is still listed. (The limits one project has are in the test above; how
+/// the limit is shared and released is tested with the tracker, `tests/tracker.rs`.)
+#[test]
+fn projects_beyond_the_limit_on_ignore_rules_across_projects_lose_their_rules_not_the_daemon() {
+    use cc_workspace_manager::watch::tree::{MAX_GITIGNORE_PATTERNS, MAX_GITIGNORE_PATTERNS_TOTAL};
+    let fit = MAX_GITIGNORE_PATTERNS_TOTAL / MAX_GITIGNORE_PATTERNS;
+    assert_eq!(
+        fit * MAX_GITIGNORE_PATTERNS,
+        MAX_GITIGNORE_PATTERNS_TOTAL,
+        "the test assumes whole projects fill the limit"
+    );
+    let extra = 2;
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("s"), 0).unwrap();
+    for i in 0..fit + extra {
+        let project = env.home.join(format!("rules/proj-{i:02}"));
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(project.join("CLAUDE.md"), "# rules\n").unwrap();
+        // Plain names: cheap rules (it is their number that is limited, whatever they cost).
+        let rules: String = (0..MAX_GITIGNORE_PATTERNS)
+            .map(|k| format!("generated-{i}-{k}.tmp\n"))
+            .collect();
+        std::fs::write(project.join(".gitignore"), rules).unwrap();
+    }
+    let d = Daemon::start(&env, &[]);
+    wait_scans_finished(&env, 1);
+    wait_until("the skipped ignore files to be reported", 30, || {
+        socket_call(&env, "service.status")["monitoring"]["ignore_files_skipped"] == extra
+    });
+    let status = socket_call(&env, "service.status");
+    let advice = status["monitoring"]["advice"].to_string();
+    assert!(
+        advice.contains(&format!(
+            "{extra} .gitignore or .git/info/exclude file(s) were skipped"
+        )) && advice.contains(&format!(
+            "all projects together have more than {MAX_GITIGNORE_PATTERNS_TOTAL} rules"
+        )),
+        "{advice}"
+    );
+    assert_eq!(status["monitoring"]["degraded"], false, "{status}");
+    let token = d.login(&env);
+    let page = d.get_json(&token, "/api/v1/projects?limit=200");
+    for i in 0..fit + extra {
+        let listed = project_by_name(&page, &format!("proj-{i:02}"));
+        assert!(listed["missing_since"].is_null(), "{listed}");
+    }
+    // Another reconciliation: the same projects keep their rules, the same files are skipped.
+    refresh_and_wait(&env);
+    assert_eq!(
+        socket_call(&env, "service.status")["monitoring"]["ignore_files_skipped"],
+        extra
+    );
+    let (code, log) = d.stop();
+    assert_eq!(code, Some(0), "{log}");
 }
 
 /// v0.1.0 review L2: `XDG_DATA_HOME` reached through a symlink that resolves **inside a

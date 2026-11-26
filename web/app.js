@@ -156,15 +156,32 @@ function privacySuffix(privacy, sep = "?") {
   return privacy ? `${sep}privacy=1` : "";
 }
 
-// One line about a project's Claude Code sessions (cards and table).
-function sessionSummary(sessions, now) {
-  if (!sessions || !sessions.count) return "No Claude Code session recorded";
+// The one line about a project's Claude Code sessions (cards and table), in two parts: the
+// recorded title of the latest session (null when there is none to show) and the rest. The title
+// is text Claude Code wrote, and it can be worded like a status ("Resuming the session…"): the
+// page shows it as a quotation, never as ccwm's own words about the project.
+function sessionParts(sessions, now) {
+  if (!sessions || !sessions.count) return { title: null, rest: "No Claude Code session recorded" };
   const latest = sessions.latest || {};
   const when = typeof latest.last_activity_at === "number" ? relativeTime(latest.last_activity_at, now) : "time unknown";
   const count = plural(sessions.count, "session");
-  if (latest.title) return `${latest.title} · ${when} · ${count}`;
-  if (latest.title_source) return `Latest session ${when} · ${count}`; // title hidden (privacy mode)
-  return `Untitled session · ${when} · ${count}`;
+  if (latest.title) return { title: latest.title, rest: `${when} · ${count}` };
+  if (latest.title_source) return { title: null, rest: `Latest session ${when} · ${count}` }; // title hidden (privacy mode)
+  return { title: null, rest: `Untitled session · ${when} · ${count}` };
+}
+
+const SESSION_TITLE_LABEL = "Session title";
+
+// A session title as shown: in quotation marks (the page also sets it in italics).
+function quotedTitle(title) {
+  return `“${title}”`;
+}
+
+// The same line as plain text (the tooltip, which shows what an ellipsis cut off): a title is
+// named as one.
+function sessionSummary(sessions, now) {
+  const { title, rest } = sessionParts(sessions, now);
+  return title ? `${SESSION_TITLE_LABEL}: ${quotedTitle(title)} · ${rest}` : rest;
 }
 
 const RESUME_WARNINGS = {
@@ -355,7 +372,7 @@ if (typeof module !== "undefined") {
     parseFragmentToken, shouldRotate, describeDiscovery, readSession, shouldClearOnUnauthorized, preferStored,
     readPrefs, buildQuery, withView, withSort, relativeTime, gitSummary, paginate, reconnectDelay, wsUrl,
     plural, describeUnreadable, degradedSummary, truncatePath, calendarDaysAgo,
-    withServerDefaults, privacySuffix, sessionSummary, resumeWarningText, durationText, promptStateText,
+    withServerDefaults, privacySuffix, sessionParts, sessionSummary, resumeWarningText, durationText, promptStateText,
     describeScope, settingsPatch, changedSettings, restartNote, commitText,
     STORAGE_KEY, PREFS_KEY, DEFAULT_QUERY,
   };
@@ -637,6 +654,23 @@ function startApp() {
     return h("ul", { class: "badges", "aria-label": "Details" }, ...list);
   }
 
+  // The session line of a card or a table row. A recorded title is set apart as a quotation
+  // (quotation marks, italics, named for screen readers and in the tooltip), so it cannot be
+  // read as the state of the project.
+  function sessionLine(p, tag, cls) {
+    const { title, rest } = sessionParts(p.sessions, now());
+    const line = h(tag, { class: cls, title: sessionSummary(p.sessions, now()) });
+    if (!title) {
+      line.textContent = rest;
+      return line;
+    }
+    line.append(
+      h("span", { class: "sr-only", text: `${SESSION_TITLE_LABEL}: ` }),
+      h("span", { class: "session-title", text: quotedTitle(title) }),
+      ` · ${rest}`);
+    return line;
+  }
+
   function card(p) {
     const status = p.activity.status;
     const git = p.git;
@@ -655,7 +689,7 @@ function startApp() {
           h("p", { class: "line small muted", title: commit && commit.subject ? commit.subject : "",
             text: commit && commit.subject ? `Latest commit: ${commit.subject}` : "No commit recorded" }),
         ]),
-      h("p", { class: "line small muted", title: sessionSummary(p.sessions, now()), text: sessionSummary(p.sessions, now()) }),
+      sessionLine(p, "p", "line small muted"),
       h("div", { class: "foot" }, badges(p), detailsButton(p), stateButton(p)));
   }
 
@@ -688,7 +722,7 @@ function startApp() {
           h("td", {}, h("span", { class: `line${p.git && p.git.dirty ? " dirty" : ""}`, title: gitSummary(p.git), text: gitSummary(p.git) })),
           h("td", {}, h("span", { class: "line", title: (p.git && p.git.commit && p.git.commit.subject) || "No commit recorded",
             text: commitText(p.git) })),
-          h("td", {}, h("span", { class: "line", title: sessionSummary(p.sessions, now()), text: sessionSummary(p.sessions, now()) })),
+          h("td", {}, sessionLine(p, "span", "line")),
           h("td", { class: "col-act" }, h("span", { class: "actions" }, detailsButton(p), copyResumeButton(p), stateButton(p))))))));
   }
 

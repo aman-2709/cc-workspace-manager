@@ -57,6 +57,28 @@ ccwm restart
 Without root, you can lower ccwm's own use instead: exclude large trees (`discovery.exclude`), set a smaller
 `watch.budget`, or close other watchers.
 
+## The service keeps restarting: out of memory
+
+```
+$ systemctl --user status ccwm
+… Failed with result 'oom-kill'.
+… Scheduled restart job, restart counter is at 3.
+```
+
+The unit limits the daemon and its `git` and `claude` children to 2 GiB together, with no swap
+(`MemoryMax=2G`, `MemorySwapMax=0`; [service.md](service.md#the-unit)). ccwm normally needs 20–30 MiB, so
+reaching the limit means something unusual is on disk. The kernel then stops the service, and systemd starts
+it again after 5 s, for as long as the cause is there.
+
+- Look for it: `journalctl --user -u ccwm -n 50`, and, while the daemon is up, `ccwm status`. A line about
+  **skipped `.gitignore` files** points at a tree with a very large number of ignore rules (the limits are
+  256 KiB per file, 5,000 rules per project, 20,000 for all projects). Exclude that tree (`discovery.exclude`
+  in `config.toml`, or Ignore the project), then `ccwm restart`.
+- A very large Git repository can need hundreds of megabytes for one `git status`, and ccwm runs up to four
+  at a time. If that is your case, raise the limit with a drop-in
+  ([service.md](service.md#the-unit)): `systemctl --user edit ccwm`, `MemoryMax=4G`.
+- To stop the restarts while you look: `ccwm stop`.
+
 ## Landlock unavailable or partial
 
 `ccwm status` shows `sandbox: fully_enforced (abi 8, filesystem true, network tcp_only, seccomp socket_denied)` on a kernel

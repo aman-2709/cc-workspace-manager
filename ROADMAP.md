@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); next is v0.1.1 (below; not started).** The session activity indicator is the v0.2 headline (ARCHITECTURE §14).
+Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); v0.1.1 is built and committed locally (below), not pushed or tagged; its spec changes and choices wait for the maintainer's approval.** The session activity indicator is the v0.2 headline (ARCHITECTURE §14).
 
 ---
 
@@ -200,9 +200,9 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
   the window width, Activity column has a fixed width
 - [x] CI: test 5's network-namespace variant and `CCWM_REQUIRE_NETNS` removed; workflows linted (actionlint)
 - [x] Info: I1, I2, I4, I5, I6 (documentation), I9 (message)
-- [ ] Not done: I3 (WebSocket send timeout / `biased` select), I7 (`wal_checkpoint` result), I8 (session-file cap),
-  the stricter `PUT /settings` checks of I6, the review's remaining test-coverage gaps (4–8), a limit on ignore
-  rules across projects, `MemoryMax=` in the unit
+- [x] Left for later then, done in v0.1.1 (below): I3 (WebSocket send timeout / `biased` select), I7
+  (`wal_checkpoint` result), I8 (session-file cap), the stricter `PUT /settings` checks of I6, the review's
+  remaining test-coverage gaps (4–8), a limit on ignore rules across projects, `MemoryMax=` in the unit
 - [x] Maintainer's review of the choices made during the pass: approved on 2026-11-26 — the 5,000-rule ignore
   limit, `notes_hidden`, `408` for a late body, exit status 0 on a closed pipe (ARCHITECTURE.md §14). Also verified
   by the maintainer on the real home: the real `claude` (2.1.332) passes its check under the `socket`/`socketpair`
@@ -211,12 +211,36 @@ cannot widen its rules); the M3.1 narrowed Basic-auth redaction rule approved.
 
 ---
 
-## v0.1.1 — planned (not started; needs a go-ahead)
+## v0.1.1 — maintenance release (built 2026-11-26; local commit, not pushed, not tagged)
 
-- [ ] Session titles on cards and table rows are rendered so that they cannot be mistaken for a status: quoted
-  and in italics, with a tooltip that says it is the session's title. Seen in real use: an AI title worded like
-  a status message (it said that a session was being resumed) read as the state of the project. UI only;
-  REQUIREMENTS.md §9 gets the wording when it is built
+No new features. What was run is in ARCHITECTURE.md §13i; the spec changes are the last rows of REQUIREMENTS.md
+Appendix A ("v0.1.1, needs approval").
+
+- [x] Session titles on cards and table rows are rendered so that they cannot be mistaken for a status: quoted
+  and in italics, with a tooltip (and screen-reader text) that says "Session title". Seen in real use: an AI
+  title worded like a status message (it said that a session was being resumed) read as the state of the
+  project. UI only; checked in Chrome against a synthetic daemon
+- [x] systemd unit: `MemoryMax=2G` and `MemorySwapMax=0`; verified with the real daemon in transient user units
+  on Ubuntu 24.04 (limits in the cgroup, `oom-kill` and restart below the limit's need, a normal run under it);
+  documented with how to override it (docs/service.md, docs/troubleshooting.md)
+- [x] A limit on ignore rules across all projects (20,000), next to the limits per file and per project; files
+  beyond it are skipped and counted; first come, first served (`tree::IgnoreBudget`)
+- [x] Review items **I3** (WebSocket: revocation first, 5 s send timeout), **I7** (the WAL truncation's result
+  is checked; a failed one is retried), **I8** (a session listing cut off at its limit removes nothing), **I6**
+  (`PUT /settings` refuses broad roots and home as the session directory)
+- [x] Test-coverage gaps **4–8** of the v0.1.0 review (the list is in ARCHITECTURE.md §13i)
+- [x] The remaining scripts that tests write and run at once (`src/claude/cli.rs`, `tests/process.rs`,
+  `tests/service.rs`) are written by a child shell (`synth::write_executable`)
+- [x] Version 0.1.1; CHANGELOG; fmt / clippy / test (`CCWM_REQUIRE_LANDLOCK=1 CCWM_REQUIRE_LANDLOCK_ABI=8
+  CCWM_REQUIRE_INOTIFY=1`) / cargo deny / gitleaks green; docs; one local commit
+- [ ] README: the request's item was an unfilled placeholder ("list anything confusing you found installing
+  from the release"); nothing was changed for it (only the version in the install commands and the status line)
+- [ ] Maintainer: approve or change the spec changes and the choices (ARCHITECTURE.md §14: 20,000 rules, 2G,
+  `MemorySwapMax=0`, the 5 s send timeout, `CCWM_REQUIRE_LANDLOCK_ABI`)
+- [ ] Maintainer: push, CI, tag, the release workflow (docs/release-checklist.md)
+- [ ] Found, not fixed (outside the list; proposal in ARCHITECTURE.md §14): in polled mode every scan compiles
+  every project's ignore rules again, and a glibc build keeps the freed memory (1.66 GiB measured at the limit).
+  Proposed: reuse the compiled rules of an ignore file whose content did not change
 
 ---
 

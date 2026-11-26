@@ -100,6 +100,9 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a") as e:
               if abi >= 1:
                   e.write("CCWM_REQUIRE_LANDLOCK=1\n")
+                  # The ABI itself: the assertions that depend on it (network rules from 4,
+                  # scopes from 6) are then required too, instead of skipping with a notice.
+                  e.write(f"CCWM_REQUIRE_LANDLOCK_ABI={abi}\n")
               if inotify_ok:
                   e.write("CCWM_REQUIRE_INOTIFY=1\n")
           EOF
@@ -123,6 +126,7 @@ jobs:
             echo "## Coverage the tests are required to run"
             echo
             echo "- CCWM_REQUIRE_LANDLOCK=${CCWM_REQUIRE_LANDLOCK:-unset}"
+            echo "- CCWM_REQUIRE_LANDLOCK_ABI=${CCWM_REQUIRE_LANDLOCK_ABI:-unset}"
             echo "- CCWM_REQUIRE_INOTIFY=${CCWM_REQUIRE_INOTIFY:-unset}"
             echo
             echo "Unset means the runner lacks the feature: those tests may skip (see the notices below)."

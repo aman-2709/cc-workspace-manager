@@ -169,8 +169,9 @@ pub struct MonitorStatus {
     pub pending_projects: usize,
     /// Session directories watched (live session updates; otherwise found at each scan).
     pub session_watches: usize,
-    /// `.gitignore` / `.git/info/exclude` files not read because of a size limit, over all
-    /// projects (their rules do not apply; see [`tree::MAX_GITIGNORE_BYTES`]).
+    /// `.gitignore` / `.git/info/exclude` files not read because of a limit (per file, per
+    /// project or across projects), over all projects (their rules do not apply; see
+    /// [`tree::MAX_GITIGNORE_BYTES`] and [`tree::MAX_GITIGNORE_PATTERNS_TOTAL`]).
     pub ignore_files_skipped: u64,
     /// Real failures only: no inotify instance, a queue overflow being recovered, or projects
     /// without any watch (polled). Partly watched projects are normal operation (§5.1).
@@ -233,6 +234,8 @@ pub struct Settings {
     pub max_user_watches: Option<u64>,
     pub debounce: Duration,
     pub events_per_project: usize,
+    /// The limit on ignore rules across projects (the tracker's walks reserve from the same one).
+    pub ignore_budget: Arc<tree::IgnoreBudget>,
 }
 
 /// The watcher abstraction the monitor needs; [`notify::INotifyWatcher`] in production.
@@ -1095,6 +1098,7 @@ impl Monitor {
             self.settings.same_file_system,
             self.clock.now(),
         );
+        let max_patterns = self.settings.ignore_budget.room(&root);
         tokio::task::spawn_blocking(move || {
             let opts = TreeOptions {
                 exclusions: &ex,
@@ -1105,6 +1109,7 @@ impl Monitor {
                 repo_root: None,
                 now,
                 max_entries: tree::MAX_ENTRIES,
+                max_patterns,
             };
             if let Ok(tree) = tree::walk_from(&root, &dir, &ignore, &opts) {
                 let _ = tx.blocking_send(Cmd::Walked { owner, tree });
@@ -1223,10 +1228,11 @@ impl Monitor {
             self.projects.values().map(|p| p.ignore_files_skipped).sum();
         if ignore_files_skipped > 0 {
             advice.push(format!(
-                "{ignore_files_skipped} .gitignore or .git/info/exclude file(s) were skipped: larger than {} KiB, or the project has more than {} KiB or {} rules of ignore files. Their rules do not apply, so files they would ignore count as activity.",
+                "{ignore_files_skipped} .gitignore or .git/info/exclude file(s) were skipped: larger than {} KiB, or the project has more than {} KiB or {} rules of ignore files, or all projects together have more than {} rules. Their rules do not apply, so files they would ignore count as activity.",
                 tree::MAX_GITIGNORE_BYTES / 1024,
                 tree::MAX_GITIGNORE_TOTAL_BYTES / 1024,
-                tree::MAX_GITIGNORE_PATTERNS
+                tree::MAX_GITIGNORE_PATTERNS,
+                tree::MAX_GITIGNORE_PATTERNS_TOTAL
             ));
         }
         if self.recovering {

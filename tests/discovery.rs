@@ -653,7 +653,108 @@ fn a_directory_swapped_for_a_symlink_during_the_walk_is_never_followed() {
     stop.store(true, Ordering::Relaxed);
     let swaps = swapper.join().unwrap();
     assert!(swaps > 0, "the swapper never ran");
+    // A swap must have hit the window between listing a directory and opening it at least
+    // once (thousands of times here; hundreds on a single CPU): otherwise no walk ever met a
+    // swapped directory and the assertion above proved nothing.
+    assert!(
+        changed > 0,
+        "no swap raced a walk ({swaps} swaps): the test did not exercise the race"
+    );
     eprintln!("swaps={swaps} changed-directory skips observed={changed}");
+}
+
+/// `same_file_system` (the default): a directory on another file system than its root is never
+/// entered, by the marker scan and by the walk of a project's tree alike. Nothing can be mounted
+/// without privileges, so the test uses a boundary every Linux system has: `/dev` (devtmpfs) and
+/// `/dev/shm` (tmpfs) below it. Both are only listed; the one thing written is a marker in a
+/// fresh directory of our own in `/dev/shm`. Control: with the option off, both walks enter it.
+#[test]
+fn a_directory_on_another_file_system_is_not_entered() {
+    use cc_workspace_manager::discovery::exclusions::Exclusions;
+    use cc_workspace_manager::watch::tree::{self, TreeOptions};
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    let (dev, shm) = (Path::new("/dev"), Path::new("/dev/shm"));
+    let other_fs = match (fs::metadata(dev), fs::metadata(shm)) {
+        (Ok(d), Ok(s)) => s.is_dir() && d.dev() != s.dev(),
+        _ => false,
+    };
+    // The directory's name must not start with a dot (hidden directories are never entered).
+    let own = other_fs
+        .then(|| {
+            tempfile::Builder::new()
+                .prefix("ccwm-test-")
+                .tempdir_in(shm)
+                .ok()
+        })
+        .flatten();
+    let Some(own) = own else {
+        common::skipped_coverage(
+            "/dev/shm is not a writable file system of its own below /dev; skipping the same_file_system walk checks",
+        );
+        return;
+    };
+    let project = own.path().join("proj");
+    fs::create_dir(&project).unwrap();
+    fs::write(project.join("CLAUDE.md"), "# on another file system\n").unwrap();
+    let marker_dir = project.to_str().unwrap().to_string();
+
+    // The marker scan, from the root `/dev`.
+    let found = |same_file_system: bool| -> bool {
+        let opts = ScanOptions {
+            roots: vec![dev.to_path_buf()],
+            exclude: vec![],
+            max_depth: 10,
+            same_file_system,
+            home: PathBuf::from("/nonexistent-home"),
+            boundaries: vec![],
+            fuse_mounts: vec![],
+        };
+        let mut all: Vec<Candidate> = Vec::new();
+        scan(
+            &opts,
+            &AtomicBool::new(false),
+            &SharedStatus::default(),
+            &mut |b| {
+                all.extend(b);
+                true
+            },
+        );
+        all.iter().any(|c| c.canonical_path == marker_dir)
+    };
+    assert!(
+        found(false),
+        "control: without the option the marker is found"
+    );
+    assert!(!found(true), "the scan entered another file system");
+
+    // The walk of a project tree rooted at `/dev`. (Only whether our own directory was
+    // reached is looked at: the other names in `/dev/shm` belong to other programs.)
+    let exclusions = Exclusions::new(dev, Path::new("/nonexistent-home"), &[], &[], &[]).unwrap();
+    let entered = |same_file_system: bool| -> bool {
+        let none = HashSet::new();
+        let tree = tree::walk(
+            dev,
+            &TreeOptions {
+                exclusions: &exclusions,
+                other_projects: &none,
+                max_depth: 10,
+                same_file_system,
+                git_aware: false,
+                repo_root: None,
+                now: i64::MAX,
+                max_entries: tree::MAX_ENTRIES,
+                max_patterns: tree::MAX_GITIGNORE_PATTERNS,
+            },
+        )
+        .unwrap();
+        tree.dirs.iter().any(|d| d == &project)
+    };
+    assert!(
+        entered(false),
+        "control: without the option the tree is walked"
+    );
+    assert!(!entered(true), "the tree walk entered another file system");
 }
 
 /// Projects already registered (e.g. found from a session, without a marker) make the markers

@@ -16,10 +16,15 @@ and measures, per scenario, from /proc and the daemon's own status over its Unix
   sessions   ~--sessions-mb of synthetic Claude Code session files (realistic record shapes, big
              tool results the parser skips): time and CPU to index them from an empty database,
              peak RSS, a restart (checkpoints: nothing re-parsed) and an append.
+  ignore     the worst case the ignore-file limits allow: --ignore-projects projects, each with a
+             `.gitignore` of --ignore-rules rules that need a regular expression (more projects
+             than the limit across projects admits): RSS and peak RSS after the first scan, which
+             files were skipped, and the peak while every project is walked again next to the
+             rules it already holds (a watch budget of 1, so every project is polled).
 
 Usage (build first: cargo build --release --bins):
   scripts/bench.py --bin target/release [--projects 500] [--idle 600] [--sessions-mb 500]
-                   [--only projects,burst,exhaustion,sessions] [--keep]
+                   [--only projects,burst,exhaustion,sessions,ignore] [--keep]
 Prints a JSON document with every measurement and the host description. Standard library only.
 """
 
@@ -508,6 +513,56 @@ def scenario_sessions(args, base, results):
         shutil.rmtree(env.root, ignore_errors=True)
 
 
+def scenario_ignore(args, base, results):
+    n, rules = args.ignore_projects, args.ignore_rules
+    env = Env(args.bin, os.path.join(base, "ignore"), 0)
+    for i in range(n):
+        p = os.path.join(env.home, "rules", f"proj-{i:02}")
+        os.makedirs(os.path.join(p, ".git"))  # a work tree: `.gitignore` applies
+        with open(os.path.join(p, "CLAUDE.md"), "w") as f:
+            f.write("# synthetic\n")
+        with open(os.path.join(p, ".gitignore"), "w") as f:
+            # Every rule needs a regular expression (the expensive kind); all are different.
+            f.writelines(f"*{i}x{k}?b[c-d]*.x\n" for k in range(rules))
+    r = {"projects": n, "rules_per_project": rules}
+
+    def measure(d, prefix):
+        st = d.status()["monitoring"]
+        mem = memory_kib(d.pid)
+        r[prefix + "ignore_files_skipped"] = st["ignore_files_skipped"]
+        r[prefix + "rules_kept"] = (n - st["ignore_files_skipped"]) * rules
+        r[prefix + "rss_mib"] = round(mem["VmRSS"] / 1024, 1)
+        r[prefix + "peak_rss_mib"] = round(mem["VmHWM"] / 1024, 1)
+        r[prefix + "polled_projects"] = st["polled_projects"]
+
+    # Every project watched: the rules are compiled once and kept.
+    d = Daemon(env)
+    d.wait_scans(1)
+    r["first_scan_s"] = round(time.monotonic() - d.started, 2)
+    wait_quiet(d.pid)
+    own, children = cpu_seconds(d.pid)
+    r["cpu_s"] = round(own + children, 2)
+    measure(d, "")
+    code, _ = d.stop()
+    r["exit_code"] = code
+
+    # Every project polled (no watch left for them): each reconciliation walks every project
+    # again, and the new rules exist next to the old ones until they replace them.
+    env.write_config("[watch]\nbudget = 1\n")
+    d = Daemon(env)
+    d.wait_scans(1)
+    wait_quiet(d.pid)
+    r["polled_refresh_s"] = [round(d.refresh(), 2) for _ in range(2)]
+    wait_quiet(d.pid)
+    measure(d, "polled_")
+    code, _ = d.stop()
+    r["polled_exit_code"] = code
+    log("ignore:", r)
+    results["ignore"] = r
+    if not args.keep:
+        shutil.rmtree(env.root, ignore_errors=True)
+
+
 def host():
     def first(path, key, sep=":"):
         try:
@@ -543,7 +598,9 @@ def main():
     p.add_argument("--idle", type=int, default=600, help="idle CPU window in seconds (0: skip)")
     p.add_argument("--budget", type=int, default=1000, help="watch budget for the exhaustion scenario")
     p.add_argument("--sessions-mb", type=int, default=500)
-    p.add_argument("--only", default="projects,burst,exhaustion,sessions")
+    p.add_argument("--ignore-projects", type=int, default=6, help="projects of the ignore scenario")
+    p.add_argument("--ignore-rules", type=int, default=5000, help="ignore rules per project (ignore scenario)")
+    p.add_argument("--only", default="projects,burst,exhaustion,sessions,ignore")
     p.add_argument("--keep", action="store_true", help="keep the synthetic environments")
     ARGS = p.parse_args()
     ARGS.only = set(ARGS.only.split(","))
@@ -558,6 +615,8 @@ def main():
         scenario_exhaustion(ARGS, base, results)
     if "sessions" in ARGS.only:
         scenario_sessions(ARGS, base, results)
+    if "ignore" in ARGS.only:
+        scenario_ignore(ARGS, base, results)
     results["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     if not ARGS.keep:
         shutil.rmtree(base, ignore_errors=True)

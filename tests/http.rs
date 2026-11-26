@@ -1443,6 +1443,64 @@ mod sockets {
         srv.stop().await;
     }
 
+    /// v0.1.0 review I3: once a revocation is signalled, no event is forwarded before the 4401
+    /// close, even when an event is waiting at the same moment. This test's runtime has one
+    /// thread and nothing is awaited between the sign-out's signal and the event, so the socket's
+    /// task finds both ready at once, every time; a select without an order then forwards the
+    /// event first in about half of the rounds.
+    #[tokio::test]
+    async fn an_event_waiting_at_the_moment_of_a_revocation_is_not_forwarded() {
+        let srv = serve(own(), 8, Duration::from_secs(5)).await;
+        for round in 0..16 {
+            let token = srv._env.login().await;
+            let c = authed(&srv, &token).await;
+            srv._env.service.auth_logout(&token).await.unwrap();
+            srv._env
+                .service
+                .hub
+                .send(&serde_json::json!({"type": "after-the-revocation"}));
+            let (_c, f) = recv(c, 5).await;
+            assert_eq!(f, Some(Frame::Close(Some(4401))), "round {round}");
+        }
+        srv.stop().await;
+    }
+
+    /// v0.1.0 review I3: a client that stops reading cannot keep its socket (and with it a
+    /// revoked token's subscription) open: the send that blocks on it is given up after
+    /// `SEND_TIMEOUT` and the session ends. Without the limit the session stays blocked in that
+    /// send for as long as the client keeps the connection, and never looks at its token again.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_disconnected_after_the_send_timeout() {
+        use cc_workspace_manager::http::ws::SEND_TIMEOUT;
+        let srv = serve(own(), 8, Duration::from_secs(5)).await;
+        let hub = srv._env.service.hub.clone();
+        let token = srv._env.login().await;
+        let idle = hub.clients();
+        // Held open and never read again.
+        let stalled = authed(&srv, &token).await;
+        assert_eq!(hub.clients(), idle + 1);
+        // 24 MiB, more than the socket buffers of a loopback connection can hold (and fewer
+        // messages than the hub keeps for a slow client): a send to this client must block.
+        let big = serde_json::json!({"type": "filler", "data": "x".repeat(1 << 20)});
+        for _ in 0..24 {
+            hub.send(&big);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Signed out while that send is blocked: the session must end, although nothing can be
+        // delivered to the client (not even the close frame).
+        srv._env.service.auth_logout(&token).await.unwrap();
+        let signed_out = std::time::Instant::now();
+        while hub.clients() > idle {
+            assert!(
+                signed_out.elapsed() < SEND_TIMEOUT + Duration::from_secs(10),
+                "the session of a client that does not read was never given up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(stalled);
+        srv.stop().await;
+    }
+
     #[tokio::test]
     async fn expired_rotated_out_and_overdue_tokens_close_websockets_on_revalidation() {
         use cc_workspace_manager::auth::sessions::{

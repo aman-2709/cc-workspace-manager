@@ -3,6 +3,62 @@
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-11-26
+
+A maintenance release: no new features. Tested on the same environment as 0.1.0 (Linux x86_64, Ubuntu
+24.04, kernel 7.0, systemd 255, Git 2.43.0).
+
+### Changed
+- **Session titles are shown as quotations.** On cards and in table rows the latest session's title is
+  now in quotation marks and italics, and its tooltip (and the text for screen readers) says "Session
+  title". The title is text Claude Code recorded: one worded like a status ("Resuming the session…") could
+  be read as the state of the project.
+- **The systemd unit has a memory limit**: `MemoryMax=2G` with `MemorySwapMax=0`, for the daemon and its
+  `git` and `claude` children together. ccwm normally needs 20–30 MiB; at the limit the kernel stops the
+  service and systemd starts it again. `MemorySwapMax=0` is part of it because, with swap, `MemoryMax=`
+  alone only moves the excess to swap. Run `scripts/install.sh` (or `ccwm service install`) to get the
+  new unit; change the limit with a drop-in (`systemctl --user edit ccwm`, see docs/service.md).
+- **Ignore rules are limited across projects too**: 20,000 rules for all projects together, next to the
+  limits per file and per project. Beyond it a project's ignore files are skipped and counted, as before
+  (`ccwm status`); the projects walked first keep their rules.
+- **The Settings page refuses more.** A discovery root that is `/` or a folder containing your home
+  folder, and your home folder itself as the session directory, can no longer be saved from the browser
+  (symlinks are resolved first). Edit `config.toml` if you really want such a root.
+
+### Fixed
+- A WebSocket client that stopped reading could keep its session, and the check of its token, blocked
+  for as long as it liked; and one event could still be sent after a sign-out was signalled. A
+  revocation now comes first, and a client that does not take a message within 5 s is disconnected.
+- The truncation of the write-ahead log after session data is deleted could fail silently when a reader
+  was using the log. The result is now checked, logged, and the truncation repeated after the next
+  write until it succeeds.
+- With more than 100,000 session files, the sessions beyond that number were removed from the index as
+  if their files were gone. A listing that was cut off no longer removes anything.
+
+### Tests
+- Purge with ccwm's directories inside the home folder next to other applications' data; purge refused
+  while a daemon holds the lock; canaries for privacy fields that no test could fail on; every directive
+  of the unit pinned; `same_file_system` in both walks; the symlink-swap race now requires that a swap
+  raced; redaction before truncation; the release archive (`package-release.sh`, `sha256sum -c`, install
+  from the extracted archive).
+- In CI, the pseudo-terminal paste test, the JavaScript tests and the `systemd-analyze` check fail instead
+  of skipping when their tool is missing, and the Landlock assertions that depend on the kernel's ABI are
+  required (`CCWM_REQUIRE_LANDLOCK_ABI`).
+- Every test that writes a script and runs it at once lets a child shell write it (no more "text file
+  busy").
+
+### Known limitations
+- The limit on ignore rules bounds what ccwm keeps (measured: at most 344–395 MiB, with 20,000 rules that
+  all need a regular expression). Projects without watches are walked again at every scan, and the new
+  rules exist next to the old ones for a moment: the release binary peaked at 775 MiB. **A build from
+  source against glibc does not return that memory** and grew to 1.66 GiB over four scans. In that case
+  the unit's memory limit is what stops it; a daemon started by hand has no such limit. See
+  docs/benchmarks.md.
+- The memory limit needs the cgroup memory controller for your user manager (present on Ubuntu 24.04).
+- Not run: CI on this version, the release workflow, a fresh-account install from the archive.
+- Everything listed under 0.1.0 still applies, except "the ignore-file limits apply per project, not
+  across projects".
+
 ## [0.1.0] — 2026-11-25
 
 The first release. CC Workspace Manager (`ccwm`) is an independent, unofficial project, not affiliated

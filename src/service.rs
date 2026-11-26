@@ -787,9 +787,11 @@ impl Service {
         self.settings(privacy).await
     }
 
-    /// Values a browser may not set even though `config.toml` may hold them: port 0 (tests only)
-    /// and a session directory that is `/` or an ancestor of home (a Landlock read rule over
-    /// everything at the next start).
+    /// Values a browser may not set even though `config.toml` may hold them: port 0 (tests only);
+    /// a discovery root that is `/` or a folder that contains home (a Landlock read rule over
+    /// everything at the next start); and a session directory that is one of those or home itself
+    /// (the session directory is a hard boundary: as home, it would shut discovery out of the
+    /// default root). v0.1.0 review I6 added the root check and home as a session directory.
     fn check_patch_values(&self, patch: &serde_json::Value) -> Result<(), ApiError> {
         if let Some(port) = patch.pointer("/server/port") {
             if port.as_u64().is_none_or(|p| !(1024..=65535).contains(&p)) {
@@ -799,29 +801,28 @@ impl Service {
             }
         }
         if let Some(dir) = patch.pointer("/sessions/dir").and_then(|d| d.as_str()) {
-            let p = Path::new(dir);
-            let plain = p.is_absolute()
-                && p.components().all(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::RootDir | std::path::Component::Normal(_)
-                    )
-                });
-            if !plain {
+            let canonical = settable_path("sessions.dir", dir)?;
+            if canonical == self.home || self.contains_home(&canonical) {
                 return Err(ApiError::invalid(
-                    "sessions.dir must be an absolute path without `.` or `..`",
+                    "sessions.dir must not be /, your home folder or a folder that contains it",
                 ));
             }
-            let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            if canonical == Path::new("/")
-                || (self.home.starts_with(&canonical) && canonical != self.home)
-            {
+        }
+        let roots = patch.pointer("/discovery/roots").and_then(|r| r.as_array());
+        for root in roots.into_iter().flatten().filter_map(|r| r.as_str()) {
+            if self.contains_home(&settable_path("discovery.roots", root)?) {
                 return Err(ApiError::invalid(
-                    "sessions.dir must not be / or a folder that contains your home folder",
+                    "discovery.roots must not contain / or a folder that contains your home folder (your home folder itself is fine); such a root can only be set in config.toml",
                 ));
             }
         }
         Ok(())
+    }
+
+    /// `/` or a strict ancestor of the home directory: what the sandbox report calls a broad
+    /// read rule.
+    fn contains_home(&self, canonical: &Path) -> bool {
+        !crate::sandbox::broad_read_rules(&[canonical.to_path_buf()], &self.home).is_empty()
     }
 
     async fn apply_live(&self, old: &Config, new: &Config) -> Result<(), ApiError> {
@@ -1158,6 +1159,22 @@ fn strip(v: &mut serde_json::Value, arrays: &[&str], key: &str) {
             }
         }
     }
+}
+
+/// A path value of `PUT /settings` (`key` names it in the error): absolute and without `.` or
+/// `..`, with symlinks resolved when it exists, so that a link to `/` is judged as `/`.
+fn settable_path(key: &str, value: &str) -> Result<PathBuf, ApiError> {
+    use std::path::Component;
+    let p = Path::new(value);
+    let plain = p.is_absolute()
+        && p.components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    if !plain {
+        return Err(ApiError::invalid(format!(
+            "{key} must be an absolute path without `.` or `..`"
+        )));
+    }
+    Ok(std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
 }
 
 /// Deep-merge the JSON object `patch` into `base` (objects merge, everything else replaces).

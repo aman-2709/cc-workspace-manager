@@ -355,6 +355,25 @@ mod tests {
         assert_eq!((short.text.as_str(), short.truncated), ("hello", false));
     }
 
+    /// The order matters when a secret lies across the cut: cut first, and what is left of the
+    /// token is too short for any rule and stays readable (the control shows exactly that).
+    #[test]
+    fn a_secret_across_the_truncation_point_is_redacted_not_cut_in_half() {
+        let token = format!("ghp_{}", "A1b2C3d4".repeat(5));
+        let before = "x ".repeat((MAX_CHARS - 10) / 2); // ten characters of the token fit
+        let text = format!("{before}{token} and more");
+        let cut_first: String = text.chars().take(MAX_CHARS).collect();
+        assert!(
+            redact(&cut_first).ends_with("ghp_A1b2C3"),
+            "control: truncating first leaves the start of the token unredacted"
+        );
+        let p = finish(&text, None);
+        assert!(p.truncated);
+        assert_eq!(p.text.chars().count(), MAX_CHARS);
+        assert!(!p.text.contains("ghp_"), "half a token is shown");
+        assert!(p.text.ends_with("[REDACTED]"), "{:?}", &p.text[1980..]);
+    }
+
     #[test]
     fn complete_lines_drop_partial_first_and_last_lines() {
         let b = b"tail of a line\n{\"a\":1}\n\n{\"b\":2}\n{\"partial";

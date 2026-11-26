@@ -40,6 +40,19 @@ const ENV_ROOT: &str = "CCWM_SANDBOX_CHILD_ROOT";
 const ENV_PORTS: &str = "CCWM_SANDBOX_CHILD_PORTS"; // "<listener port>,<allowed bind port>"
 const ENV_ABSTRACT: &str = "CCWM_SANDBOX_CHILD_ABSTRACT";
 const REQUIRE: &str = "CCWM_REQUIRE_LANDLOCK";
+/// The Landlock ABI the kernel is known to have (CI sets it from its own probe of the kernel):
+/// the assertions that need an ABI up to it must run, not skip.
+const REQUIRE_ABI: &str = "CCWM_REQUIRE_LANDLOCK_ABI";
+
+/// [`REQUIRE_ABI`] as a number; 0 when it is not set (nothing is required).
+fn required_abi() -> u64 {
+    match std::env::var(REQUIRE_ABI) {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("{REQUIRE_ABI}={v:?} is not a number")),
+        Err(_) => 0,
+    }
+}
 
 // ---- probe helpers ------------------------------------------------------------------------------
 
@@ -646,6 +659,11 @@ fn landlock_confines_the_process_threads_and_children() {
         want("tcp_bind_other_port", "EACCES");
         want("grandchild_tcp_connect", "EACCES");
     } else {
+        assert!(
+            required_abi() < 4,
+            "{REQUIRE_ABI}={} but the network rules (ABI 4) are not active: {r}",
+            required_abi()
+        );
         eprintln!(
             "NOTICE: Landlock network rules unavailable (ABI < 4); skipping network assertions"
         );
@@ -654,6 +672,11 @@ fn landlock_confines_the_process_threads_and_children() {
         want("abstract_unix_connect", "EPERM");
         want("signal_parent", "EPERM");
     } else {
+        assert!(
+            required_abi() < 6,
+            "{REQUIRE_ABI}={} but the scopes (ABI 6) are not active: {r}",
+            required_abi()
+        );
         eprintln!("NOTICE: Landlock scopes unavailable (ABI < 6); skipping scope assertions");
         want("abstract_unix_connect", "ok");
     }
@@ -771,6 +794,21 @@ fn child_processes_do_not_inherit_session_ipc_variables() {
     std::env::set_var("DBUS_EXTRA_THING", "x");
     std::env::set_var("SSH_AUTH_SOCK", "/nonexistent/agent");
     std::env::set_var("CCWM_KEEP_ME", "kept");
+    // Set here, whatever the machine has: where it is unset (CI, a shell without a login
+    // session) the check below would otherwise pass without the variable ever being dropped.
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    std::env::set_var("XDG_RUNTIME_DIR", "/nonexistent/runtime-dir");
+    // Control: a plain child does inherit every one of them.
+    let plain = std::process::Command::new("/usr/bin/env").output().unwrap();
+    let plain = String::from_utf8_lossy(&plain.stdout);
+    for set in [
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/bus",
+        "DBUS_EXTRA_THING=x",
+        "SSH_AUTH_SOCK=/nonexistent/agent",
+        "XDG_RUNTIME_DIR=/nonexistent/runtime-dir",
+    ] {
+        assert!(plain.lines().any(|l| l == set), "control: {set} not set");
+    }
     let out = sandbox::child_command("/usr/bin/env").output().unwrap();
     let env = String::from_utf8_lossy(&out.stdout);
     for gone in [
@@ -792,6 +830,10 @@ fn child_processes_do_not_inherit_session_ipc_variables() {
         "CCWM_KEEP_ME",
     ] {
         std::env::remove_var(k);
+    }
+    match runtime_dir {
+        Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+        None => std::env::remove_var("XDG_RUNTIME_DIR"),
     }
 }
 

@@ -207,8 +207,13 @@ mod tests {
     /// Feed each of `pastes` to one interactive `bash` (5.x, readline) through a pseudo-terminal,
     /// as a paste from the clipboard would, pressing Enter after each, then exit. `bracketed`: readline's
     /// bracketed-paste mode, with the text wrapped in `ESC[200~ … ESC[201~` as a terminal sends
-    /// it. Returns `false` if python3 or bash are unavailable.
-    fn paste_into_bash(pastes: &[String], bracketed: bool, path_dir: &std::path::Path) -> bool {
+    /// it. `None` if python3 or bash is not installed (nothing was run); otherwise whether the
+    /// driver ran to its end.
+    fn paste_into_bash(
+        pastes: &[String],
+        bracketed: bool,
+        path_dir: &std::path::Path,
+    ) -> Option<bool> {
         const DRIVER: &str = r#"
 import os, pty, select, sys, time
 pastes = sys.stdin.buffer.read().split(b"\0")
@@ -247,9 +252,9 @@ os.waitpid(pid, 0)
 "#;
         use std::io::Write;
         if !std::path::Path::new("/bin/bash").exists() {
-            return false;
+            return None;
         }
-        let Ok(mut child) = Command::new("python3")
+        let spawned = Command::new("python3")
             .arg("-I")
             .arg("-c")
             .arg(DRIVER)
@@ -260,9 +265,11 @@ os.waitpid(pid, 0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
-        else {
-            return false;
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => panic!("cannot start python3: {e}"),
         };
         let input = pastes.join("\0");
         child
@@ -271,7 +278,7 @@ os.waitpid(pid, 0)
             .unwrap()
             .write_all(input.as_bytes())
             .unwrap();
-        child.wait().unwrap().success()
+        Some(child.wait().unwrap().success())
     }
 
     /// Regression test for M3 review M1, with a real line editor: pasting the old command for a
@@ -296,10 +303,17 @@ os.waitpid(pid, 0)
             let sentinel = t.path().join(format!("control-{bracketed}"));
             let cwd = format!("/home/u/x{marker}\u{15}touch {}\n", sentinel.display());
             let old = format!("cd -- {} && claude --resume {ID}", shell_quote(&cwd));
-            if !paste_into_bash(&[old], bracketed, t.path()) {
+            // Skipped only where the tools are missing, and never in CI (v0.1.0 review,
+            // test-coverage gap 7); a driver that fails is a failure, not a skip.
+            let Some(ran) = paste_into_bash(&[old], bracketed, t.path()) else {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "python3 and bash are required in CI (the pty paste test)"
+                );
                 eprintln!("NOTICE: python3 or bash missing; skipping the pty paste test");
                 return;
-            }
+            };
+            assert!(ran, "the pty driver failed (bracketed = {bracketed})");
             assert!(
                 sentinel.exists(),
                 "control run (bracketed = {bracketed}) did not execute: the harness is blind"
@@ -318,7 +332,7 @@ os.waitpid(pid, 0)
                 .map(|p| command(p, ID).unwrap())
                 .collect();
             pastes.push(format!("touch {}", shell_quote(&alive.to_string_lossy())));
-            assert!(paste_into_bash(&pastes, bracketed, t.path()));
+            assert_eq!(paste_into_bash(&pastes, bracketed, t.path()), Some(true));
             assert!(
                 alive.exists(),
                 "bash did not run the final paste (bracketed = {bracketed})"

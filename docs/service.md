@@ -9,8 +9,8 @@ From a release archive (`ccwm-<version>-x86_64-unknown-linux-musl.tar.gz`):
 
 ```bash
 sha256sum -c SHA256SUMS            # both files from the release page, in the same folder
-tar -xzf ccwm-0.1.0-x86_64-unknown-linux-musl.tar.gz
-cd ccwm-0.1.0-x86_64-unknown-linux-musl
+tar -xzf ccwm-0.1.1-x86_64-unknown-linux-musl.tar.gz
+cd ccwm-0.1.1-x86_64-unknown-linux-musl
 scripts/install.sh                 # copies ./ccwm to ~/.local/bin, installs and starts the unit
 ccwm open                          # sign in in your browser
 ```
@@ -99,6 +99,8 @@ Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=10 11
 TimeoutStopSec=10
+MemoryMax=2G
+MemorySwapMax=0
 UMask=0077
 Nice=10
 IOSchedulingClass=idle
@@ -124,6 +126,23 @@ Notes:
   ```
   Drop-ins survive a reinstall. `ccwm doctor` tells you when the daemon cannot find `claude` but your
   shell can.
+- **`MemoryMax=2G` and `MemorySwapMax=0`** (since 0.1.1): the most memory the daemon and its `git` and
+  `claude` children may use together, with no swap on top. It is a backstop, not a working size: ccwm
+  normally needs 20–30 MiB, and the worst case its own limits allow was measured at 775 MiB with the release
+  binary ([benchmarks.md](benchmarks.md#ignore-rules-at-their-limits)). If the limit is ever reached, the
+  kernel stops the service and systemd starts it again after 5 s
+  ([troubleshooting.md](troubleshooting.md#the-service-keeps-restarting-out-of-memory)). `MemorySwapMax=0`
+  belongs to it: on a machine with swap, `MemoryMax=` alone does not stop anything, it only moves the excess
+  to swap. To use another limit, add a drop-in with `systemctl --user edit ccwm`:
+  ```ini
+  [Service]
+  MemoryMax=512M
+  ```
+  (`MemoryMax=infinity` removes the limit.) Then `ccwm restart`. Check what applies with
+  `systemctl --user show ccwm -p MemoryMax -p MemorySwapMax`. The limit needs the cgroup **memory
+  controller** for your user manager: `cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers`
+  must list `memory` (it does on Ubuntu 24.04). Without it, systemd accepts the directives and they do
+  nothing. A daemon started by hand (`ccwm serve`) has no such limit.
 - **What is not used, and why.** `ProtectSystem=`, `ProtectHome=` and `PrivateTmp=` make systemd run a
   *user* service inside a user namespace. There, root-owned paths such as `/` and `/home` appear to be
   owned by `nobody` (uid 65534). ccwm refuses to trust directories other users could own, so it would not
@@ -135,7 +154,11 @@ Notes:
 ## Tested
 
 The unit's directives were run with the real daemon, in a synthetic environment, as a transient user unit
-on Ubuntu 24.04 with systemd 255. `systemd-analyze --user verify` accepts the generated unit. The scripts and
+on Ubuntu 24.04 with systemd 255. `systemd-analyze --user verify` accepts the generated unit. For the memory
+limit (0.1.1), with the static release binary: the unit's cgroup shows `memory.max = 2147483648` and
+`memory.swap.max = 0`; the daemon runs fully sandboxed under them and stops cleanly; with the limit lowered
+to 200M and content that needs about 390 MiB, the unit ends with `oom-kill` and is restarted every few
+seconds, and with 2G the same content runs at 384 MiB with no swap in use. The scripts and
 the service commands are tested end to end with a stand-in `systemctl` (`tests/service.rs`). Installing
 from the release archive on a fresh account, and starting at boot with lingering, are manual steps in
 [release-checklist.md](release-checklist.md). They have not been run yet.

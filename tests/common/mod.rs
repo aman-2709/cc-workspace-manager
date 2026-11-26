@@ -30,24 +30,22 @@ pub fn tempdir() -> tempfile::TempDir {
     t
 }
 
-/// Write an executable script **without this process ever holding it open for writing**. A
-/// child that another test thread forks inherits every open descriptor until it execs, and
-/// executing a file that any process still has open for writing fails with `ETXTBSY` ("text file
-/// busy"): a script written with `fs::write` and run right away then fails now and then (seen as
-/// `GitMissing` for a stand-in `git`). A shell writes the file instead and has exited when this
-/// returns.
+/// Coverage is skipped because this machine lacks something: print the notice (CI copies every
+/// `NOTICE:` line to the job summary) — except in CI (`CI` is set), where it is a failure: a
+/// runner that silently lost a tool would otherwise pass with less tested (v0.1.0 review,
+/// test-coverage gap 7).
+pub fn skipped_coverage(what: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{what}: this coverage is required in CI"
+    );
+    eprintln!("NOTICE: {what}");
+}
+
+/// An executable script written so that it can be run at once (no `ETXTBSY`): see
+/// [`cc_workspace_manager::synth::write_executable`].
 pub fn write_executable(path: &Path, content: &str) {
-    use std::io::Write;
-    let mut sh = std::process::Command::new("/bin/sh")
-        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
-        .arg(path)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = sh.stdin.take().unwrap();
-    stdin.write_all(content.as_bytes()).unwrap();
-    drop(stdin);
-    assert!(sh.wait().unwrap().success(), "writing {}", path.display());
+    cc_workspace_manager::synth::write_executable(path, content).unwrap();
 }
 
 /// Send `request` on a connection the server is expected to **drop without answering**, and
@@ -181,6 +179,9 @@ pub async fn env() -> Env {
 pub async fn env_with_sandbox(sandbox: SandboxReport) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.db");
+    // The folder's name is a canary: privacy mode must never send the configuration path.
+    let config_path = dir.path().join("CANARY-CONFIG-DIR").join("config.toml");
+    fs::create_dir(config_path.parent().unwrap()).unwrap();
     let clock = Arc::new(FakeClock::new(START));
     let writer = Arc::new(Writer::spawn(&db).unwrap());
     let reader = Reader::open(&db, 2).unwrap();
@@ -198,7 +199,7 @@ pub async fn env_with_sandbox(sandbox: SandboxReport) -> Env {
         notifier,
         tracker: None,
         config: cc_workspace_manager::config::Config::default(),
-        config_path: Some(dir.path().join("config.toml")),
+        config_path: Some(config_path.clone()),
         session_dir: std::path::PathBuf::from(HOME).join(".claude"),
         roots: vec![std::path::PathBuf::from(HOME)],
         claude: None,
@@ -210,7 +211,7 @@ pub async fn env_with_sandbox(sandbox: SandboxReport) -> Env {
         clock,
         writer,
         router,
-        config_path: dir.path().join("config.toml"),
+        config_path,
         db,
         _dir: dir,
     }

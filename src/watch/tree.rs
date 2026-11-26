@@ -12,11 +12,11 @@ use crate::discovery::dirfd::{DirHandle, Identity, Kind};
 use crate::discovery::exclusions::Exclusions;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::Match;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Directory entries examined per project walk (larger trees are truncated and reported).
 pub const MAX_ENTRIES: usize = 100_000;
@@ -33,6 +33,101 @@ pub const MAX_GITIGNORE_TOTAL_BYTES: u64 = 1024 * 1024;
 /// 1 MiB of memory per KiB of file. 5,000 such rules are about 75 MiB and 1.2 s; literal rules
 /// cost almost nothing.
 pub const MAX_GITIGNORE_PATTERNS: usize = 5_000;
+/// All ignore rules of **all** projects together ([`IgnoreBudget`]). The limits above bound one
+/// project, and a directory tree chooses how many projects it holds (each needs only a marker):
+/// without this limit, memory grew with their number. A file that would take the daemon past it
+/// is skipped and counted like any other, whichever project it belongs to; projects walked
+/// earlier keep their rules. At about 15 KiB per rule that needs a regular expression this is
+/// about 300 MiB in the worst case (measured: docs/benchmarks.md); ordinary rules cost a small
+/// fraction of that.
+pub const MAX_GITIGNORE_PATTERNS_TOTAL: usize = 20_000;
+
+/// How many ignore rules each project keeps, so that all projects together stay within a limit
+/// ([`MAX_GITIGNORE_PATTERNS_TOTAL`]). Shared by everything that walks project trees.
+///
+/// A full walk of a project [`reserve`](Self::reserve)s what the project may keep at most,
+/// walks, and then [`settle`](Self::settle)s for what it kept. The reservation is what makes the
+/// limit hold when two projects are walked at the same time: the second one sees the first one's
+/// reservation, not its still-empty result. The count is of rules kept for later (a project's
+/// rules stay in memory while it is tracked); rules of a walk in progress that replace a
+/// project's current ones exist next to them until the walk's result is taken over.
+#[derive(Debug)]
+pub struct IgnoreBudget {
+    limit: usize,
+    /// Project root -> the rules it keeps (during its full walk: may keep).
+    kept: Mutex<HashMap<PathBuf, usize>>,
+}
+
+impl Default for IgnoreBudget {
+    fn default() -> Self {
+        Self::new(MAX_GITIGNORE_PATTERNS_TOTAL)
+    }
+}
+
+impl IgnoreBudget {
+    /// A budget of `limit` rules for all projects together.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            kept: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut HashMap<PathBuf, usize>) -> T) -> T {
+        // A panic while the lock was held leaves numbers that are still usable.
+        f(&mut self.kept.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn room_in(&self, kept: &HashMap<PathBuf, usize>, root: &Path) -> usize {
+        let others: usize = kept
+            .iter()
+            .filter(|(r, _)| r.as_path() != root)
+            .map(|(_, n)| n)
+            .sum();
+        MAX_GITIGNORE_PATTERNS.min(self.limit.saturating_sub(others))
+    }
+
+    /// The rules project `root` may hold: what the other projects leave of the limit, at most
+    /// [`MAX_GITIGNORE_PATTERNS`]. For a walk that keeps nothing (a subtree walk, which starts
+    /// from the project's rules).
+    pub fn room(&self, root: &Path) -> usize {
+        self.with(|kept| self.room_in(kept, root))
+    }
+
+    /// Start a full walk of project `root`: [`room`](Self::room), reserved for `root` until
+    /// [`settle`](Self::settle) (the project's previous count no longer applies: a full walk
+    /// replaces its rules).
+    pub fn reserve(&self, root: &Path) -> usize {
+        self.with(|kept| {
+            let room = self.room_in(kept, root);
+            Self::set(kept, root, room);
+            room
+        })
+    }
+
+    /// The full walk of `root` kept `rules` rules (0: the project has none, or the walk failed).
+    pub fn settle(&self, root: &Path, rules: usize) {
+        self.with(|kept| Self::set(kept, root, rules));
+    }
+
+    fn set(kept: &mut HashMap<PathBuf, usize>, root: &Path, rules: usize) {
+        if rules == 0 {
+            kept.remove(root);
+        } else {
+            kept.insert(root.to_path_buf(), rules);
+        }
+    }
+
+    /// Forget the projects whose root `keep` rejects (no longer tracked).
+    pub fn retain(&self, keep: impl Fn(&Path) -> bool) {
+        self.with(|kept| kept.retain(|root, _| keep(root)));
+    }
+
+    /// Rules counted for all projects together (kept or reserved); never above the limit.
+    pub fn total(&self) -> usize {
+        self.with(|kept| kept.values().sum())
+    }
+}
 
 /// Gitignore rules of one project: `.git/info/exclude` of its repository (lowest priority), then
 /// `.gitignore` files from the repository's root down, deeper ones overriding shallower ones.
@@ -105,13 +200,25 @@ impl GitIgnore {
         }
     }
 
+    /// Number of rules in all layers.
+    pub fn patterns(&self) -> usize {
+        self.layers.iter().map(|l| l.patterns).sum()
+    }
+
     /// Read `name` through `handle` (the descriptor of the directory that holds it) as the
     /// `.gitignore` of `dir` (or its `info/exclude` when `exclude_file`) and add its rules.
     /// Returns `true` when the file was **skipped**: it is larger than [`MAX_GITIGNORE_BYTES`],
-    /// or it would take the project past [`MAX_GITIGNORE_TOTAL_BYTES`] or
-    /// [`MAX_GITIGNORE_PATTERNS`]. A skipped file is not read beyond the limit, nothing of it
-    /// is compiled, and none of its rules apply (not even its first ones).
-    fn load(&mut self, dir: &Path, exclude_file: bool, handle: &DirHandle, name: &str) -> bool {
+    /// or it would take the project past [`MAX_GITIGNORE_TOTAL_BYTES`] or past `max_patterns`
+    /// rules ([`TreeOptions::max_patterns`]). A skipped file is not read beyond the limit,
+    /// nothing of it is compiled, and none of its rules apply (not even its first ones).
+    fn load(
+        &mut self,
+        dir: &Path,
+        exclude_file: bool,
+        handle: &DirHandle,
+        name: &str,
+        max_patterns: usize,
+    ) -> bool {
         let rank = rank(dir, exclude_file);
         let replaces = |l: &Layer| l.dir == dir && l.rank == rank;
         // The layer this file replaces does not count against the project's totals.
@@ -131,7 +238,7 @@ impl GitIgnore {
             .filter(|line| !line.starts_with(b"#") && !line.trim_ascii().is_empty())
             .count();
         if u64::try_from(text.len()).unwrap_or(u64::MAX) > limit
-            || rule_lines > MAX_GITIGNORE_PATTERNS.saturating_sub(patterns)
+            || rule_lines > max_patterns.saturating_sub(patterns)
         {
             self.layers.retain(|l| !replaces(l));
             return true;
@@ -184,6 +291,9 @@ pub struct TreeOptions<'a> {
     /// File times after this are clamped to it (a future mtime must not pin a project on top).
     pub now: i64,
     pub max_entries: usize,
+    /// Ignore rules the project may hold: [`MAX_GITIGNORE_PATTERNS`], or less when the other
+    /// projects leave less of the limit across projects ([`IgnoreBudget`]).
+    pub max_patterns: usize,
 }
 
 #[derive(Debug)]
@@ -201,7 +311,8 @@ pub struct Tree {
     /// Directories that could not be opened (permission, vanished, swapped).
     pub unreadable: u64,
     /// `.gitignore` / `info/exclude` files skipped because of a limit ([`MAX_GITIGNORE_BYTES`],
-    /// [`MAX_GITIGNORE_TOTAL_BYTES`], [`MAX_GITIGNORE_PATTERNS`]): their rules do not apply.
+    /// [`MAX_GITIGNORE_TOTAL_BYTES`], [`MAX_GITIGNORE_PATTERNS`],
+    /// [`MAX_GITIGNORE_PATTERNS_TOTAL`]): their rules do not apply.
     pub ignore_files_skipped: u64,
 }
 
@@ -249,7 +360,8 @@ pub fn walk_from(
     let mut ignore = base.clone();
     if o.git_aware && start_depth == 0 {
         if let Some(repo) = o.repo_root.filter(|r| *r != root && root.starts_with(r)) {
-            tree.ignore_files_skipped += add_repository_layers(&mut ignore, repo, root);
+            tree.ignore_files_skipped +=
+                add_repository_layers(&mut ignore, repo, root, o.max_patterns);
         }
     }
     let mut entries_seen = 0usize;
@@ -278,11 +390,12 @@ pub fn walk_from(
         }
         if o.git_aware {
             if frame.depth == 0 && o.repo_root.is_none_or(|r| r == root) {
-                tree.ignore_files_skipped += load_info_exclude(&mut ignore, &frame.path, &dir);
+                tree.ignore_files_skipped +=
+                    load_info_exclude(&mut ignore, &frame.path, &dir, o.max_patterns);
             }
             if entries.iter().any(|e| e.name == ".gitignore") {
                 tree.ignore_files_skipped +=
-                    u64::from(ignore.load(&frame.path, false, &dir, ".gitignore"));
+                    u64::from(ignore.load(&frame.path, false, &dir, ".gitignore", o.max_patterns));
             }
         }
         let mut subdirs = Vec::new();
@@ -341,8 +454,13 @@ pub fn walk_from(
 /// Rules from a work tree's root above the project root: its `.git/info/exclude` and every
 /// `.gitignore` from `repo` down to (not including) `root`. Each directory is opened by path and
 /// read through its descriptor; one that cannot be read (e.g. outside the sandbox) is skipped.
-/// Returns how many files a size limit skipped.
-fn add_repository_layers(ignore: &mut GitIgnore, repo: &Path, root: &Path) -> u64 {
+/// Returns how many files a limit skipped.
+fn add_repository_layers(
+    ignore: &mut GitIgnore,
+    repo: &Path,
+    root: &Path,
+    max_patterns: usize,
+) -> u64 {
     let Ok(rel) = root.strip_prefix(repo) else {
         return 0;
     };
@@ -360,21 +478,26 @@ fn add_repository_layers(ignore: &mut GitIgnore, repo: &Path, root: &Path) -> u6
             continue;
         };
         if i == 0 {
-            skipped += load_info_exclude(ignore, d, &h);
+            skipped += load_info_exclude(ignore, d, &h, max_patterns);
         }
-        skipped += u64::from(ignore.load(d, false, &h, ".gitignore"));
+        skipped += u64::from(ignore.load(d, false, &h, ".gitignore", max_patterns));
     }
     skipped
 }
 
 /// `.git/info/exclude` of a repository rooted at `path` (`dir` is its descriptor), only when
-/// `.git` is a real directory. Returns 1 if a size limit skipped the file, else 0.
-fn load_info_exclude(ignore: &mut GitIgnore, path: &Path, dir: &DirHandle) -> u64 {
+/// `.git` is a real directory. Returns 1 if a limit skipped the file, else 0.
+fn load_info_exclude(
+    ignore: &mut GitIgnore,
+    path: &Path,
+    dir: &DirHandle,
+    max_patterns: usize,
+) -> u64 {
     let info = dir
         .open_child_dir(OsStr::new(".git"))
         .and_then(|git| git.open_child_dir(OsStr::new("info")));
     info.map_or(0, |info| {
-        u64::from(ignore.load(path, true, &info, "exclude"))
+        u64::from(ignore.load(path, true, &info, "exclude", max_patterns))
     })
 }
 
@@ -393,6 +516,7 @@ mod tests {
             repo_root: None,
             now: i64::MAX,
             max_entries: MAX_ENTRIES,
+            max_patterns: MAX_GITIGNORE_PATTERNS,
         }
     }
 
@@ -819,12 +943,120 @@ mod tests {
         let mut gi = GitIgnore::default();
         fs::write(r.join("d5/.gitignore"), &over).unwrap();
         let d5 = DirHandle::open_root(&r.join("d5")).unwrap();
-        assert!(gi.load(&r.join("d5"), false, &d5, ".gitignore"));
+        let limit = MAX_GITIGNORE_PATTERNS;
+        assert!(gi.load(&r.join("d5"), false, &d5, ".gitignore", limit));
         assert!(gi.is_empty());
         let last_line = over.trim_end().rfind('\n').unwrap();
         fs::write(r.join("d5/.gitignore"), &over[..=last_line]).unwrap();
-        assert!(!gi.load(&r.join("d5"), false, &d5, ".gitignore"));
+        assert!(!gi.load(&r.join("d5"), false, &d5, ".gitignore", limit));
         assert_eq!(gi.layers[0].patterns, MAX_GITIGNORE_PATTERNS);
+    }
+
+    /// The limit across projects reaches a walk as the number of rules the project may hold
+    /// (`max_patterns`): a file that does not fit in it is skipped whole and counted, exactly
+    /// like one over the project's own limit, and later files that do fit are still read.
+    #[test]
+    fn a_project_keeps_only_the_rules_the_limit_across_projects_leaves_it() {
+        let f = fx();
+        let r = &f.root;
+        fs::create_dir(r.join(".git")).unwrap();
+        for (dir, rules) in [("d0", 3), ("d1", 4), ("d2", 2), ("d3", 1)] {
+            fs::create_dir(r.join(dir)).unwrap();
+            let text: String = (0..rules).map(|i| format!("rule{i}\n")).collect();
+            fs::write(r.join(dir).join(".gitignore"), text).unwrap();
+        }
+        let none = HashSet::new();
+        let mut o = opts(&f.ex, &none, true);
+        o.max_patterns = 6;
+        let t = walk(r, &o).unwrap();
+        // d0 (3) fits, d1 (4) would make 7, d2 (2) makes 5, d3 (1) makes 6.
+        assert_eq!(t.ignore_files_skipped, 1);
+        assert_eq!(t.ignore.patterns(), 6);
+        assert!(t.ignore.is_ignored(&r.join("d0/rule0"), false));
+        assert!(!t.ignore.is_ignored(&r.join("d1/rule0"), false), "skipped");
+        assert!(t.ignore.is_ignored(&r.join("d2/rule0"), false));
+        // No room at all: every file is skipped, the walk itself is complete.
+        o.max_patterns = 0;
+        let t = walk(r, &o).unwrap();
+        assert_eq!((t.ignore_files_skipped, t.ignore.patterns()), (4, 0));
+        assert_eq!(t.dirs.len(), 5);
+        // A subtree walk starts from the project's rules: what they hold counts.
+        o.max_patterns = 6;
+        let full = walk(r, &o).unwrap();
+        fs::write(r.join("d1/.gitignore"), "one\n").unwrap();
+        let sub = walk_from(r, &r.join("d1"), &full.ignore, &o).unwrap();
+        assert_eq!(
+            sub.ignore_files_skipped, 1,
+            "6 kept already: no room for one more"
+        );
+        o.max_patterns = 7;
+        let sub = walk_from(r, &r.join("d1"), &full.ignore, &o).unwrap();
+        assert_eq!((sub.ignore_files_skipped, sub.ignore.patterns()), (0, 7));
+    }
+
+    #[test]
+    fn the_budget_gives_each_project_what_the_others_leave_of_the_limit() {
+        let (a, b, c) = (Path::new("/p/a"), Path::new("/p/b"), Path::new("/p/c"));
+        let budget = IgnoreBudget::new(10);
+        assert_eq!(budget.room(a), 10);
+        assert_eq!(budget.total(), 0, "asking reserves nothing");
+        // A full walk of `a` is in progress: its whole share is taken until it settles.
+        assert_eq!(budget.reserve(a), 10);
+        assert_eq!((budget.room(b), budget.reserve(b)), (0, 0));
+        budget.settle(a, 4);
+        budget.settle(b, 0);
+        assert_eq!((budget.room(b), budget.total()), (6, 4));
+        assert_eq!(budget.reserve(b), 6);
+        budget.settle(b, 6);
+        assert_eq!((budget.room(c), budget.total()), (0, 10));
+        // A project's own rules do not count against it: a full walk replaces them.
+        assert_eq!(budget.room(a), 4);
+        assert_eq!(budget.reserve(a), 4);
+        budget.settle(a, 1);
+        assert_eq!((budget.room(c), budget.total()), (3, 7));
+        // A project that is no longer tracked frees its share.
+        budget.retain(|root| root != b);
+        assert_eq!((budget.room(c), budget.total()), (9, 1));
+        // A walk that failed (or found no rules) keeps nothing.
+        assert_eq!(budget.reserve(c), 9);
+        budget.settle(c, 0);
+        assert_eq!(budget.total(), 1);
+    }
+
+    #[test]
+    fn the_budget_never_gives_one_project_more_than_the_project_limit() {
+        let budget = IgnoreBudget::default();
+        let a = Path::new("/p/a");
+        assert_eq!(budget.room(a), MAX_GITIGNORE_PATTERNS);
+        assert_eq!(budget.reserve(a), MAX_GITIGNORE_PATTERNS);
+        let fit = MAX_GITIGNORE_PATTERNS_TOTAL / MAX_GITIGNORE_PATTERNS;
+        for i in 1..fit {
+            let root = PathBuf::from(format!("/p/{i}"));
+            assert_eq!(budget.reserve(&root), MAX_GITIGNORE_PATTERNS);
+        }
+        let rest = MAX_GITIGNORE_PATTERNS_TOTAL - fit * MAX_GITIGNORE_PATTERNS;
+        assert_eq!(budget.reserve(Path::new("/p/last")), rest);
+        assert_eq!(budget.total(), MAX_GITIGNORE_PATTERNS_TOTAL);
+    }
+
+    /// Two projects walked at the same time cannot both take the last room: what was handed out
+    /// never exceeds the limit, whatever the interleaving.
+    #[test]
+    fn walks_at_the_same_time_cannot_take_more_than_the_limit_together() {
+        const LIMIT: usize = 12_000;
+        for _ in 0..50 {
+            let budget = Arc::new(IgnoreBudget::new(LIMIT));
+            let walkers: Vec<_> = (0..8)
+                .map(|i| {
+                    let budget = Arc::clone(&budget);
+                    std::thread::spawn(move || budget.reserve(Path::new(&format!("/p/{i}"))))
+                })
+                .collect();
+            let mut given: Vec<usize> = walkers.into_iter().map(|w| w.join().unwrap()).collect();
+            given.sort_unstable();
+            assert_eq!(given, [0, 0, 0, 0, 0, 2_000, 5_000, 5_000]);
+            assert_eq!(budget.total(), LIMIT);
+        }
     }
 
     /// A file that grew past the limit loses the rules read earlier: they no longer describe it.
