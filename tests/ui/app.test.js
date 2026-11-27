@@ -345,3 +345,96 @@ test("Missing only is its own server flag; the commit column shows a dash when t
   assert.match(resumeWarningText("continuation_other_project"), /another project/);
   assert.match(resumeWarningText("continuation_unassigned"), /outside every project/);
 });
+
+// ---- v0.2: the session activity indicator (REQUIREMENTS.md §21.8) ------------------------------
+const {
+  approvalLabel, liveCounts, liveDescriptor, sessionLive, liveFilterLabel, LIVE_FILTERS, APPROVAL_NOTE,
+} = require("../../web/app.js");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const one = (state, extra = {}) => ({ state, sessions: 1, needs_approval: 0, working: 0, waiting: 0, unknown: 0, [state]: 1, since: 1000, needs_approval_since: state === "needs_approval" ? 1000 : null, ...extra });
+
+test("each state has its class, its label and a tooltip that names it", () => {
+  const want = {
+    needs_approval: ["live live--needs-approval", "Needs approval", /needs approval since .*Claude Code does not report an approval/],
+    working: ["live live--working", "Working", /^Claude Code session: working since /],
+    waiting: ["live live--waiting", "Waiting for input", /^Claude Code session: waiting for input since /],
+    unknown: ["live live--unknown", "Session open", /^Claude Code session: state unknown since /],
+  };
+  for (const [state, [cls, label, title]] of Object.entries(want)) {
+    const d = liveDescriptor(one(state), 1030);
+    assert.strictEqual(d.cls, cls, state);
+    assert.strictEqual(d.label, label, state);
+    assert.match(d.title, title, state);
+  }
+  // No open session, or a state this page does not know: nothing.
+  assert.strictEqual(liveDescriptor(null, 0), null);
+  assert.strictEqual(liveDescriptor({ state: "dancing", sessions: 1 }, 0), null);
+  // Without a time, no "since".
+  assert.strictEqual(liveDescriptor(one("working", { since: null }), 0).title, "Claude Code session: working");
+});
+
+test("Needs approval counts whole minutes from the permission prompt", () => {
+  assert.strictEqual(approvalLabel(1000, 1000), "Needs approval");
+  assert.strictEqual(approvalLabel(1000, 1059), "Needs approval");
+  assert.strictEqual(approvalLabel(1000, 1060), "Needs approval · 1 min");
+  assert.strictEqual(approvalLabel(1000, 1000 + 59 * 60 + 59), "Needs approval · 59 min");
+  assert.strictEqual(approvalLabel(1000, 900), "Needs approval", "a clock behind the server's");
+  assert.strictEqual(approvalLabel(null, 5000), "Needs approval");
+  assert.strictEqual(liveDescriptor(one("needs_approval"), 1000 + 180).label, "Needs approval · 3 min");
+  assert.match(APPROVAL_NOTE, /approved that is still running shows here until it finishes/);
+});
+
+test("several sessions: the counts per state in the tooltip and the accessible name", () => {
+  const live = { state: "needs_approval", sessions: 3, needs_approval: 1, working: 1, waiting: 1, unknown: 0, since: null, needs_approval_since: 500 };
+  assert.strictEqual(liveCounts(live), "3 open sessions: 1 needs approval, 1 working, 1 waiting for input");
+  const d = liveDescriptor(live, 500 + 120);
+  assert.strictEqual(d.label, "Needs approval · 2 min");
+  assert.match(d.title, /^3 open sessions: 1 needs approval, 1 working, 1 waiting for input\. Claude Code does not report/);
+  assert.strictEqual(liveCounts({ sessions: 2, waiting: 1, unknown: 1 }), "2 open sessions: 1 waiting for input, 1 state unknown");
+  assert.doesNotMatch(liveDescriptor({ ...live, state: "working", needs_approval: 0, working: 2 }, 0).title, /does not report/);
+});
+
+test("a session's state in the detail panel is a one-session aggregate", () => {
+  assert.deepStrictEqual(sessionLive({ state: "working", since: 7 }), { state: "working", sessions: 1, working: 1, since: 7, needs_approval_since: null });
+  assert.strictEqual(sessionLive({ state: "needs_approval", since: 9 }).needs_approval_since, 9);
+  assert.strictEqual(sessionLive(null), null);
+  assert.strictEqual(sessionLive({ state: "?" }), null);
+});
+
+test("the three filters: their query value, their label with the count, the same in both views", () => {
+  assert.deepStrictEqual(LIVE_FILTERS.map(([v]) => v), ["waiting", "working", "open"]);
+  const stats = { live: { waiting_for_me: 2, working: 1, open: 3 } };
+  assert.strictEqual(liveFilterLabel("waiting", stats), "Waiting for me (2)");
+  assert.strictEqual(liveFilterLabel("working", stats), "Working (1)");
+  assert.strictEqual(liveFilterLabel("open", stats), "Open (3)");
+  assert.strictEqual(liveFilterLabel("open", null), "Open", "no count before the summary arrived");
+  assert.strictEqual(liveFilterLabel("bogus", stats), "");
+  for (const view of ["cards", "table"]) {
+    for (const [v] of LIVE_FILTERS) {
+      const q = new URLSearchParams(buildQuery(withView({ ...DEFAULT_QUERY, live: v }, view), 10, null, false));
+      assert.strictEqual(q.get("live"), v, `${v} in ${view}`);
+    }
+  }
+  assert.strictEqual(new URLSearchParams(buildQuery(DEFAULT_QUERY, 10)).has("live"), false);
+  assert.strictEqual(new URLSearchParams(buildQuery({ ...DEFAULT_QUERY, live: "<x>" }, 10)).has("live"), false, "only known values");
+});
+
+test("the Settings toggle for non-interactive sessions is sent only when it changed", () => {
+  const saved = { indicator: { show_noninteractive: false } };
+  assert.deepStrictEqual(changedSettings(settingsPatch({ show_noninteractive: true }), saved), { indicator: { show_noninteractive: true } });
+  assert.deepStrictEqual(changedSettings(settingsPatch({ show_noninteractive: false }), saved), {});
+  assert.deepStrictEqual(settingsPatch({}).indicator, {});
+});
+
+test("the stylesheet pulses only `working`, stops it under reduced motion, and the dot is decorative", () => {
+  const css = fs.readFileSync(path.join(__dirname, "../../web/app.css"), "utf8");
+  assert.match(css, /\.live--working \.live-dot \{[^}]*animation: live-pulse 2s ease-in-out infinite/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{\s*\.live--working \.live-dot \{ animation: none; \}/);
+  assert.doesNotMatch(css.replace(/\.live--working \.live-dot \{[^}]*\}/, ""), /live-pulse 2s/, "nothing else pulses");
+  assert.match(css, /\.live--unknown \.live-dot \{[^}]*border: 2px solid/, "unknown is a hollow ring");
+  assert.match(css, /\.col-live \{ width: [0-9.]+rem;/, "the Claude column has a width in rem");
+  const js = fs.readFileSync(path.join(__dirname, "../../web/app.js"), "utf8");
+  assert.match(js, /h\("span", \{ class: "live-dot", "aria-hidden": "true" \}\)/);
+});

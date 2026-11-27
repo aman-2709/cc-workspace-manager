@@ -6,7 +6,7 @@ CC Workspace Manager is an **independent, unofficial** open-source project. Clau
 
 `ccwm` is a small local daemon with a browser dashboard. It finds the folders on your machine that are Claude Code projects: those your Claude Code sessions started in, and those containing a `CLAUDE.md`. It shows which ones you worked on recently, their Git state, and where you left off. It also gives you the command to resume the last session. It is a project-centric workspace manager, not a token or cost dashboard.
 
-> **Status: v0.1.1.** Feature-complete for v0.1. Tested only on Linux x86_64 (Ubuntu 24.04, kernel 7.0, systemd 255, Git 2.43). See [CHANGELOG.md](CHANGELOG.md) for what has not been run yet.
+> **Status: v0.2.0 (unreleased).** v0.1 plus the session activity indicator. Tested only on Linux x86_64 (Ubuntu 24.04, kernel 7.0, systemd 255, Git 2.43). See [CHANGELOG.md](CHANGELOG.md) for what has not been run yet.
 
 ![Card view (synthetic data)](docs/screenshots/cards.jpg)
 
@@ -16,6 +16,7 @@ CC Workspace Manager is an **independent, unofficial** open-source project. Clau
 - **Tracks activity live**: the latest meaningful file change per project, through one inotify instance with non-recursive watches and a budget. Gitignored files and `.git/` do not count. Folders without a watch are checked periodically.
 - **Shows Git state**: branch, ahead/behind, staged/modified/untracked counts, the latest commit. It reads them with hardened, allowlisted Git commands that never run repository-defined helpers or contact a remote.
 - **Picks up where you left off**: the latest session's AI title, the last prompt (read from the session file when you open the details, redacted, not stored), and a resume command to copy (`cd -- '<folder>' && claude --resume <id>`). ccwm never runs it.
+- **Shows which sessions are open and what Claude is doing** (v0.2, opt-in): "Needs approval", "Working", "Waiting for input" per project, live, from Claude Code hooks you add (`ccwm hooks print`) and the session files. [The session activity indicator](docs/session-hooks.md).
 - **Card and table views**, search, sort, filters, live updates, light/dark themes, a Settings page, and a **privacy mode** that the server enforces.
 
 | Detail panel | Privacy mode |
@@ -73,12 +74,16 @@ env $(cat /tmp/ccwm-demo/env) target/debug/ccwm open --print
 | `ccwm start` / `stop` / `restart` | control the systemd user service |
 | `ccwm service install` / `uninstall [--purge]` | install or remove the systemd user unit |
 | `ccwm auth revoke-all` | sign out every browser |
+| `ccwm hooks print` | the Claude Code hooks of the session activity indicator, to add to your settings |
+| `ccwm hooks events [--follow]` | the hook events the daemon received (time, event, session id, outcome) |
+| `ccwm hook <Event>` | run by Claude Code from those hooks (reads the event on stdin; always exits 0) |
 
 ## Documentation
 
 - [docs/configuration.md](docs/configuration.md): every setting, its default, and whether it needs a restart.
 - [docs/discovery.md](docs/discovery.md): what counts as a project, roots and exclusions, missing projects, watching.
 - [docs/service.md](docs/service.md): install, systemd, logs, start at login vs. at boot.
+- [docs/session-hooks.md](docs/session-hooks.md): the session activity indicator — the hooks, the states, what Claude Code does not report.
 - [docs/troubleshooting.md](docs/troubleshooting.md): inotify limits, Landlock unavailable, port collisions, `claude` not found.
 - [docs/data-retention.md](docs/data-retention.md): what is stored, and how to delete it.
 - [docs/benchmarks.md](docs/benchmarks.md): measured CPU, memory and timings, with the method.

@@ -170,6 +170,10 @@ pub struct Env {
     pub db: std::path::PathBuf,
     /// The configuration file `PUT /settings` writes.
     pub config_path: std::path::PathBuf,
+    /// The activity indicator (v0.2); its `/proc` is the real one unless [`env_with_proc`].
+    pub presence: Arc<cc_workspace_manager::presence::Presence>,
+    /// Receives what the service publishes (when it is not consumed elsewhere).
+    pub changes: Option<tokio::sync::mpsc::Receiver<cc_workspace_manager::events::Change>>,
     _dir: tempfile::TempDir,
 }
 
@@ -179,6 +183,26 @@ pub async fn env() -> Env {
 
 /// [`env`] with a given sandbox report (what the service status shows).
 pub async fn env_with_sandbox(sandbox: SandboxReport) -> Env {
+    build_env(
+        sandbox,
+        cc_workspace_manager::presence::proc::ProcFs::default(),
+    )
+    .await
+}
+
+/// [`env`] whose activity indicator reads a fake `/proc` tree at `proc_root` ([`FakeProc`]).
+pub async fn env_with_proc(proc_root: &Path) -> Env {
+    build_env(
+        SandboxReport::disabled("test"),
+        cc_workspace_manager::presence::proc::ProcFs::new(proc_root),
+    )
+    .await
+}
+
+async fn build_env(
+    sandbox: SandboxReport,
+    proc: cc_workspace_manager::presence::proc::ProcFs,
+) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("t.db");
     // The folder's name is a canary: privacy mode must never send the configuration path.
@@ -187,7 +211,15 @@ pub async fn env_with_sandbox(sandbox: SandboxReport) -> Env {
     let clock = Arc::new(FakeClock::new(START));
     let writer = Arc::new(Writer::spawn(&db).unwrap());
     let reader = Reader::open(&db, 2).unwrap();
-    let (notifier, _changes) = Notifier::channel();
+    let (notifier, changes) = Notifier::channel();
+    let presence = Arc::new(cc_workspace_manager::presence::Presence::new(
+        proc,
+        nix::unistd::geteuid().as_raw(),
+        std::process::id(),
+        writer.clone(),
+        clock.clone(),
+        notifier.clone(),
+    ));
     let service = Arc::new(Service::new(Deps {
         clock: clock.clone(),
         writer: writer.clone(),
@@ -206,13 +238,7 @@ pub async fn env_with_sandbox(sandbox: SandboxReport) -> Env {
         roots: vec![std::path::PathBuf::from(HOME)],
         claude: None,
         peer_lookup: "procfs",
-        presence: Arc::new(cc_workspace_manager::presence::Presence::new(
-            cc_workspace_manager::presence::proc::ProcFs::default(),
-            nix::unistd::geteuid().as_raw(),
-            std::process::id(),
-            writer.clone(),
-            clock.clone(),
-        )),
+        presence: presence.clone(),
     }));
     let router = http::router(service.clone());
     Env {
@@ -222,7 +248,58 @@ pub async fn env_with_sandbox(sandbox: SandboxReport) -> Env {
         router,
         config_path,
         db,
+        presence,
+        changes: Some(changes),
         _dir: dir,
+    }
+}
+
+/// A fake `/proc` tree for the activity indicator's process walk (REQUIREMENTS.md §21.5).
+pub struct FakeProc {
+    pub dir: tempfile::TempDir,
+}
+
+impl FakeProc {
+    pub const BOOT: &'static str = "1d2c3b4a-0000-4000-8000-00000000b007";
+
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = dir.path().join("sys/kernel/random");
+        fs::create_dir_all(&boot).unwrap();
+        fs::write(boot.join("boot_id"), format!("{}\n", Self::BOOT)).unwrap();
+        Self { dir }
+    }
+
+    pub fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// A running process of this user: parent, start time and argv.
+    pub fn process(&self, pid: u32, ppid: u32, start: u64, argv: &[&str]) {
+        let uid = nix::unistd::geteuid().as_raw();
+        let d = self.root().join(pid.to_string());
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join("status"),
+            format!("Name:\tx\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )
+        .unwrap();
+        let middle = vec!["0"; 18].join(" ");
+        fs::write(
+            d.join("stat"),
+            format!("{pid} (x) S {middle} {start} 0 0\n"),
+        )
+        .unwrap();
+        let mut cmdline = Vec::new();
+        for a in argv {
+            cmdline.extend_from_slice(a.as_bytes());
+            cmdline.push(0);
+        }
+        fs::write(d.join("cmdline"), cmdline).unwrap();
+    }
+
+    pub fn remove(&self, pid: u32) {
+        fs::remove_dir_all(self.root().join(pid.to_string())).unwrap();
     }
 }
 

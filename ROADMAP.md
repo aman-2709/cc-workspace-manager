@@ -323,22 +323,26 @@ After v0.1.1:
 - [x] Tests: unit, `tests/hooks.rs` (fake `claude` tree, budgets, the guarded snippet under dash, restart, sweep,
   canaries in the trace log, database and debug output)
 - [x] fmt / clippy / test green; one local commit; O11 steps for the maintainer
-- [ ] **Maintainer on the real home:** O11 with `ccwm hooks events --follow` (interrupt and `idle_prompt`, a
-  background session, permission dialogs, the `claude` command line, SDK hosts)
+- [x] **O11 on the real home** (2026-11-26): the maintainer's runs, then a session-driven re-run at the
+  maintainer's request with a scoped read of the test project's session files (ARCHITECTURE.md §11a). Decisions
+  P1–P4 (REQUIREMENTS.md §21.12)
 
-#### Stop 2 — after O11
-- [ ] Adjust REQUIREMENTS.md §21 if O11 calls for it
-- [ ] The state machine (`needs_approval`, `working`, `waiting`, `unknown`; stale `prompt_id`s; subagent events);
-  tracker resolution and re-resolution of the session's project
-- [ ] `[indicator] show_noninteractive` (live setting, Settings toggle)
-- [ ] API and WebSocket (`live` fields, `live=waiting|working|open`, `/stats`, `/service/status` `hooks`);
+#### Stop 2 — after O11 (built 2026-11-26; one local commit, not pushed)
+- [x] REQUIREMENTS.md §21 adjusted: §21.2a (recorded facts from the session file), "Needs approval · N min",
+  the three `argv[0]` rules, the verified facts; ARCHITECTURE.md §11a (O11)
+- [x] The state machine (`needs_approval`, `working`, `waiting`, `unknown`; stale `prompt_id`s; subagent events);
+  the recorded facts with the current-turn rule; tracker resolution and re-resolution of the session's project
+- [x] `[indicator] show_noninteractive` (live setting, Settings toggle)
+- [x] API and WebSocket (`live` fields, `live=waiting|working|open`, `/stats`, `/service/status` `hooks`);
   `ccwm status`, `ccwm doctor`
-- [ ] UI: dot and label for four states, pulse, reduced motion, "Claude" column, detail panel, the three filters
-  with counts; privacy mode
-- [ ] Tests (§21.11): the state machine, aggregates, filters, API/WebSocket, DOM tests
-- [ ] Docs: docs/session-hooks.md (the snippet, where it goes, cost, limitations), README section, SECURITY.md (who
-  may report, same-user limit), configuration and troubleshooting; CHANGELOG 0.2.0
-- [ ] fmt / clippy / test green; synthetic daemon + real browser check; one local commit; report
+- [x] UI: dot and label for four states, pulse, reduced motion, "Claude" column, detail panel, the three filters
+  with counts, the minutes of "Needs approval"; privacy mode
+- [x] Tests (§21.11): the state machine, aggregates, filters, API/WebSocket, fixtures per record shape, DOM
+  helper tests
+- [x] Docs: docs/session-hooks.md, README, SECURITY.md, configuration, troubleshooting, data retention;
+  CHANGELOG 0.2.0; version 0.2.0
+- [x] fmt / clippy / test green; synthetic daemon + real browser check; one local commit; report
+- [ ] **Maintainer:** review; pushing, CI, tagging and the release stay with the maintainer
 
 ---
 

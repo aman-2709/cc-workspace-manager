@@ -133,12 +133,25 @@ pub fn parse_cmdline(bytes: &[u8], truncated: bool) -> Vec<Vec<u8>> {
     args
 }
 
-/// Claude Code's process: the last path component of `argv[0]` is exactly `claude` (§21.5;
-/// 2.1.332 is started as `claude` and sets its process title to `claude`).
+/// Claude Code's process, by `argv[0]` (REQUIREMENTS.md §21.5, decided after O11):
+/// 1. its last path component is exactly `claude` (a session started as `claude`);
+/// 2. it starts with `claude ` — a process title Claude Code writes over its arguments
+///    (`claude bg-pty-host`, `claude bg-spare`: a background session's processes);
+/// 3. it is Claude Code's versioned binary: a path ending in `/claude/versions/<version>`, the
+///    version digits and dots (a background session resumed under 2.1.321).
 pub fn is_claude(argv: &[Vec<u8>]) -> bool {
-    argv.first()
-        .and_then(|a0| a0.rsplit(|b| *b == b'/').next())
-        .is_some_and(|name| name == b"claude")
+    let Some(a0) = argv.first() else {
+        return false;
+    };
+    let mut parts = a0.rsplit(|b| *b == b'/');
+    let last = parts.next().unwrap_or_default();
+    if last == b"claude" || a0.starts_with(b"claude ") {
+        return true;
+    }
+    let version = !last.is_empty()
+        && last[0].is_ascii_digit()
+        && last.iter().all(|b| b.is_ascii_digit() || *b == b'.');
+    version && parts.next() == Some(b"versions") && parts.next() == Some(b"claude")
 }
 
 /// A non-interactive session (§21.5, O17): `-p` or `--print`, or `--output-format` /
@@ -448,6 +461,61 @@ mod tests {
         );
     }
 
+    /// O11: a background session. Supervisor → `claude bg-pty-host` → the session (`claude
+    /// bg-spare`, `CLAUDE_PID`) → `sh` → hook. The session itself is the nearest.
+    #[test]
+    fn a_background_session_is_its_own_process_not_the_supervisors() {
+        let fake = FakeProc::new();
+        fake.process(50, UID, 1, 10, &["/usr/lib/systemd/systemd", "--user"]);
+        fake.process(
+            60,
+            UID,
+            50,
+            11,
+            &[
+                "/home/u/.local/bin/claude",
+                "--json-path",
+                "x",
+                "--spawned-by",
+                "y",
+            ],
+        );
+        fake.process(
+            70,
+            UID,
+            60,
+            12,
+            &["claude bg-pty-host", "--bg-pty-host", "--", "--bg-spare"],
+        );
+        fake.process(80, UID, 70, 13, &["claude bg-spare", "--bg-spare"]);
+        fake.process(90, UID, 80, 20, &["sh", "-c", "x"]);
+        fake.process(95, UID, 90, 21, &["ccwm", "hook", "Stop"]);
+        let p = ProcFs::new(fake.root());
+        assert_eq!(p.find_claude(95, Some(80), UID, BOOT), found(80, 13, true));
+        assert_eq!(p.find_claude(95, None, UID, BOOT), found(80, 13, true));
+        assert_eq!(
+            p.find_claude(95, Some(60), UID, BOOT),
+            Err(Refusal::PidMismatch),
+            "not the supervisor"
+        );
+        // The older layout: the versioned binary under a pty host under systemd.
+        fake.process(
+            80,
+            UID,
+            70,
+            13,
+            &[
+                "/home/u/.local/share/claude/versions/2.1.321",
+                "--session-id",
+                "s",
+                "--resume",
+                "r",
+            ],
+        );
+        fake.process(70, UID, 50, 12, &["claude bg-pty-host", "--bg-pty-host"]);
+        assert_eq!(p.find_claude(95, Some(80), UID, BOOT), found(80, 13, true));
+    }
+
     #[test]
     fn the_walk_looks_at_most_eight_parents_and_stops_at_pid_1() {
         let fake = FakeProc::new();
@@ -525,20 +593,36 @@ mod tests {
     }
 
     #[test]
-    fn argv0_must_be_claude_by_its_last_path_component() {
+    fn argv0_identifies_claude_by_name_process_title_or_versioned_binary() {
         let claude = |a0: &[u8]| is_claude(&[a0.to_vec(), b"--resume".to_vec()]);
+        // 1. The last path component.
         assert!(claude(b"claude"));
         assert!(claude(b"/x/claude"));
         assert!(claude(b"/home/u/.local/bin/claude"));
         assert!(claude(b"./claude"));
+        // 2. Claude Code's process titles (O11: a background session's processes).
+        assert!(claude(b"claude bg-pty-host"));
+        assert!(claude(b"claude bg-spare"));
+        assert!(claude(b"claude daemon"));
+        // 3. The versioned binary.
+        assert!(claude(b"/home/u/.local/share/claude/versions/2.1.321"));
+        assert!(claude(b"/home/u/.local/share/claude/versions/2.1.332"));
+        assert!(claude(b"claude/versions/3"));
         for not in [
             &b"claude-x"[..],
             b"/x/claude-code",
             b"/x/2.1.332",
+            b"/x/versions/2.1.332",
+            b"/x/claudex/versions/2.1.332",
+            b"/x/claude/versions/2.1.332-beta",
+            b"/x/claude/versions/v2.1",
+            b"/x/claude/versions/",
+            b"/x/claude/version/2.1.332",
             b"node",
             b"Claude",
-            b"claude ",
-            b"claude daemon",
+            b"Claude bg-spare",
+            b"claudebg",
+            b" claude",
             b"/x/claude/",
             b"",
             b"xclaude",
@@ -546,7 +630,7 @@ mod tests {
             assert!(!claude(not), "{}", String::from_utf8_lossy(not));
         }
         assert!(!is_claude(&[]));
-        // Through the fake tree: a versioned binary or node is not found.
+        // Through the fake tree: node, another name, a bare version are not found.
         for argv in [["/x/2.1.332"], ["node"], ["claude-x"]] {
             let fake = FakeProc::new();
             let p = chain(&fake, &argv);

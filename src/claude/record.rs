@@ -166,6 +166,26 @@ pub struct Head {
     /// `continued-in` records: the session this one continues in.
     #[serde(rename = "continuedInSessionId", deserialize_with = "lenient_string")]
     pub continued_in: Option<String>,
+    // v0.2, the recorded ends of a turn (REQUIREMENTS.md §21.2a): top-level fields only; no
+    // message text, and `toolUseResult` stays unread.
+    /// The turn's prompt id (`user` records); equals the hooks' `prompt_id`.
+    #[serde(rename = "promptId", deserialize_with = "lenient_string")]
+    pub prompt_id: Option<String>,
+    /// Who wrote the record (`harness`: Claude Code itself, e.g. an interruption marker).
+    #[serde(rename = "rowSource", deserialize_with = "lenient_string")]
+    pub row_source: Option<String>,
+    /// Presence only: the record marks the interruption of a message.
+    #[serde(rename = "interruptedMessageId")]
+    pub interrupted_message_id: Option<IgnoredAny>,
+    /// A tool use the user rejected (`user-rejected`), on its result record.
+    #[serde(rename = "toolDenialKind", deserialize_with = "lenient_string")]
+    pub tool_denial_kind: Option<String>,
+    /// An assistant message cut off by an interrupt.
+    #[serde(rename = "isAbortedMidStream", deserialize_with = "lenient_bool")]
+    pub is_aborted_mid_stream: Option<bool>,
+    /// `system` records' kind (`turn_duration` ends a turn).
+    #[serde(deserialize_with = "lenient_string")]
+    pub subtype: Option<String>,
 }
 
 /// `derived-from` records: `{"sessions":[{"id":…,"type":…,"via":…}]}`. Parsed separately (only
@@ -310,6 +330,14 @@ impl<'de> Deserialize<'de> for BlockOrOther {
 /// seconds. Anything unparseable is `None`, never a guess.
 pub fn parse_timestamp(s: &str) -> Option<i64> {
     s.parse::<jiff::Timestamp>().ok().map(|t| t.as_second())
+}
+
+/// [`parse_timestamp`] in milliseconds (the recorded ends of a turn are ordered against hook
+/// events more finely than a second).
+pub fn parse_timestamp_ms(s: &str) -> Option<i64> {
+    s.parse::<jiff::Timestamp>()
+        .ok()
+        .map(|t| t.as_millisecond())
 }
 
 #[cfg(test)]

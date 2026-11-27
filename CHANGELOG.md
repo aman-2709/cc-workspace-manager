@@ -3,6 +3,55 @@
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — unreleased
+
+The session activity indicator. Tested on the same environment as 0.1.1 (Linux x86_64, Ubuntu 24.04, kernel
+7.0, systemd 255, Git 2.43.0) with Claude Code 2.1.332; the interactive behaviour of Claude Code it relies on was
+checked on the maintainer's machine (REQUIREMENTS.md §21.12, O11).
+
+### Added
+- **Which projects have an open Claude Code session, and what it is doing** — opt-in, from Claude Code hooks
+  you add to your Claude Code settings ([docs/session-hooks.md](docs/session-hooks.md)). Cards and table rows
+  show a dot and a label: **Needs approval** (from the first minute "Needs approval · N min"), **Working** (the
+  dot pulses, except with reduced motion), **Waiting for input**, **Session open** (state unknown, after a ccwm
+  restart). Several sessions in one project: the most urgent state, with the counts in the tooltip. The table
+  has a "Claude" column, the detail panel lists the open sessions and the latest session's state. Three
+  toolbar filters with counts: **Waiting for me**, **Working**, **Open**. Changes appear live. Privacy mode
+  keeps the indicator (states, counts and times only).
+- **`ccwm hooks print`** prints the hooks to add: one per event, each a guarded command
+  (`command -v '<ccwm>' >/dev/null 2>&1 && '<ccwm>' hook <Event>; exit 0`) that does nothing when ccwm is
+  missing and never fails a Claude Code hook. ccwm never reads or edits Claude Code's settings.
+- **`ccwm hook <Event>`**, run by those hooks: reads the event's JSON (at most 16 MiB; the prompt, Claude's reply
+  and the tool fields are skipped unread), sends the event name, session id, working folder and prompt id over
+  ccwm's Unix socket within 100 ms, never prints on stdout, always exits 0, and ends after 1 s whatever it waits
+  for.
+- **`ccwm hooks events [--follow]`**: the last 256 hook events the daemon received — time, event, session id,
+  what the daemon did with it — for checking the hooks (in memory only).
+- **Turn ends Claude Code reports to no hook** — Esc during a reply, "No" or Esc in a permission dialog, Esc
+  while an approved tool runs — are taken from the session file: the session shows "Waiting for input" about
+  2 seconds later. Only structural fields of those records are read, never their text.
+- **Settings → "Show non-interactive sessions"** (`[indicator] show_noninteractive`, off by default, applies at
+  once): `claude -p` runs and SDK hosts that start Claude Code non-interactively are tracked but hidden unless
+  it is on.
+- **`ccwm status`** has a "hooks" line (open sessions by state, hidden ones, those in no project, events
+  received, stale and refused events, facts from session files); **`ccwm doctor`** an informational line;
+  `/api/v1/service/status` a `hooks` object; `/api/v1/stats` the filter counts; `GET /api/v1/projects` a `live`
+  field and a `live=waiting|working|open` filter; session items a `live` field.
+
+### Changed
+- The daemon decides which Claude Code process an event comes from itself (the nearest Claude Code process
+  above the hook, at most 8 levels, of your user; `CLAUDE_PID` must name the same one) and closes a session when
+  that process exits (checked every 5 s). Open sessions survive a ccwm restart as "Session open" while their
+  process runs (database migration 6); a reboot or "Clear session index" forgets them.
+- Unix-socket requests may be up to 32 KiB (was 4 KiB), and the CLI reads responses up to 256 KiB (was 64 KiB).
+- The socket's trace log names the request type only (it printed the whole request).
+- `ccwm` looks up the passwd entry only when `$HOME` does not qualify.
+
+### Not run
+- A release build of 0.2.0, CI, the release workflow, and the fresh-account install (the maintainer's steps,
+  docs/release-checklist.md). The real `claude` was run only in the maintainer-approved O11 checks; the tests
+  use a fake one.
+
 ## [0.1.1] — 2026-11-26
 
 A maintenance release: no new features. Tested on the same environment as 0.1.0 (Linux x86_64, Ubuntu

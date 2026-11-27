@@ -32,6 +32,8 @@ pub enum Control {
     Refresh,
     Ignored(String),
     Unignored(String),
+    /// v0.2: an open session of the activity indicator opened or moved: resolve its project.
+    ResolveSessions,
 }
 
 #[derive(Clone)]
@@ -97,6 +99,8 @@ pub struct Tracker {
     live: Mutex<Live>,
     /// Session ingests never overlap (reconciliation and live session events).
     session_lock: tokio::sync::Mutex<()>,
+    /// v0.2: the activity indicator, set once by the daemon ([`Self::set_presence`]).
+    presence: std::sync::OnceLock<Arc<crate::presence::Presence>>,
 }
 
 impl Tracker {
@@ -142,7 +146,56 @@ impl Tracker {
             cancel: Arc::new(AtomicBool::new(false)),
             live: Mutex::new(live),
             session_lock: tokio::sync::Mutex::new(()),
+            presence: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The activity indicator whose open sessions the tracker resolves to projects and to which
+    /// it hands the ends of a turn read from session files (REQUIREMENTS.md §21.2a, §21.6).
+    pub fn set_presence(&self, presence: Arc<crate::presence::Presence>) {
+        let _ = self.presence.set(presence);
+    }
+
+    /// Resolve every open session's first cwd to a registered project with the rules of §4.4
+    /// (the code session ingest uses), or say why there is none (O14). Hook events never
+    /// register a project: a root that is not registered yet waits for its session file.
+    pub(crate) async fn resolve_open_sessions(self: &Arc<Self>) -> Result<()> {
+        let (Some(presence), Some(cfg)) = (self.presence.get(), self.settings.sessions.clone())
+        else {
+            return Ok(());
+        };
+        let wanted = presence.cwds();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let tracked = self.tracked().await?;
+        let ctx = self.resolve_context(&cfg, &tracked);
+        let by_path: HashMap<String, String> = tracked
+            .into_iter()
+            .filter(|t| !t.missing)
+            .map(|t| (t.path, t.id))
+            .collect();
+        let results: Vec<(String, std::result::Result<String, &'static str>)> =
+            tokio::task::spawn_blocking(move || {
+                wanted
+                    .into_iter()
+                    .map(|(sid, cwd)| {
+                        let r: std::result::Result<String, &'static str> =
+                            match ctx.resolve(Some(&cwd)) {
+                                Ok(root) => root
+                                    .to_str()
+                                    .and_then(|r| by_path.get(r).cloned())
+                                    .ok_or(crate::presence::store::NOT_REGISTERED),
+                                Err(u) => Err(u.as_str()),
+                            };
+                        (sid, r)
+                    })
+                    .collect()
+            })
+            .await
+            .map_err(|e| crate::error::Error::new(format!("session resolution failed: {e}")))?;
+        presence.assign(results);
+        Ok(())
     }
 
     pub fn live(&self) -> Live {
@@ -315,6 +368,8 @@ impl Tracker {
         if rescan_all {
             let _ = self.monitor.send(Cmd::OverflowRecovered).await;
         }
+        // Projects came, went or moved: the open sessions' projects are resolved again.
+        self.resolve_open_sessions().await?;
         tracing::info!(
             dirs = summary.dirs_visited,
             projects = summary.projects_found,
@@ -870,6 +925,7 @@ impl Tracker {
             }
             Control::Ignored(id) => self.unwatch(&id).await,
             Control::Unignored(id) => self.enroll(&id, false).await?,
+            Control::ResolveSessions => return self.resolve_open_sessions().await,
         }
         // A project left or joined: the rules may have to go to other projects.
         self.forget_departed().await?;
@@ -936,6 +992,8 @@ impl Tracker {
         }
         if rebalance {
             self.rebalance_rules().await?;
+            // Projects were added, walked or moved: an open session may name one now.
+            self.resolve_open_sessions().await?;
         }
         Ok(())
     }

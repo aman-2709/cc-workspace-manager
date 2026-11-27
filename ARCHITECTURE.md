@@ -804,6 +804,44 @@ CLAUDE_CODE_SESSION_ID CLAUDE_PID CLAUDE_PROJECT_DIR`, plus `CLAUDE_ENV_FILE` (S
 documentation. The environment also holds a token (`CLAUDE_CODE_MESSAGING_TOKEN`): `ccwm hook` reads
 `CLAUDE_PID` only.
 
+**O11 — interactive behaviour on the real home (2.1.332, 2026-11-26).** The maintainer's own runs, then a re-run
+the maintainer asked for: interactive sessions in `/tmp/ccwm-o11` driven through GNU `screen` (tmux is not
+installed) with every `CLAUDE*` variable of the driving session removed, `--permission-mode manual`, the
+project's `ask: ["Bash"]` rule, `--setting-sources project,local --strict-mcp-config --model haiku`; hook events
+read from the real daemon (`hooks.events`, stop 1's build); and, under a scoped exception granted by the
+maintainer, **structure-only reads of that one project's session files** (record types, field names, small
+enum values, timestamps; no prompt or reply text). Measured (local time of the hook receipt; record timestamps
+from the file; the file's size polled every 50 ms):
+
+| Run | Hooks after it | Session-file records |
+|---|---|---|
+| Esc during a reply | none for 85 s (maintainer: 3 min and more) | `assistant` `isAbortedMidStream: true`; `user` `rowSource: "harness"`, `interruptedMessageId`, text `[Request interrupted by user]`; 57 ms after the key, on disk ≈ 200 ms after it |
+| Normal turn (control) | `Stop`; `idle_prompt` 60.03 s later | `assistant` `stop_reason: end_turn`; `system` `subtype: stop_hook_summary`, then `system` `subtype: turn_duration` (≈ 20 ms after the `Stop` hook) |
+| Approve (after `permission_prompt`) | `permission_prompt` 7.0 s after the prompt; nothing until `PostToolUse` → `PostToolBatch` (17 ms) when the tool ends; `Stop` | **nothing between the approval and the tool's end** (12 s, no write); the tool's result then carries `permissionDecision {decision: accept, source: user_temporary, grantScope: once, …}` (a rule-approved one: `source: config`) |
+| "No" in the dialog (after the notification, and within 2 s before it) | none | `user` `tool_result` (`is_error: true`) with top-level `toolDenialKind: "user-rejected"`, `toolDenialBeforeRun: true` (`toolUseResult` holds a fixed string; not read); `user` `rowSource: "harness"` with text `[Request interrupted by user for tool use]`; ≈ 10 ms after the key |
+| Esc on the dialog | none | identical to "No" |
+| Approve, then Esc while the tool runs | none — no `PostToolUse`, `PostToolUseFailure`, `Stop` | as "No", without `toolDenialBeforeRun`; the marker record also has `interruptedMessageId` |
+| `/clear` | `SessionEnd` then `SessionStart` `clear` (new id), 39 ms apart | — |
+| `ccwm restart` with sessions open | — | both live sessions `restored` |
+| `/exit` | `SessionEnd` | — |
+| `claude -p` | `SessionStart` (opened non-interactive), `UserPromptSubmit`, `Stop`, `SessionEnd` | prompt record `promptSource: "sdk"` |
+| `claude --bg` | every event refused `pid_mismatch` (stop 1's `argv[0]` rule) | — |
+
+Every `user` record of a turn carries `promptId`; it **equals the hooks' `prompt_id`** (a one-off `--settings`
+hook in `/tmp` wrote the hook's `prompt_id`, compared for a `-p` and a `--bg` session). `assistant` and `system`
+records have no `promptId`. `rowSource: "harness"` also marks the records `/clear` and `/exit` write.
+
+**Process layout** (`argv[0]`, `comm` and option names only): terminal sessions `argv[0]` `claude`, `comm`
+`claude` (options such as `--allow-dangerously-skip-permissions`, `--continue`, `--permission-mode`). Background
+sessions: a supervisor (`argv[0]` `~/.local/bin/claude`, `comm` `claude`, options `--json-path --log-file
+--origin --spawned-by`, parent `systemd --user`) → `claude bg-pty-host` (`argv[0]` is that one string, `comm`
+`2.1.332`, options `--bg-pty-host -- --bg-spare`) → the session process `claude bg-spare` (`comm` `2.1.332`,
+`--bg-spare`; a spare is promoted to the session and keeps its title). A background session resumed under 2.1.321
+had the versioned binary `~/.local/share/claude/versions/2.1.321` as `argv[0]` (options `--session-id
+--fork-session --resume …`) and its pty host directly under `systemd --user`. An SDK-style host started
+`~/.local/bin/claude --output-format --verbose --input-format --thinking=… --model=… --permission-prompt-tool=…
+--disallowedTools=… --tools=…` (no `-p`). No npm-installed Claude Code on the host.
+
 **Settings:** `~/.claude/settings.json` (all projects), `.claude/settings.json` (project, shared),
 `.claude/settings.local.json` (project, not shared), managed policy settings; hook entries merge across levels.
 Off: `disableAllHooks`, managed `allowManagedHooksOnly`, `claude --bare`, `--safe-mode`, `--restricted` (user,
@@ -1198,6 +1236,46 @@ with a synthetic `HOME`/`XDG_*`).
 
 ---
 
+## 13m. v0.2 O11 and stop 2 — what was actually run (2026-11-26)
+
+**O11** (facts in §11a): the maintainer's interactive runs (A, B1–B3), then, at the maintainer's request, a
+re-run driven from this session — GNU `screen` (tmux is not installed; installing it needs `sudo`) with every
+`CLAUDE*` variable removed, `--permission-mode manual --setting-sources project,local --strict-mcp-config --model
+haiku`, in `/tmp/ccwm-o11` with the project's `ask: ["Bash"]` rule and stop 1's hooks; the real daemon (stop 1's
+build, installed by the maintainer) read over its socket (`hooks.events`); `ccwm restart` once (check G). Three
+`claude` processes, four session ids (an interactive one with `/clear`, a `--bg` one, a `-p` one). A one-off
+`--settings` file in `/tmp/ccwm-o11-probe` (removed afterwards) wrote the hooks' `prompt_id` for the `-p` and
+`--bg` runs. Under the maintainer's scoped exception, only `~/.claude/projects/-tmp-ccwm-o11/` was read, by
+scripts that print record types, field names, small enum values and timestamps (no prompt or reply text, only
+Claude Code's fixed interruption and rejection strings), and a size poller (50 ms) on its `.jsonl` files. Not
+done: an npm-installed Claude Code (none on the host), an editor extension (optional, not run); `claude rm` of
+the background session (left to the maintainer: it changes Claude Code's state).
+
+**Stop 2:**
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `CCWM_REQUIRE_LANDLOCK=1
+  CCWM_REQUIRE_LANDLOCK_ABI=8 CCWM_REQUIRE_INOTIFY=1 cargo test`: green (315 unit tests; every integration
+  suite, `tests/hooks.rs` 8, `tests/live_api.rs` 4, `node --test tests/ui/app.test.js` 37). `tests/hooks.rs` and
+  `tests/live_api.rs` ten more times: green. musl (`--test hooks --test live_api --test ipc`): green.
+  `cargo-deny check`: ok (no new dependency).
+- **A real browser** (Chrome, through the browser extension) on a synthetic daemon (`/tmp/ccwm-v02-demo`, port
+  8766, debug build) with fake sessions: alpha working, beta needs approval, gamma waiting, delta two sessions
+  (working + waiting), monorepo a `-p` session. Seen: the cards' dots and labels ("Working", "Needs approval" in
+  the warning colour, "Waiting for input"), delta as "Working" with "2 open sessions: 1 working, 1 waiting for
+  input" in the tooltip, monorepo without a dot; the filters "Waiting for me (3)", "Working (2)", "Open (4)";
+  "Working" in the table view (alpha, delta) with the "Claude" column; "Waiting for me" with privacy mode on
+  (paths hidden, indicator unchanged); "Needs approval · 1 min" appearing without a reload; a `Stop` sent for
+  beta's session turning it to "Waiting for input" live; Settings → "Show non-interactive sessions" saved without
+  a restart note, then "Working (3)", "Open (5)"; delta's detail panel ("Open sessions"). DOM: the dot
+  `aria-hidden`, the tooltip copied into an `sr-only` span, only `working` animated (`live-pulse`), the
+  reduced-motion rule present in the CSSOM. **Not seen:** the pulse switched off by the OS setting (the browser's
+  motion preference cannot be changed from the extension; the rule is checked in the CSSOM and by the node test);
+  a screen reader.
+- Contrast of the dot colours computed (WCAG): 4.73–7.48:1 against the page and card backgrounds in both themes.
+- Demo cleaned up: the daemon stopped by its `instance.json` pid, the fake processes (and one orphaned `sleep`)
+  killed, the directory removed.
+
+---
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -1388,13 +1466,14 @@ Open:
 
 ---
 
-## 15. v0.2 design — session activity indicator (approved 2026-11-26; stop 1 built)
+## 15. v0.2 design — session activity indicator (approved 2026-11-26; built)
 
 The spec is REQUIREMENTS.md §21 (approved with the decisions of §21.12); this is how phase 2 builds it, written
 against the v0.1.1 code. Rules marked *(choice, for review)* in §21 are marked here too. Phase 2 runs in two stops
-(maintainer, 2026-11-26): **stop 1 — the plumbing — is built** (below, "Stop 1 as built"); stop 2 (the state
-machine, project resolution, API/WebSocket, UI, the Settings toggle, status/doctor lines, docs) follows the
-maintainer's O11 checks on the real home.
+(maintainer, 2026-11-26): **stop 1 — the plumbing** (below, "Stop 1 as built"), the O11 checks (§11a; the
+decisions P1–P4 in REQUIREMENTS.md §21.12), then **stop 2** — the state machine, project resolution, the
+recorded facts of §21.2a, API/WebSocket, UI, the Settings toggle, status/doctor lines, docs ("Stop 2 as built").
+Both are built.
 
 ### Data flow
 ```mermaid
@@ -1471,6 +1550,7 @@ closes — not at every turn.
 | `Stop`, `StopFailure`, `Notification` `idle_prompt` | open, `waiting` | `waiting` | `waiting` | `waiting` | `waiting` |
 | any of these with a `prompt_id` ≠ the current one | (cannot be stale) | unchanged, counted `stale` | unchanged | unchanged | unchanged |
 | `SessionEnd` | ignored | closed | closed | closed | closed |
+| recorded fact (§21.2a): interrupted, turn ended — current turn only | — | `waiting` | `waiting` | unchanged | `waiting` |
 | process gone (event, restore or sweep) | — | closed | closed | closed | closed |
 
 Project aggregate over its **shown** sessions (non-interactive ones only with the toggle on): `needs_approval` if
@@ -1555,6 +1635,50 @@ against a socket that never answers, the 1 s watchdog, the guarded snippet with 
   wrong `CLAUDE_PID`, a detached hook, `-p`, `SessionEnd`, a killed process, a restart, "Clear session
   index", canaries in the trace log, the database and `ccwm hooks events`). `tests/common/daemon.rs` now holds
   the daemon harness `tests/process.rs` had.
+
+### Stop 2 as built (2026-11-26)
+- **The recorded facts (§21.2a, P1):** `claude::record::Head` gains `promptId`, `rowSource`,
+  `interruptedMessageId` (presence), `toolDenialKind`, `isAbortedMidStream`, `subtype`; `claude::parse::turn_end`
+  is the structural rule; `parse::parse` returns the **latest** `TurnFact {end, prompt_id, at_ms}` of the records
+  read in that pass (`Outcome::Updated { fact, .. }`; never stored, no parser-version bump — aggregates are
+  unchanged). `tracker::sessions::scan` collects them; `ingest_sessions` hands them to
+  `Presence::apply_facts` after storing. Fixtures: `tests/fixtures/turns/2.1.332/` (eight files); the
+  corroboration test reads the fixed strings, the parser never does.
+- **`presence::store`** now holds the activity state per session: `State {NeedsApproval, Working, Waiting,
+  Unknown}` (ordered for the aggregate), `next_state` (the table above), `since` (seconds, shown) and `since_ms`
+  (orders facts), the current `prompt_id` (set by `UserPromptSubmit`; learned from any event when unknown;
+  forgotten by `SessionStart` except `compact`), staleness (`SessionStart`/`UserPromptSubmit` exempt;
+  `SessionEnd` closes regardless), `apply_fact` with the current-turn rule, `assign` (project or unassigned
+  reason, `NOT_REGISTERED` for a root not registered yet), `live` (the aggregate: `LiveView`, with
+  `needs_approval_since` for P2), `session_live`, `projects_matching(LiveFilter)`, `open_counts`. Every change
+  returns the projects to publish; `Presence` sends them to the `Notifier` (the WebSocket batching as before).
+  Debug-log outcomes name the state reached (`opened: waiting`, `→ working`, `unchanged: working`, `stale (an
+  older prompt)`, `restored: unknown`, `interrupted (session file): → waiting`, …).
+- **Project resolution (O14):** `Tracker::resolve_open_sessions` (the session ingest's `resolve_context` and
+  `discovery::resolve::Context::resolve`, then a lookup of the root among registered projects — never an
+  upsert) runs on `Control::ResolveSessions` (sent by `Service::hook_event` when a session opens or moves), after
+  each reconciliation, after signals that walk, add or move projects, and once at start right after the
+  restore. `Tracker::set_presence` (a `OnceLock`) avoids changing `Tracker::new`.
+- **API:** `ProjectView.live`, `SessionView.live`, `ProjectsQuery.live` → `Filters.live` (a JSON array of ids,
+  `?10 … json_each(?10)`; the keyset parameters moved to `?11`–`?14`), `Stats.live` (`queries::count_present`:
+  present, not ignored), `ServiceStatus.hooks` (`HooksStatus`: `OpenCounts` + `Counters`). `[indicator]
+  show_noninteractive` (`config::IndicatorConfig`, in `SETTABLE`, live through `apply_live` →
+  `Presence::set_show_noninteractive`, which republishes the affected projects). The CLI response limit is 256 KiB
+  (the full debug log is ≈ 50 KB).
+- **UI (`web/app.js`, `web/app.css`):** pure helpers `liveDescriptor`, `approvalLabel`, `liveCounts`,
+  `sessionLive`, `liveFilterLabel` (node-tested); `liveEl` renders `.live.live--<state>` with an `aria-hidden`
+  dot, the label and an `sr-only` copy of the tooltip; cards (head row), table ("Claude" column, `.col-live`
+  11.5rem), detail panel ("Open sessions", the latest session's "Now"); the three filters are a toggle group
+  (one at a time) with counts from `/stats`; a 30 s timer advances "· N min" in place; the Settings checkbox;
+  colours `--live-approval`, `--live-working`, `--live-idle` (≥ 4.7:1 on every background, both themes);
+  `@media (prefers-reduced-motion: reduce)` stops the pulse.
+- **CLI:** `cli::format_hooks` (the `ccwm status` line), `doctor::hooks` (informational).
+- **Tests:** `presence::store` (every event in every state, staleness, facts and the current-turn rule, restart,
+  aggregates and filters, assignment), `presence` (publishing, the toggle, facts), `claude::parse` (each fixture,
+  corroboration, appends and re-reads, odd values), `tests/live_api.rs` (the API contract with a fake `/proc`),
+  `tests/hooks.rs` (a `StepClaude` driven through a FIFO: every state over the API and the WebSocket, a fact
+  from a session file written during the test, the session list, the sweep, a restart, the toggle),
+  `tests/ui/app.test.js` (labels, minutes, counts, filters, the CSS rules).
 
 ### Phase 2 — the build, once the maintainer gives the go-ahead
 Accept (synthetic environment, a real browser): a fake session's `SessionStart` shows "Waiting for input" on its

@@ -16,7 +16,8 @@ use crate::db::writer::Writer;
 use crate::discovery::status::{DiscoverySnapshot, SharedStatus};
 use crate::events::{next_batch, Batch, Change, Hub, Notifier};
 use crate::git::GitSummary;
-use crate::presence::{EventsView, HookRequest, Presence};
+use crate::presence::store::LiveFilter;
+use crate::presence::{EventsView, HookRequest, HooksStatus, Presence};
 use crate::sandbox::SandboxReport;
 use crate::tracker::{Control, Tracker};
 use crate::view::{self, Privacy, ProjectDetail, ProjectView, PromptView, ResumeView, SessionView};
@@ -69,6 +70,8 @@ pub struct ProjectsQuery {
     pub privacy: Option<String>,
     pub limit: Option<String>,
     pub cursor: Option<String>,
+    /// v0.2: `waiting` ("Waiting for me": waiting or needs approval), `working` or `open`.
+    pub live: Option<String>,
 }
 
 /// `?privacy=1` on the detail and status endpoints.
@@ -112,6 +115,16 @@ pub struct Stats {
     pub uncommitted_changes: u64,
     pub missing: u64,
     pub total_sessions: u64,
+    /// v0.2: projects (present, not ignored) each toolbar filter of the activity indicator
+    /// keeps, for its count.
+    pub live: LiveStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct LiveStats {
+    pub waiting_for_me: u64,
+    pub working: u64,
+    pub open: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -143,6 +156,8 @@ pub struct ServiceStatus {
     /// The `claude` CLI check (§8); `null` before the first check.
     pub claude: Option<CliCheck>,
     pub queues: Queues,
+    /// v0.2: the session activity indicator (§21.10): counts and times only.
+    pub hooks: HooksStatus,
 }
 
 /// `GET /settings` (and the `PUT` response).
@@ -217,7 +232,7 @@ const RESTART_KEYS: [(&str, ConfigValue); 10] = [
 /// (e.g. `git.allow_unhardened_status`, `watch.debounce_ms`) changes only by editing
 /// `config.toml` (M3 security review, L7: a stolen browser token must not be able to weaken the
 /// hardening persistently).
-const SETTABLE: [(&str, &[&str]); 6] = [
+const SETTABLE: [(&str, &[&str]); 7] = [
     ("server", &["port"]),
     (
         "discovery",
@@ -234,6 +249,7 @@ const SETTABLE: [(&str, &[&str]); 6] = [
     ("watch", &["budget"]),
     ("activity", &["inactive_after_days", "dormant_after_days"]),
     ("sessions", &["dir", "store_prompt_text"]),
+    ("indicator", &["show_noninteractive"]),
     ("ui", &["default_view", "theme", "privacy"]),
 ];
 
@@ -449,14 +465,16 @@ impl Service {
         } else {
             self.monitor.of(&row.id)
         };
-        view::project_view(
+        let mut v = view::project_view(
             row,
             &self.classifier(),
             now,
             &self.home,
             monitoring,
             privacy,
-        )
+        );
+        v.live = self.presence.live(&row.id);
+        v
     }
 
     pub async fn list_projects(&self, q: ProjectsQuery) -> Result<ProjectsPage, ApiError> {
@@ -466,6 +484,7 @@ impl Service {
         let limit = v.params.limit;
         let mut params = v.params.clone();
         params.limit = limit + 1;
+        params.filters.live = v.live.map(|f| self.presence.projects_matching(f));
         let (mut rows, total) = self
             .reader
             .with(move |c| queries::list_projects(c, &params))
@@ -602,6 +621,7 @@ impl Service {
             last_prompt,
             first_prompt,
             resume,
+            live: self.presence.session_live(&r.id),
         })
     }
 
@@ -856,6 +876,8 @@ impl Service {
         } else if !old.sessions.store_prompt_text && new.sessions.store_prompt_text {
             self.writer.set_store_prompts(true);
         }
+        self.presence
+            .set_show_noninteractive(new.indicator.show_noninteractive);
         Ok(())
     }
 
@@ -944,9 +966,19 @@ impl Service {
             .classifier()
             .boundaries(self.clock.now())
             .ok_or_else(|| ApiError::internal("cannot compute day boundaries"))?;
-        let c = self
+        let sets = LiveFilter::ALL.map(|f| self.presence.projects_matching(f));
+        let (c, live) = self
             .reader
-            .with(move |c| queries::stat_counts(c, &b))
+            .with(move |c| {
+                let counts = queries::stat_counts(c, &b)?;
+                let [waiting, working, open] = &sets;
+                let live = LiveStats {
+                    waiting_for_me: queries::count_present(c, waiting)?,
+                    working: queries::count_present(c, working)?,
+                    open: queries::count_present(c, open)?,
+                };
+                Ok((counts, live))
+            })
             .await?;
         Ok(Stats {
             total_projects: c.total,
@@ -958,6 +990,7 @@ impl Service {
             uncommitted_changes: c.dirty,
             missing: c.missing,
             total_sessions: c.sessions,
+            live,
         })
     }
 
@@ -1025,6 +1058,7 @@ impl Service {
                 git_in_flight: self.tracker.as_ref().map_or(0, |t| t.git.in_flight()),
                 websocket_clients: self.hub.clients(),
             },
+            hooks: self.presence.status(),
         }
     }
 
@@ -1038,10 +1072,16 @@ impl Service {
         peer_pid: Option<i32>,
         request: HookRequest,
     ) -> Result<serde_json::Value, ApiError> {
-        self.presence
+        let reported = self
+            .presence
             .report(peer_pid, request)
-            .map(|()| serde_json::json!({ "accepted": true }))
-            .map_err(|r| ApiError::invalid(r.as_str()))
+            .map_err(|r| ApiError::invalid(r.as_str()))?;
+        if reported.resolve {
+            // The tracker finds the session's project from its cwd (§21.6, O14); the answer to
+            // `ccwm hook` never waits for it.
+            self.control(Control::ResolveSessions);
+        }
+        Ok(serde_json::json!({ "accepted": true }))
     }
 
     /// The counters and debug log of hook events (`ccwm hooks events`): names, times and session
@@ -1235,6 +1275,9 @@ struct ValidQuery {
     sort: String,
     order: String,
     params: ListParams,
+    /// The toolbar filter of the activity indicator; its project ids are filled in by
+    /// `list_projects` (they come from the daemon's memory, not the query).
+    live: Option<LiveFilter>,
 }
 
 fn encode_cursor(sort: &str, order: &str, last: &queries::ProjectRow) -> String {
@@ -1335,6 +1378,13 @@ fn validate_projects_query(
         .as_deref()
         .map(|c| decode_cursor(c, sort_name, order_name))
         .transpose()?;
+    let live = match q.live.as_deref() {
+        None | Some("") => None,
+        Some(l) => Some(
+            LiveFilter::parse(l)
+                .ok_or_else(|| ApiError::invalid("live must be one of: waiting, working, open"))?,
+        ),
+    };
     Ok(ValidQuery {
         sort: sort_name.to_string(),
         order: order_name.to_string(),
@@ -1348,12 +1398,14 @@ fn validate_projects_query(
                 activity,
                 has_sessions: flag(q.has_sessions.as_deref(), "has_sessions")?,
                 private: flag(q.privacy.as_deref(), "privacy")?,
+                live: None,
             },
             sort,
             order,
             limit,
             after,
         },
+        live,
     })
 }
 

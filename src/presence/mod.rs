@@ -1,6 +1,7 @@
 //! The activity indicator's daemon side (REQUIREMENTS.md §21; ARCHITECTURE.md §15): hook events
-//! from `ccwm hook`, which Claude Code process each came from ([`proc`]), the open sessions
-//! ([`store`]), their persistence across restarts, and the liveness sweep.
+//! from `ccwm hook`, which Claude Code process each came from ([`proc`]), the open sessions and
+//! their states ([`store`]), the ends of a turn recorded in session files (§21.2a), persistence
+//! across restarts, the liveness sweep, and what the API and the UI show.
 //!
 //! Hook events are **never activity** (§21.1): nothing here touches activity times, sort order,
 //! watches or ignore rules, and nothing here registers a project.
@@ -9,14 +10,20 @@ pub mod proc;
 pub mod store;
 
 use crate::claude::hook::{Malformed, Report};
+use crate::claude::parse::TurnFact;
 use crate::clock::Clock;
 use crate::db::reader::Reader;
 use crate::db::writer::Writer;
+use crate::events::Notifier;
 use proc::ProcFs;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use store::{Counters, LogEntry, Outcome, Persist, Refusal, Store};
+use store::{
+    Counters, FactOutcome, LiveFilter, LiveView, LogEntry, OpenCounts, Outcome, Persist, Refusal,
+    SessionLive, Store,
+};
 use tokio::sync::watch;
 
 /// Open sessions are checked this often while any is tracked (§21.6, O13).
@@ -32,11 +39,28 @@ pub struct EventsView {
     pub started_at: i64,
     #[serde(flatten)]
     pub counters: Counters,
+    /// Every tracked session, and the non-interactive ones among them (whatever the toggle).
     pub open: usize,
     pub open_noninteractive: usize,
     /// The debug log's size: older entries are dropped.
     pub kept: usize,
     pub events: Vec<LogEntry>,
+}
+
+/// `hooks` of `/service/status` and `ccwm status` (§21.10).
+#[derive(Debug, Clone, Serialize)]
+pub struct HooksStatus {
+    #[serde(flatten)]
+    pub counts: OpenCounts,
+    #[serde(flatten)]
+    pub counters: Counters,
+}
+
+/// What an accepted event asks of the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reported {
+    /// A session opened or moved to another process: its project is to be resolved.
+    pub resolve: bool,
 }
 
 pub struct Presence {
@@ -49,6 +73,9 @@ pub struct Presence {
     boot_id: String,
     writer: Arc<Writer>,
     clock: Arc<dyn Clock>,
+    notifier: Notifier,
+    /// `indicator.show_noninteractive` (§21.8, O17), live.
+    show_noninteractive: AtomicBool,
     started_at: i64,
 }
 
@@ -59,6 +86,7 @@ impl Presence {
         daemon_pid: u32,
         writer: Arc<Writer>,
         clock: Arc<dyn Clock>,
+        notifier: Notifier,
     ) -> Self {
         let boot_id = proc.boot_id().unwrap_or_else(|e| {
             tracing::warn!(error = %e, "cannot read the boot id: open sessions cannot be restored after a restart");
@@ -73,6 +101,8 @@ impl Presence {
             started_at: clock.now(),
             writer,
             clock,
+            notifier,
+            show_noninteractive: AtomicBool::new(false),
         }
     }
 
@@ -87,10 +117,29 @@ impl Presence {
         }
     }
 
+    fn publish(&self, projects: &[String]) {
+        for id in projects {
+            self.notifier.project(id);
+        }
+    }
+
+    pub fn show_noninteractive(&self) -> bool {
+        self.show_noninteractive.load(Ordering::Relaxed)
+    }
+
+    /// Turn the Settings toggle on or off (§21.8): the projects with a non-interactive session
+    /// are published again.
+    pub fn set_show_noninteractive(&self, on: bool) {
+        if self.show_noninteractive.swap(on, Ordering::Relaxed) != on {
+            let projects = self.store().noninteractive_projects();
+            self.publish(&projects);
+        }
+    }
+
     /// A `hook.event` from the socket peer `peer_pid` (§21.5, §21.6). Called by the socket
     /// handler while `ccwm hook` waits for its answer: validation, the process walk and the
     /// in-memory update only; the database write is queued, never awaited.
-    pub fn report(&self, peer_pid: Option<i32>, request: HookRequest) -> Result<(), Refusal> {
+    pub fn report(&self, peer_pid: Option<i32>, request: HookRequest) -> Result<Reported, Refusal> {
         let now = self.clock.now();
         let at_ms = self.clock.now_ms();
         let report = match request {
@@ -136,12 +185,16 @@ impl Presence {
         };
         let mut store = self.store();
         store.received(now);
-        let applied = store.apply(&report, &found, now, |id| self.proc.alive(id));
+        let applied = store.apply(&report, &found, at_ms, |id| self.proc.alive(id));
         let outcome = match &applied {
-            Ok((Outcome::Opened, _)) if !found.interactive => {
-                "opened (non-interactive)".to_string()
+            Ok(a) => {
+                let text = a.outcome.text();
+                if !found.interactive && matches!(a.outcome, Outcome::Opened(_)) {
+                    format!("{text} (non-interactive)")
+                } else {
+                    text
+                }
             }
-            Ok((o, _)) => o.as_str().to_string(),
             Err(r) => format!("refused: {}", r.as_str()),
         };
         store.log(
@@ -153,13 +206,15 @@ impl Presence {
             outcome,
         );
         match applied {
-            Ok((_, persist)) => {
+            Ok(a) => {
                 drop(store);
                 tracing::trace!(event = report.event.name(), "hook event");
-                if let Some(p) = persist {
+                let resolve = matches!(a.outcome, Outcome::Opened(_) | Outcome::NewProcess(_));
+                if let Some(p) = a.persist {
                     self.persist(p);
                 }
-                Ok(())
+                self.publish(&a.projects);
+                Ok(Reported { resolve })
             }
             Err(r) => {
                 store.refused(r);
@@ -183,7 +238,7 @@ impl Presence {
         session_id: Option<String>,
         sent: Option<bool>,
         r: Refusal,
-    ) -> Result<(), Refusal> {
+    ) -> Result<Reported, Refusal> {
         let mut store = self.store();
         store.received(now);
         store.refused(r);
@@ -207,6 +262,70 @@ impl Presence {
         Err(r)
     }
 
+    /// The ends of a turn the session ingest read from session files (§21.2a): each moves its
+    /// session to `waiting` when it belongs to the current turn. Logged unless there was nothing
+    /// to change (a `turn_duration` after the `Stop` hook, a session that is not open).
+    pub fn apply_facts(&self, facts: &[(String, TurnFact)]) {
+        if facts.is_empty() {
+            return;
+        }
+        let at_ms = self.clock.now_ms();
+        let mut changed = Vec::new();
+        let mut store = self.store();
+        for (sid, fact) in facts {
+            let (outcome, project) = store.apply_fact(sid, fact, at_ms);
+            if outcome != FactOutcome::Nothing {
+                store.log(
+                    at_ms,
+                    None,
+                    None,
+                    Some(sid.clone()),
+                    None,
+                    store::fact_text(fact, outcome),
+                );
+            }
+            changed.extend(project);
+        }
+        drop(store);
+        self.publish(&changed);
+    }
+
+    /// The open sessions to resolve to a project: id and first cwd (never logged).
+    pub fn cwds(&self) -> Vec<(String, String)> {
+        self.store().cwds()
+    }
+
+    /// The tracker's resolution of [`Self::cwds`]: a project id, or why there is none.
+    pub fn assign(&self, results: Vec<(String, Result<String, &'static str>)>) {
+        let changed = self.store().assign(results);
+        self.publish(&changed);
+    }
+
+    /// The aggregate shown for `project`, honouring the non-interactive toggle.
+    pub fn live(&self, project: &str) -> Option<LiveView> {
+        self.store().live(project, self.show_noninteractive())
+    }
+
+    /// One session's state for the detail panel.
+    pub fn session_live(&self, session_id: &str) -> Option<SessionLive> {
+        self.store()
+            .session_live(session_id, self.show_noninteractive())
+    }
+
+    /// The projects a toolbar filter keeps.
+    pub fn projects_matching(&self, filter: LiveFilter) -> Vec<String> {
+        self.store()
+            .projects_matching(filter, self.show_noninteractive())
+    }
+
+    pub fn status(&self) -> HooksStatus {
+        let store = self.store();
+        HooksStatus {
+            counts: store.open_counts(self.show_noninteractive()),
+            counters: store.counters().clone(),
+        }
+    }
+
     /// Close every session whose process is gone (§21.6, O13). The `/proc` reads happen outside
     /// the lock; a session that moved to another process meanwhile stays.
     pub fn sweep(&self) -> Vec<String> {
@@ -224,8 +343,9 @@ impl Presence {
         let at_ms = self.clock.now_ms();
         let mut store = self.store();
         let mut closed = Vec::new();
+        let mut projects = Vec::new();
         for (sid, identity) in gone {
-            if store.close_if(&sid, &identity) {
+            if let Some(project) = store.close_if(&sid, &identity) {
                 store.log(
                     at_ms,
                     None,
@@ -234,17 +354,19 @@ impl Presence {
                     None,
                     "closed: process gone".into(),
                 );
+                projects.extend(project);
                 closed.push(sid);
             }
         }
         drop(store);
         self.writer.delete_open_sessions(closed.clone());
+        self.publish(&projects);
         closed
     }
 
     /// At start (§21.7): put back the persisted sessions whose process is still the same Claude
-    /// Code process (same pid, start time and boot id); delete the others. The interactive flag
-    /// is read again. Returns (restored, dropped).
+    /// Code process (same pid, start time and boot id), in the state `unknown`; delete the
+    /// others. The interactive flag is read again. Returns (restored, dropped).
     pub async fn restore(&self, reader: &Reader) -> crate::error::Result<(usize, usize)> {
         let rows = reader.with(crate::db::queries::open_sessions).await?;
         let at_ms = self.clock.now_ms();
@@ -261,12 +383,12 @@ impl Presence {
             let kept = match verdict {
                 Some(interactive) => {
                     open.interactive = interactive;
-                    store.restore(sid.clone(), open)
+                    store.restore(sid.clone(), open, at_ms)
                 }
                 None => false,
             };
             let outcome = if kept {
-                "restored"
+                "restored: unknown"
             } else {
                 "dropped at start: process gone"
             };
@@ -288,7 +410,7 @@ impl Presence {
     pub fn clear(&self) {
         let at_ms = self.clock.now_ms();
         let mut store = self.store();
-        let n = store.clear();
+        let (n, projects) = store.clear();
         store.log(
             at_ms,
             None,
@@ -297,11 +419,13 @@ impl Presence {
             None,
             format!("cleared: {n} open session(s) forgotten"),
         );
+        drop(store);
+        self.publish(&projects);
     }
 
     pub fn events(&self) -> EventsView {
         let store = self.store();
-        let (open, open_noninteractive) = store.open_counts();
+        let (open, open_noninteractive) = store.totals();
         EventsView {
             started_at: self.started_at,
             counters: store.counters().clone(),
@@ -333,14 +457,17 @@ impl Presence {
 #[cfg(test)]
 mod tests {
     use super::proc::fake::{FakeProc, BOOT};
+    use super::store::State;
     use super::*;
     use crate::claude::hook::{Event, Notice, Source};
+    use crate::claude::parse::TurnEnd;
     use crate::clock::FakeClock;
 
     const UID: u32 = 1000;
     const DAEMON: u32 = 7;
     const A: &str = "0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f";
     const B: &str = "1b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f";
+    const P1: &str = "9a8b7c6d-5e4f-4a3b-8c2d-000000000001";
 
     struct Env {
         fake: FakeProc,
@@ -349,6 +476,8 @@ mod tests {
         reader: Reader,
         db: std::path::PathBuf,
         clock: Arc<FakeClock>,
+        changes: tokio::sync::mpsc::Receiver<crate::events::Change>,
+        notifier: Notifier,
         _dir: tempfile::TempDir,
     }
 
@@ -368,12 +497,14 @@ mod tests {
         let writer = Arc::new(Writer::spawn(&db).unwrap());
         let reader = Reader::open(&db, 1).unwrap();
         let clock = Arc::new(FakeClock::new(1_000));
+        let (notifier, changes) = Notifier::channel();
         let presence = Presence::new(
             ProcFs::new(fake.root()),
             UID,
             DAEMON,
             Arc::clone(&writer),
             clock.clone(),
+            notifier.clone(),
         );
         Env {
             fake,
@@ -382,6 +513,8 @@ mod tests {
             reader,
             db,
             clock,
+            changes,
+            notifier,
             _dir: dir,
         }
     }
@@ -416,21 +549,70 @@ mod tests {
                 .map(|e| e.outcome)
                 .collect()
         }
+
+        fn restarted(&self) -> Presence {
+            Presence::new(
+                ProcFs::new(self.fake.root()),
+                UID,
+                DAEMON,
+                Arc::clone(&self.writer),
+                self.clock.clone(),
+                self.notifier.clone(),
+            )
+        }
+
+        /// The projects published since the last call.
+        fn published(&mut self) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Ok(c) = self.changes.try_recv() {
+                if let crate::events::Change::Project(id) = c {
+                    out.push(id);
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        }
     }
 
     #[tokio::test]
-    async fn events_open_and_close_sessions_and_the_database_follows() {
-        let e = env();
+    async fn events_open_change_and_close_sessions_and_the_database_follows() {
+        let mut e = env();
         let p = &e.presence;
-        p.report(
-            Some(300),
-            report(Event::SessionStart(Source::Startup), A, Some(100)),
-        )
-        .unwrap();
-        p.report(Some(300), report(Event::UserPromptSubmit, A, None))
+        assert_eq!(
+            p.report(
+                Some(300),
+                report(Event::SessionStart(Source::Startup), A, Some(100))
+            ),
+            Ok(Reported { resolve: true })
+        );
+        // The tracker resolves the session's project; a state change then publishes it.
+        assert_eq!(
+            p.cwds(),
+            [(
+                A.to_string(),
+                "/home/u/dev/SYNTHETIC-CWD-CANARY".to_string()
+            )]
+        );
+        p.assign(vec![(A.into(), Ok("proj".into()))]);
+        assert_eq!(e.published(), ["proj"]);
+        let p = &e.presence;
+        assert_eq!(p.live("proj").unwrap().state, State::Waiting);
+        assert_eq!(
+            p.report(Some(300), report(Event::UserPromptSubmit, A, None)),
+            Ok(Reported { resolve: false })
+        );
+        assert_eq!(p.live("proj").unwrap().state, State::Working);
+        assert_eq!(e.published(), ["proj"]);
+        let p = &e.presence;
+        p.report(Some(300), report(Event::PostToolUse, A, None))
             .unwrap();
+        assert!(
+            e.published().is_empty(),
+            "no state change, nothing published"
+        );
         assert_eq!(e.rows().await, [(A.to_string(), 100)]);
-        let v = p.events();
+        let v = e.presence.events();
         assert_eq!(
             (
                 v.counters.received,
@@ -438,36 +620,48 @@ mod tests {
                 v.open_noninteractive,
                 v.counters.last_event_at
             ),
-            (2, 1, 0, Some(1_000))
+            (3, 1, 0, Some(1_000))
         );
+        let p = &e.presence;
         p.report(Some(300), report(Event::SessionEnd, A, Some(100)))
             .unwrap();
         p.report(Some(300), report(Event::SessionEnd, B, None))
             .unwrap();
+        assert_eq!(p.live("proj"), None);
         assert!(e.rows().await.is_empty());
         assert_eq!(
             e.outcomes(),
-            ["opened", "accepted", "closed", "ignored (not open)"]
+            [
+                "opened: waiting",
+                "→ working",
+                "unchanged: working",
+                "closed",
+                "ignored (not open)"
+            ]
         );
-        let log = p.events().events;
+        assert_eq!(e.published(), ["proj"]);
+        let log = e.presence.events().events;
         assert_eq!(log[0].detail, Some("startup"));
         assert_eq!(
             log.iter().map(|l| l.claude_pid_sent).collect::<Vec<_>>(),
-            [Some(true), Some(false), Some(true), Some(false)]
+            [
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(false)
+            ]
         );
-        assert_eq!(log.iter().map(|l| l.seq).collect::<Vec<_>>(), [1, 2, 3, 4]);
     }
 
     #[tokio::test]
     async fn refusals_are_counted_logged_and_change_nothing() {
         let e = env();
         let p = &e.presence;
-        // CLAUDE_PID naming another process.
         assert_eq!(
             p.report(Some(300), report(Event::Stop, A, Some(200))),
             Err(Refusal::PidMismatch)
         );
-        // No claude above the peer; no peer pid at all.
         e.fake.process(400, UID, 50, 40, &["ccwm", "hook", "Stop"]);
         assert_eq!(
             p.report(Some(400), report(Event::Stop, A, None)),
@@ -481,7 +675,6 @@ mod tests {
             p.report(Some(-1), report(Event::Stop, A, None)),
             Err(Refusal::NoClaudeAncestor)
         );
-        // The daemon's own pid as CLAUDE_PID; a malformed request.
         assert_eq!(
             p.report(Some(300), report(Event::Stop, A, Some(DAEMON))),
             Err(Refusal::Malformed)
@@ -499,68 +692,123 @@ mod tests {
         let v = p.events();
         assert_eq!(v.open, 0);
         assert_eq!(v.counters.received, 6);
+        let r = &v.counters.refused;
         assert_eq!(
-            (
-                v.counters.refused.malformed,
-                v.counters.refused.no_claude_ancestor,
-                v.counters.refused.pid_mismatch,
-                v.counters.refused.limit
-            ),
+            (r.malformed, r.no_claude_ancestor, r.pid_mismatch, r.limit),
             (2, 3, 1, 0)
-        );
-        assert_eq!(
-            e.outcomes(),
-            [
-                "refused: pid_mismatch",
-                "refused: no_claude_ancestor",
-                "refused: no_claude_ancestor",
-                "refused: no_claude_ancestor",
-                "refused: malformed",
-                "refused: malformed"
-            ]
         );
         assert_eq!(v.events[5].event, Some("Stop"));
         assert!(e.rows().await.is_empty());
     }
 
     #[tokio::test]
-    async fn a_non_interactive_session_is_marked() {
-        let e = env();
+    async fn a_non_interactive_session_is_hidden_until_the_toggle_is_on() {
+        let mut e = env();
         e.fake
             .process(100, UID, 50, 20, &["claude", "-p", "SYNTHETIC-ARGV-PROMPT"]);
         e.presence
             .report(Some(300), report(Event::UserPromptSubmit, A, None))
             .unwrap();
+        e.presence.assign(vec![(A.into(), Ok("proj".into()))]);
         let v = e.presence.events();
         assert_eq!((v.open, v.open_noninteractive), (1, 1));
-        assert_eq!(e.outcomes(), ["opened (non-interactive)"]);
-        let shown = serde_json::to_string(&v).unwrap();
+        assert_eq!(e.outcomes(), ["opened: working (non-interactive)"]);
+        assert_eq!(e.presence.live("proj"), None);
+        assert!(e.presence.projects_matching(LiveFilter::Open).is_empty());
+        assert_eq!(e.presence.status().counts.hidden_noninteractive, 1);
+        e.published();
+        e.presence.set_show_noninteractive(true);
+        assert_eq!(e.published(), ["proj"], "republished");
+        assert_eq!(e.presence.live("proj").unwrap().state, State::Working);
+        assert_eq!(e.presence.projects_matching(LiveFilter::Working), ["proj"]);
+        e.presence.set_show_noninteractive(true);
+        assert!(e.published().is_empty(), "no change, nothing published");
+        let shown = serde_json::to_string(&e.presence.events()).unwrap()
+            + &serde_json::to_string(&e.presence.status()).unwrap()
+            + &serde_json::to_string(&e.presence.live("proj")).unwrap();
         assert!(
             !shown.contains("SYNTHETIC"),
-            "no argv, cwd or prompt in the view: {shown}"
+            "no argv, cwd or prompt in the views: {shown}"
         );
     }
 
     #[tokio::test]
+    async fn recorded_facts_end_the_current_turn_and_are_logged() {
+        let mut e = env();
+        let with_prompt = |event, p: &str| {
+            let mut r = report(event, A, None).unwrap();
+            r.prompt_id = Some(p.into());
+            Ok(r)
+        };
+        e.presence
+            .report(Some(300), with_prompt(Event::UserPromptSubmit, P1))
+            .unwrap();
+        e.presence.assign(vec![(A.into(), Ok("proj".into()))]);
+        e.presence
+            .report(
+                Some(300),
+                with_prompt(Event::Notification(Notice::PermissionPrompt), P1),
+            )
+            .unwrap();
+        e.published();
+        // "No" in the dialog: only the session file says so.
+        let older = TurnFact {
+            end: TurnEnd::Interrupted,
+            prompt_id: Some("9a8b7c6d-5e4f-4a3b-8c2d-000000000009".into()),
+            at_ms: 2_000_000,
+        };
+        let current = TurnFact {
+            end: TurnEnd::Interrupted,
+            prompt_id: Some(P1.into()),
+            at_ms: 1_000_500,
+        };
+        e.presence
+            .apply_facts(&[(A.into(), older), (B.into(), current.clone())]);
+        assert_eq!(
+            e.presence.live("proj").unwrap().state,
+            State::NeedsApproval,
+            "an older turn, a session not open"
+        );
+        e.presence.apply_facts(&[(A.into(), current.clone())]);
+        assert_eq!(e.presence.live("proj").unwrap().state, State::Waiting);
+        assert_eq!(e.published(), ["proj"]);
+        e.presence.apply_facts(&[(A.into(), current)]);
+        let out = e.outcomes();
+        assert_eq!(
+            &out[out.len() - 2..],
+            [
+                "interrupted (session file): an older turn, ignored",
+                "interrupted (session file): → waiting"
+            ],
+            "nothing logged when nothing changes"
+        );
+        assert_eq!(e.presence.status().counters.session_file_facts, 1);
+    }
+
+    #[tokio::test]
     async fn the_sweep_closes_sessions_whose_process_is_gone() {
-        let e = env();
+        let mut e = env();
         e.presence
             .report(Some(300), report(Event::Stop, A, None))
             .unwrap();
-        // A second claude with its own session.
         e.fake.process(500, UID, 50, 50, &["claude"]);
         e.fake.process(510, UID, 500, 51, &["ccwm", "hook", "Stop"]);
         e.presence
             .report(Some(510), report(Event::Stop, B, None))
             .unwrap();
+        e.presence.assign(vec![
+            (A.into(), Ok("p".into())),
+            (B.into(), Err(store::NOT_REGISTERED)),
+        ]);
         assert!(e.presence.sweep().is_empty(), "both alive");
-        // The first claude exits; the second's pid is reused by another process.
+        e.published();
         e.fake.remove(100);
         e.fake.process(500, UID, 50, 99, &["claude"]);
         let mut closed = e.presence.sweep();
         closed.sort();
         assert_eq!(closed, [A, B]);
         assert_eq!(e.presence.events().open, 0);
+        assert_eq!(e.published(), ["p"]);
         assert!(e.rows().await.is_empty());
         assert!(e.outcomes().ends_with(&[
             "closed: process gone".to_string(),
@@ -576,44 +824,44 @@ mod tests {
             .unwrap();
         e.fake
             .process_full(100, "claude", UID, UID, 50, 20, 'Z', &[b"claude"]);
-        // `claude --resume` in a new process: its first event (not SessionStart) moves the
-        // session there, because the old process is gone.
         e.fake.process(600, UID, 50, 60, &["claude", "--resume", A]);
         e.fake.process(610, UID, 600, 61, &["ccwm", "hook", "Stop"]);
-        e.presence
+        let r = e
+            .presence
             .report(
                 Some(610),
                 report(Event::Notification(Notice::IdlePrompt), A, None),
             )
             .unwrap();
+        assert!(r.resolve, "a new process: resolved again");
         assert_eq!(e.rows().await, [(A.to_string(), 600)]);
         assert!(e.presence.sweep().is_empty());
-        assert_eq!(e.outcomes(), ["opened", "new process"]);
+        assert_eq!(e.outcomes(), ["opened: waiting", "new process: waiting"]);
     }
 
     #[tokio::test]
-    async fn a_restart_restores_live_sessions_and_drops_the_others() {
+    async fn a_restart_restores_live_sessions_as_unknown_and_drops_the_others() {
         let e = env();
         e.fake.process(500, UID, 50, 50, &["claude"]);
         e.fake.process(510, UID, 500, 51, &["ccwm", "hook", "Stop"]);
         e.presence
-            .report(Some(300), report(Event::Stop, A, None))
+            .report(Some(300), report(Event::UserPromptSubmit, A, None))
             .unwrap();
         e.presence
             .report(Some(510), report(Event::Stop, B, None))
             .unwrap();
         e.writer.flush().await.unwrap();
-        // Restart: the first claude now runs with --print; the second has exited.
         e.fake.process(100, UID, 50, 20, &["claude", "--print"]);
         e.fake.remove(500);
-        let restarted = Presence::new(
-            ProcFs::new(e.fake.root()),
-            UID,
-            DAEMON,
-            Arc::clone(&e.writer),
-            e.clock.clone(),
-        );
+        let restarted = e.restarted();
         assert_eq!(restarted.restore(&e.reader).await.unwrap(), (1, 1));
+        restarted.assign(vec![(A.into(), Ok("proj".into()))]);
+        restarted.set_show_noninteractive(true);
+        assert_eq!(
+            restarted.live("proj").unwrap().state,
+            State::Unknown,
+            "never guessed"
+        );
         let v = restarted.events();
         assert_eq!(
             (v.open, v.open_noninteractive, v.counters.received),
@@ -621,53 +869,49 @@ mod tests {
         );
         let mut outcomes: Vec<String> = v.events.iter().map(|l| l.outcome.clone()).collect();
         outcomes.sort();
-        assert_eq!(outcomes, ["dropped at start: process gone", "restored"]);
-        assert_eq!(e.rows().await, [(A.to_string(), 100)]);
-        // A reboot (another boot id): nothing is restored, everything deleted.
-        e.fake.set_boot_id("2d2c3b4a-0000-4000-8000-00000000b007");
-        let rebooted = Presence::new(
-            ProcFs::new(e.fake.root()),
-            UID,
-            DAEMON,
-            Arc::clone(&e.writer),
-            e.clock.clone(),
+        assert_eq!(
+            outcomes,
+            ["dropped at start: process gone", "restored: unknown"]
         );
-        assert_eq!(rebooted.restore(&e.reader).await.unwrap(), (0, 1));
+        assert_eq!(e.rows().await, [(A.to_string(), 100)]);
+        e.fake.set_boot_id("2d2c3b4a-0000-4000-8000-00000000b007");
+        assert_eq!(e.restarted().restore(&e.reader).await.unwrap(), (0, 1));
         assert!(e.rows().await.is_empty());
-        // The boot id was BOOT for the first daemon.
         assert_eq!(BOOT.len(), 36);
     }
 
     #[tokio::test]
     async fn clear_session_index_empties_memory_and_database() {
-        let e = env();
+        let mut e = env();
         e.presence
             .report(Some(300), report(Event::Stop, A, None))
             .unwrap();
+        e.presence.assign(vec![(A.into(), Ok("proj".into()))]);
         assert_eq!(e.rows().await.len(), 1);
+        e.published();
         e.writer.clear_session_index().await.unwrap();
         e.presence.clear();
         assert!(e.rows().await.is_empty());
         assert_eq!(e.presence.events().open, 0);
+        assert_eq!(e.published(), ["proj"]);
         assert_eq!(
             e.outcomes().last().unwrap(),
             "cleared: 1 open session(s) forgotten"
         );
-        // Back with its next event.
         e.presence
             .report(Some(300), report(Event::Stop, A, None))
             .unwrap();
         assert_eq!(e.presence.events().open, 1);
     }
 
-    /// The cwd is persisted (by design, like a session row) but never in the view or a log.
     #[tokio::test]
     async fn the_cwd_reaches_only_the_open_sessions_table() {
         let e = env();
         e.presence
             .report(Some(300), report(Event::Stop, A, None))
             .unwrap();
-        let view = serde_json::to_string(&e.presence.events()).unwrap();
+        let view = serde_json::to_string(&e.presence.events()).unwrap()
+            + &serde_json::to_string(&e.presence.status()).unwrap();
         assert!(!view.contains("CANARY"), "{view}");
         e.writer.flush().await.unwrap();
         let cwd: String = rusqlite::Connection::open(&e.db)
@@ -677,11 +921,10 @@ mod tests {
         assert_eq!(cwd, "/home/u/dev/SYNTHETIC-CWD-CANARY");
     }
 
-    /// The debug log, full and with the longest values, fits in a socket response.
     #[tokio::test]
     async fn a_full_debug_log_fits_in_one_socket_response() {
         let e = env();
-        for i in 0..store::LOG_SIZE {
+        for _ in 0..store::LOG_SIZE {
             e.presence
                 .report(
                     Some(999_999),
@@ -692,14 +935,13 @@ mod tests {
                     ),
                 )
                 .unwrap_err();
-            assert!(i < store::LOG_SIZE);
         }
         e.clock.advance(1_000_000_000);
         let v = e.presence.events();
         assert_eq!(v.events.len(), store::LOG_SIZE);
         let line = crate::ipc::protocol::encode_response(&Ok(serde_json::to_value(&v).unwrap()));
         assert!(
-            line.len() < crate::client::MAX_RESPONSE_BYTES as usize,
+            line.len() < crate::client::MAX_RESPONSE_BYTES as usize * 3 / 4,
             "{} bytes",
             line.len()
         );

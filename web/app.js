@@ -128,7 +128,7 @@ function withServerDefaults(prefs, ui, stored) {
   return out;
 }
 
-const DEFAULT_QUERY = { q: "", sort: "activity", order: "desc", activity: "all", dirty: false, missing: false, ignored: false, sessions: false };
+const DEFAULT_QUERY = { q: "", sort: "activity", order: "desc", activity: "all", dirty: false, missing: false, ignored: false, sessions: false, live: "" };
 
 // The query string for the current search, sort and filters. Both views use exactly this.
 // In privacy mode the server omits hidden fields and does not search them.
@@ -145,10 +145,60 @@ function buildQuery(state, limit, cursor, privacy) {
   if (state.missing && state.activity !== "missing") qs.set("include_missing", "1");
   if (state.ignored) qs.set("include_ignored", "1");
   if (state.sessions) qs.set("has_sessions", "1");
+  if (LIVE_FILTERS.some(([v]) => v === state.live)) qs.set("live", state.live);
   if (privacy) qs.set("privacy", "1");
   qs.set("limit", String(limit));
   if (cursor) qs.set("cursor", cursor);
   return qs.toString();
+}
+
+// ---- v0.2: the session activity indicator (REQUIREMENTS.md §21.8) ------------------------------
+// The server sends states, counts and times only (the same in privacy mode); the dot is
+// decorative, the label is text, and the tooltip gives the details.
+
+const LIVE_LABEL = { needs_approval: "Needs approval", working: "Working", waiting: "Waiting for input", unknown: "Session open" };
+const LIVE_WORDS = { needs_approval: "needs approval", working: "working", waiting: "waiting for input", unknown: "state unknown" };
+const LIVE_CLASS = { needs_approval: "needs-approval", working: "working", waiting: "waiting", unknown: "unknown" };
+const APPROVAL_NOTE = "Claude Code does not report an approval: a tool you approved that is still running shows here until it finishes.";
+// The toolbar filters: the `live` query value and the button's text.
+const LIVE_FILTERS = [["waiting", "Waiting for me"], ["working", "Working"], ["open", "Open"]];
+const LIVE_STATS = { waiting: "waiting_for_me", working: "working", open: "open" };
+
+// "Needs approval", and from the first full minute since `since` "Needs approval · N min".
+function approvalLabel(since, now) {
+  const m = typeof since === "number" ? Math.floor(Math.max(0, now - since) / 60) : 0;
+  return m >= 1 ? `${LIVE_LABEL.needs_approval} · ${m} min` : LIVE_LABEL.needs_approval;
+}
+
+// "2 open sessions: 1 needs approval, 1 working".
+function liveCounts(live) {
+  const parts = Object.keys(LIVE_LABEL).filter((k) => live[k] > 0).map((k) => `${live[k]} ${LIVE_WORDS[k]}`);
+  return `${plural(live.sessions, "open session")}: ${parts.join(", ")}`;
+}
+
+// What a project's (or one session's) indicator shows: its classes, its visible label and the
+// text of its tooltip and accessible name. `null` without an open session to show.
+function liveDescriptor(live, now) {
+  if (!live || !LIVE_LABEL[live.state]) return null;
+  const approval = live.state === "needs_approval";
+  const label = approval ? approvalLabel(live.needs_approval_since, now) : LIVE_LABEL[live.state];
+  const since = typeof live.since === "number" ? ` since ${new Date(live.since * 1000).toLocaleTimeString()}` : "";
+  const detail = live.sessions > 1 ? liveCounts(live) : `Claude Code session: ${LIVE_WORDS[live.state]}${since}`;
+  return { cls: `live live--${LIVE_CLASS[live.state]}`, label, title: approval ? `${detail}. ${APPROVAL_NOTE}` : detail };
+}
+
+// One session's state (the detail panel) as a one-session aggregate.
+function sessionLive(s) {
+  if (!s || !LIVE_LABEL[s.state]) return null;
+  return { state: s.state, sessions: 1, [s.state]: 1, since: s.since, needs_approval_since: s.state === "needs_approval" ? s.since : null };
+}
+
+// A toolbar filter's text, with its count when the summary has one.
+function liveFilterLabel(value, stats) {
+  const f = LIVE_FILTERS.find(([v]) => v === value);
+  if (!f) return "";
+  const n = stats && stats.live && stats.live[LIVE_STATS[value]];
+  return typeof n === "number" ? `${f[1]} (${n})` : f[1];
 }
 
 // `?privacy=1` for the detail and status endpoints.
@@ -359,6 +409,7 @@ function settingsPatch(v) {
     activity: clean({ inactive_after_days: int(v.inactive_after_days), dormant_after_days: int(v.dormant_after_days) }),
     sessions: clean({ store_prompt_text: v.store_prompt_text }),
     ui: clean({ default_view: v.default_view, theme: v.theme, privacy: v.ui_privacy }),
+    indicator: clean({ show_noninteractive: v.show_noninteractive }),
   };
 }
 
@@ -374,6 +425,7 @@ if (typeof module !== "undefined") {
     plural, describeUnreadable, degradedSummary, truncatePath, calendarDaysAgo,
     withServerDefaults, privacySuffix, sessionParts, sessionSummary, resumeWarningText, durationText, promptStateText,
     describeScope, settingsPatch, changedSettings, restartNote, commitText,
+    approvalLabel, liveCounts, liveDescriptor, sessionLive, liveFilterLabel, LIVE_FILTERS, APPROVAL_NOTE,
     STORAGE_KEY, PREFS_KEY, DEFAULT_QUERY,
   };
 }
@@ -419,6 +471,7 @@ function startApp() {
   let wsConnected = false;
   let refetchTimer = null;
   let rotationTimer = null;
+  let liveTimer = null;
   let loadSeq = 0;
   let ui = null; // the rendered toolbar/stats/content containers
 
@@ -465,7 +518,7 @@ function startApp() {
 
   function stopLive() {
     if (ws) { const w = ws; ws = null; w.onclose = null; w.close(); }
-    clearTimeout(wsTimer); clearTimeout(refetchTimer); clearInterval(rotationTimer);
+    clearTimeout(wsTimer); clearTimeout(refetchTimer); clearInterval(rotationTimer); clearInterval(liveTimer);
     wsConnected = false;
   }
 
@@ -654,6 +707,30 @@ function startApp() {
     return h("ul", { class: "badges", "aria-label": "Details" }, ...list);
   }
 
+  // The activity indicator of a project or a session: a decorative dot, a text label, and the
+  // details in the tooltip and (for screen readers) after the label. Nothing without an open
+  // session to show.
+  function liveEl(live) {
+    const d = liveDescriptor(live, now());
+    if (!d) return null;
+    const el = h("span", { class: d.cls, title: d.title },
+      h("span", { class: "live-dot", "aria-hidden": "true" }),
+      h("span", { class: "live-label", text: d.label }),
+      h("span", { class: "sr-only", text: `. ${d.title}` }));
+    if (live.state === "needs_approval" && typeof live.needs_approval_since === "number") {
+      el.dataset.approvalSince = String(live.needs_approval_since);
+    }
+    return el;
+  }
+
+  // "Needs approval · N min" counts up without a reload.
+  function refreshApprovalLabels() {
+    for (const el of document.querySelectorAll(".live[data-approval-since]")) {
+      const label = el.querySelector(".live-label");
+      if (label) label.textContent = approvalLabel(Number(el.dataset.approvalSince), now());
+    }
+  }
+
   // The session line of a card or a table row. A recorded title is set apart as a quotation
   // (quotation marks, italics, named for screen readers and in the tooltip), so it cannot be
   // read as the state of the project.
@@ -678,6 +755,7 @@ function startApp() {
     return h("li", { class: `card${p.missing_since ? " missing" : ""}`, "data-status": status },
       h("div", { class: "head" },
         h("h3", { class: "line", title: p.name, text: p.name }),
+        liveEl(p.live),
         h("span", { class: "small muted", text: STATUS_LABEL[status] || status })),
       pathEl(p),
       h("p", { class: "line small" }, timeEl(p.activity),
@@ -706,6 +784,7 @@ function startApp() {
       h("table", {},
         h("thead", {}, h("tr", {},
           sortHeader("Name", "name", "col-name"),
+          h("th", { class: "col-live", scope: "col", text: "Claude" }),
           h("th", { class: "col-path", scope: "col", text: "Path" }),
           sortHeader("Last change", "activity", "col-mod"),
           h("th", { class: "col-status", scope: "col", text: "Activity" }),
@@ -715,6 +794,7 @@ function startApp() {
           h("th", { class: "col-act", scope: "col" }, h("span", { class: "sr-only", text: "Actions" })))),
         h("tbody", {}, ...rows.map((p) => h("tr", {},
           h("td", {}, h("span", { class: "line", title: p.name, text: p.name })),
+          h("td", {}, liveEl(p.live)),
           h("td", {}, pathEl(p, "span")),
           h("td", {}, h("span", { class: "line" }, timeEl(p.activity))),
           h("td", {}, h("span", { class: "line" }, h("span", { class: "dot", "data-status": p.activity.status }),
@@ -775,6 +855,10 @@ function startApp() {
         prefs = { ...prefs, view: state.view }; savePrefs();
         syncToolbar(); renderContent();
       } });
+    // The activity indicator's filters: at most one at a time; pressing the active one clears it.
+    const liveBtn = (v) => h("button", { type: "button", "data-live": v, "aria-pressed": state.live === v ? "true" : "false",
+      text: liveFilterLabel(v, stats),
+      onclick: () => { state = { ...state, live: state.live === v ? "" : v, page: 0 }; syncToolbar(); reload(); } });
     const refresh = h("button", { type: "button", id: "refresh", text: "Scan now",
       onclick: async () => {
         refresh.disabled = true;
@@ -787,6 +871,7 @@ function startApp() {
       check("sessions", "Has sessions", "sessions"),
       check("missing", "Show missing", "missing"),
       check("ignored", "Show ignored", "ignored"),
+      h("span", { class: "group", role: "group", "aria-label": "Claude Code sessions" }, ...LIVE_FILTERS.map(([v]) => liveBtn(v))),
       h("span", { class: "group", role: "group", "aria-label": "View" }, viewBtn("cards", "Cards"), viewBtn("table", "Table")),
       refresh);
   }
@@ -798,6 +883,15 @@ function startApp() {
     if ([...sort.options].some((o) => o.value === key)) sort.value = key;
     ui.toolbar.querySelector("#activity").value = state.activity;
     for (const b of ui.toolbar.querySelectorAll("[data-view]")) b.setAttribute("aria-pressed", b.dataset.view === state.view ? "true" : "false");
+    syncLiveFilters();
+  }
+
+  function syncLiveFilters() {
+    if (!ui) return;
+    for (const b of ui.toolbar.querySelectorAll("[data-live]")) {
+      b.setAttribute("aria-pressed", b.dataset.live === state.live ? "true" : "false");
+      b.textContent = liveFilterLabel(b.dataset.live, stats);
+    }
   }
 
   function ensureLayout() {
@@ -833,11 +927,18 @@ function startApp() {
 
   function renderStats() {
     if (ui) ui.summary.replaceChildren(statsList());
+    syncLiveFilters();
   }
 
   function emptyState() {
     const scanning = status && status.phase === "scanning";
-    const filtered = (state.q || "").trim() || state.activity !== "all" || state.dirty || state.sessions;
+    const filtered = (state.q || "").trim() || state.activity !== "all" || state.dirty || state.sessions || state.live;
+    if (state.live && stats && stats.live && stats.live.open === 0) {
+      // Nothing reports yet: the indicator is opt-in (Claude Code hooks the user adds).
+      return h("section", { class: "state" }, h("h2", { text: "No open Claude Code session" }),
+        h("p", {}, "No session reports yet: ", h("code", { text: "ccwm hooks print" }),
+          " prints the Claude Code hooks that send them (you add them to your Claude Code settings)."));
+    }
     if (filtered) {
       return h("section", { class: "state" }, h("h2", { text: "No projects match" }),
         h("p", { text: "Change the search or the filters to see more projects." }));
@@ -1022,6 +1123,8 @@ function startApp() {
     renderBanners();
     clearInterval(rotationTimer);
     rotationTimer = setInterval(() => { ensureFreshToken(); }, ROTATION_CHECK_MS);
+    clearInterval(liveTimer);
+    liveTimer = setInterval(refreshApprovalLabels, 30 * 1000);
   }
 
   async function setIgnored(p, ignored) {
@@ -1109,7 +1212,8 @@ function startApp() {
       h("section", {}, h("h3", { text: "Project" }), h("dl", {},
         field("Path", h("span", { class: "path", text: d.path || "Hidden in privacy mode" })),
         field("Found from", h("span", { text: d.sources.map((x) => (x === "session" ? "Claude Code sessions" : "CLAUDE.md")).join(" and ") })),
-        field("Last change", timeEl(d.activity)))),
+        field("Last change", timeEl(d.activity)),
+        d.live ? field("Open sessions", h("span", {}, liveEl(d.live), h("span", { class: "small muted", text: ` ${liveCounts(d.live)}` }))) : null)),
       h("section", {}, h("h3", { text: "Git" }), h("dl", {},
         field("Status", h("span", { class: g && g.dirty ? "dirty" : "", text: gitSummary(g) })),
         g && g.upstream ? field("Upstream", h("span", { text: `${g.upstream}${typeof g.ahead === "number" ? `, ${g.ahead} ahead, ${g.behind} behind` : ""}` })) : null,
@@ -1130,6 +1234,7 @@ function startApp() {
         field("Started", h("span", { text: when(latest.started_at) })),
         field("Last activity", h("span", { text: `${when(latest.last_activity_at)}${durationText(latest.duration_s) ? ` (${durationText(latest.duration_s)} after the start)` : ""}` })),
         field("Sessions", h("span", { text: String(s.total) })),
+        latest.live ? field("Now", liveEl(sessionLive(latest.live))) : null,
         latest.version ? field("Claude Code", h("span", { text: latest.version })) : null,
         latest.cwd_changed ? field("Note", h("span", { class: "small", text: "The session changed folder after it started; resume uses the first folder." })) : null,
         promptBlock("Last prompt", latest.last_prompt),
@@ -1207,6 +1312,7 @@ function startApp() {
         input("s-dormant", "Dormant after (calendar days)", c.activity.dormant_after_days, { type: "number", min: "2", max: "3650" })),
       h("fieldset", {}, h("legend", { text: "Claude Code sessions" }),
         input("s-store", "Store prompt text (the last prompt, redacted, cached in ccwm's database; turning this off deletes it)", c.sessions.store_prompt_text, { type: "checkbox" }),
+        input("s-noninteractive", "Show non-interactive sessions (-p, SDK) in the activity indicator", Boolean(c.indicator && c.indicator.show_noninteractive), { type: "checkbox" }),
         clearIndexButton()),
       h("fieldset", {}, h("legend", { text: "Server and appearance" }),
         input("s-port", "Port on 127.0.0.1", c.server.port, { type: "number", min: "1024", max: "65535" }, true),
@@ -1228,6 +1334,7 @@ function startApp() {
         inactive_after_days: val("s-inactive").value, dormant_after_days: val("s-dormant").value,
         store_prompt_text: val("s-store").checked, port: val("s-port").value,
         default_view: val("s-view").value, theme: val("s-theme").value, ui_privacy: val("s-privacy").checked,
+        show_noninteractive: val("s-noninteractive").checked,
       }), st.config);
       if (Object.keys(patch).length === 0) { msg.textContent = "Nothing changed."; return; }
       msg.textContent = "Saving…";

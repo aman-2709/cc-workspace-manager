@@ -13,9 +13,11 @@
 //! and later appends are not read either, until the predicate changes its mind (a restart with
 //! other roots) — then the file is parsed again from byte 0.
 
-use super::record::{parse_timestamp, DerivedFrom, Head, CONVERSATIONAL, KNOWN_TYPES};
+use super::record::{
+    parse_timestamp, parse_timestamp_ms, DerivedFrom, Head, CONVERSATIONAL, KNOWN_TYPES,
+};
 use super::redact::redact;
-use super::resume::is_uuid;
+use super::resume::{is_lower_uuid, is_uuid};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -91,6 +93,45 @@ pub struct Aggregate {
     pub counts: Counts,
 }
 
+/// How a turn ended, as Claude Code recorded it (REQUIREMENTS.md §21.2a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// The user ended it: Esc during a reply or a running tool, "No" or Esc in a permission
+    /// dialog.
+    Interrupted,
+    /// `system` `turn_duration`: the turn finished (written after the `Stop` hooks).
+    Ended,
+}
+
+/// A recorded end of a turn: what the activity indicator may learn from a session file. Never
+/// stored; only the latest of one read is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFact {
+    pub end: TurnEnd,
+    /// The turn's prompt id when the record has one (`user` records), a lower-case UUID.
+    pub prompt_id: Option<String>,
+    /// The record's timestamp, milliseconds since the epoch.
+    pub at_ms: i64,
+}
+
+/// The end of a turn `head` (a record of type `kind`) records, from structural fields only:
+/// `interruptedMessageId` with `rowSource: "harness"` or `toolDenialKind: "user-rejected"` on a
+/// `user` record, `isAbortedMidStream: true` on an `assistant` record, `subtype:
+/// "turn_duration"` on a `system` record. Claude Code's interruption strings are never read.
+pub fn turn_end(kind: &str, head: &Head) -> Option<TurnEnd> {
+    match kind {
+        "user" => {
+            let marker = head.interrupted_message_id.is_some()
+                && head.row_source.as_deref() == Some("harness");
+            let rejected = head.tool_denial_kind.as_deref() == Some("user-rejected");
+            (marker || rejected).then_some(TurnEnd::Interrupted)
+        }
+        "assistant" => (head.is_aborted_mid_stream == Some(true)).then_some(TurnEnd::Interrupted),
+        "system" => (head.subtype.as_deref() == Some("turn_duration")).then_some(TurnEnd::Ended),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Same identity, size and mtime as the checkpoint: nothing read.
@@ -100,6 +141,8 @@ pub enum Outcome {
         aggregate: Box<Aggregate>,
         /// The previous aggregate was discarded (rotation, truncation or rewrite).
         reset: bool,
+        /// The latest recorded end of a turn among the records read now (§21.2a).
+        fact: Option<TurnFact>,
     },
 }
 
@@ -148,6 +191,7 @@ pub fn parse(
                     },
                     aggregate: Box::new(a.clone()),
                     reset: false,
+                    fact: None,
                 });
             } else if now.size == c.size {
                 (0, Aggregate::default(), true) // same size, new mtime: rewritten in place
@@ -165,6 +209,7 @@ pub fn parse(
     let mut line: Vec<u8> = Vec::new();
     let mut oversized = false;
     let mut partial = false;
+    let mut fact = None;
     loop {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
@@ -191,7 +236,7 @@ pub fn parse(
                 agg.counts.oversized += 1;
             } else if !line.iter().all(u8::is_ascii_whitespace) {
                 let had_cwd = agg.first_cwd.is_some();
-                apply_line(&mut agg, session_id, &line);
+                apply_line(&mut agg, &mut fact, session_id, &line);
                 if !had_cwd && agg.first_cwd.as_deref().is_some_and(stop) {
                     partial = true;
                 }
@@ -213,6 +258,7 @@ pub fn parse(
         },
         aggregate: Box::new(agg),
         reset,
+        fact,
     })
 }
 
@@ -226,8 +272,8 @@ fn set_last(slot: &mut Option<String>, v: Option<String>) {
     }
 }
 
-/// Fold one complete line into the aggregate.
-fn apply_line(agg: &mut Aggregate, session_id: &str, line: &[u8]) {
+/// Fold one complete line into the aggregate; a recorded end of a turn replaces `fact`.
+fn apply_line(agg: &mut Aggregate, fact: &mut Option<TurnFact>, session_id: &str, line: &[u8]) {
     agg.counts.lines += 1;
     let Ok(head) = serde_json::from_slice::<Head>(line) else {
         agg.counts.malformed += 1;
@@ -244,6 +290,15 @@ fn apply_line(agg: &mut Aggregate, session_id: &str, line: &[u8]) {
     if !KNOWN_TYPES.contains(&kind) {
         agg.counts.unknown += 1;
         return;
+    }
+    if let Some(end) = turn_end(kind, &head) {
+        if let Some(at_ms) = head.timestamp.as_deref().and_then(parse_timestamp_ms) {
+            *fact = Some(TurnFact {
+                end,
+                prompt_id: head.prompt_id.clone().filter(|p| is_lower_uuid(p)),
+                at_ms,
+            });
+        }
     }
     if CONVERSATIONAL.contains(&kind) {
         if let Some(t) = head.timestamp.as_deref().and_then(parse_timestamp) {
@@ -320,9 +375,260 @@ mod tests {
                 checkpoint,
                 aggregate,
                 reset,
+                ..
             } => (checkpoint, *aggregate, reset),
             Outcome::Unchanged => panic!("expected an update"),
         }
+    }
+
+    fn fact_of(o: Outcome) -> Option<TurnFact> {
+        match o {
+            Outcome::Updated { fact, .. } => fact,
+            Outcome::Unchanged => panic!("expected an update"),
+        }
+    }
+
+    // ---- v0.2: the recorded ends of a turn (REQUIREMENTS.md §21.2a) ---------------------------
+
+    const TURN_SID: &str = "5e55a0b1-2c3d-4e5f-8a9b-0c1d2e3f4a5b";
+    const TURN_P: &str = "6b38c910-1111-4aaa-8bbb-000000000001";
+    const FIXED: [&str; 2] = [
+        "[Request interrupted by user]",
+        "[Request interrupted by user for tool use]",
+    ];
+
+    fn turn_fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/turns/2.1.332")
+            .join(format!("{name}.jsonl"))
+    }
+
+    fn turn_fact(name: &str) -> Option<TurnFact> {
+        let mut f = File::open(turn_fixture(name)).unwrap();
+        fact_of(parse(&mut f, TURN_SID, None, &read_all).unwrap())
+    }
+
+    fn ms(ts: &str) -> i64 {
+        parse_timestamp_ms(ts).unwrap()
+    }
+
+    #[test]
+    fn every_recorded_end_of_a_turn_gives_its_fact() {
+        let interrupted = |at: &str| {
+            Some(TurnFact {
+                end: TurnEnd::Interrupted,
+                prompt_id: Some(TURN_P.into()),
+                at_ms: ms(at),
+            })
+        };
+        let ended = |at: &str| {
+            Some(TurnFact {
+                end: TurnEnd::Ended,
+                prompt_id: None,
+                at_ms: ms(at),
+            })
+        };
+        // The latest fact of the read: for an interrupt, the user marker (it has the prompt id).
+        assert_eq!(
+            turn_fact("esc-during-reply"),
+            interrupted("2026-11-27T01:06:00.607Z")
+        );
+        assert_eq!(
+            turn_fact("deny-in-dialog"),
+            interrupted("2026-11-27T01:09:31.063Z")
+        );
+        assert_eq!(
+            turn_fact("esc-on-dialog"),
+            interrupted("2026-11-27T01:12:42.284Z")
+        );
+        assert_eq!(
+            turn_fact("esc-during-approved-tool"),
+            interrupted("2026-11-27T01:11:30.247Z")
+        );
+        assert_eq!(turn_fact("normal-turn"), ended("2026-11-27T01:07:29.3Z"));
+        assert_eq!(turn_fact("approved-tool"), ended("2026-11-27T01:08:50.3Z"));
+        assert_eq!(
+            turn_fact("clear-and-exit"),
+            None,
+            "rowSource harness alone is no interruption"
+        );
+        let next = turn_fact("esc-then-next-turn").unwrap();
+        assert_eq!(
+            (next.end, next.at_ms),
+            (TurnEnd::Ended, ms("2026-11-27T01:20:12.3Z"))
+        );
+    }
+
+    /// The structural rule and Claude Code's fixed strings agree: an interruption is found in
+    /// exactly the fixtures whose records carry one of the strings, and for the same turn (the
+    /// marker's `promptId`). The parser never reads the text; this test does, to corroborate.
+    #[test]
+    fn the_structural_rule_matches_the_fixed_interruption_strings() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/turns/2.1.332");
+        let mut files = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let mut structural = Vec::new(); // prompt ids of the records the rule marks
+            let mut strings = Vec::new(); // prompt ids of the records with a fixed string
+            for line in text.lines() {
+                let head: Head = serde_json::from_str(line).unwrap();
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                let kind = head.kind.clone().unwrap();
+                if turn_end(&kind, &head) == Some(TurnEnd::Interrupted) {
+                    structural.push(head.prompt_id.clone());
+                }
+                let blocks = v
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if blocks.iter().any(|b| {
+                    b.get("text")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| FIXED.contains(&t))
+                }) {
+                    strings.push(head.prompt_id.clone());
+                    assert_eq!(
+                        head.row_source.as_deref(),
+                        Some("harness"),
+                        "{path:?}: the marker is Claude Code's"
+                    );
+                }
+            }
+            files += 1;
+            assert_eq!(structural.is_empty(), strings.is_empty(), "{path:?}");
+            for p in &strings {
+                assert!(
+                    structural.contains(p),
+                    "{path:?}: the marker's turn is the one the rule finds"
+                );
+            }
+        }
+        assert_eq!(files, 8, "every fixture is checked");
+    }
+
+    #[test]
+    fn a_turn_end_is_learned_from_an_append_and_again_from_a_read_from_byte_0() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join(format!("{TURN_SID}.jsonl"));
+        let text = std::fs::read_to_string(turn_fixture("deny-in-dialog")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        std::fs::write(&p, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+        let (c, a, _) = updated(run_id(&p, None, TURN_SID));
+        let mut f = File::open(&p).unwrap();
+        assert_eq!(
+            fact_of(parse(&mut f, TURN_SID, None, &read_all).unwrap()),
+            None,
+            "prompt and tool use only"
+        );
+        // The rejection is appended: only the new records are read, and they hold the fact.
+        let mut w = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        writeln!(w, "{}\n{}", lines[2], lines[3]).unwrap();
+        let fact = fact_of(run_id(&p, Some((c, a)), TURN_SID)).unwrap();
+        assert_eq!(
+            (fact.end, fact.prompt_id.as_deref()),
+            (TurnEnd::Interrupted, Some(TURN_P))
+        );
+        // A read from byte 0 (no checkpoint) finds the same, latest fact again: the indicator
+        // tells it from a new one by its turn (§21.2a), not by how often it is read.
+        assert_eq!(fact_of(run_id(&p, None, TURN_SID)), Some(fact));
+    }
+
+    #[test]
+    fn turn_end_fields_of_other_types_or_values_are_ignored() {
+        let head = |json: &str| serde_json::from_str::<Head>(json).unwrap();
+        let end = |kind: &str, json: &str| turn_end(kind, &head(json));
+        assert_eq!(
+            end(
+                "user",
+                r#"{"interruptedMessageId":"m","rowSource":"harness"}"#
+            ),
+            Some(TurnEnd::Interrupted)
+        );
+        assert_eq!(
+            end(
+                "user",
+                r#"{"interruptedMessageId":"m","rowSource":"local"}"#
+            ),
+            None,
+            "only Claude Code's own marker"
+        );
+        assert_eq!(
+            end(
+                "user",
+                r#"{"interruptedMessageId":null,"rowSource":"harness"}"#
+            ),
+            None
+        );
+        assert_eq!(end("user", r#"{"rowSource":"harness"}"#), None);
+        assert_eq!(
+            end("user", r#"{"toolDenialKind":"user-rejected"}"#),
+            Some(TurnEnd::Interrupted)
+        );
+        assert_eq!(
+            end("user", r#"{"toolDenialKind":"classifier-denied"}"#),
+            None,
+            "other kinds do not end a turn"
+        );
+        assert_eq!(end("user", r#"{"toolDenialKind":7}"#), None);
+        assert_eq!(
+            end("assistant", r#"{"isAbortedMidStream":true}"#),
+            Some(TurnEnd::Interrupted)
+        );
+        assert_eq!(end("assistant", r#"{"isAbortedMidStream":false}"#), None);
+        assert_eq!(end("assistant", r#"{"isAbortedMidStream":"true"}"#), None);
+        assert_eq!(
+            end("user", r#"{"isAbortedMidStream":true}"#),
+            None,
+            "an assistant field"
+        );
+        assert_eq!(
+            end("system", r#"{"subtype":"turn_duration"}"#),
+            Some(TurnEnd::Ended)
+        );
+        assert_eq!(end("system", r#"{"subtype":"stop_hook_summary"}"#), None);
+        assert_eq!(end("assistant", r#"{"subtype":"turn_duration"}"#), None);
+        assert_eq!(
+            end("attachment", r#"{"toolDenialKind":"user-rejected"}"#),
+            None
+        );
+        // A prompt id that is not a lower-case UUID is dropped; the fact keeps its time.
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("x.jsonl");
+        std::fs::write(&p, format!("{{\"type\":\"user\",\"sessionId\":\"{TURN_SID}\",\"timestamp\":\"2026-01-01T00:00:00.250Z\",\"promptId\":\"NOT-A-UUID\",\"toolDenialKind\":\"user-rejected\"}}\n")).unwrap();
+        let fact = fact_of(run_id(&p, None, TURN_SID)).unwrap();
+        assert_eq!(
+            (fact.prompt_id, fact.at_ms),
+            (None, ms("2026-01-01T00:00:00.250Z"))
+        );
+        // Without a timestamp there is no fact (it could not be ordered).
+        std::fs::write(&p, format!("{{\"type\":\"system\",\"sessionId\":\"{TURN_SID}\",\"subtype\":\"turn_duration\"}}\n")).unwrap();
+        assert_eq!(fact_of(run_id(&p, None, TURN_SID)), None);
+    }
+
+    /// The parser reads none of the text of these records: the canaries in prompts, replies
+    /// and tool output reach no fact or aggregate.
+    #[test]
+    fn turn_records_leave_their_text_unread() {
+        for name in [
+            "esc-during-reply",
+            "deny-in-dialog",
+            "approved-tool",
+            "esc-then-next-turn",
+        ] {
+            let mut f = File::open(turn_fixture(name)).unwrap();
+            let shown = format!("{:?}", parse(&mut f, TURN_SID, None, &read_all).unwrap());
+            for c in ["CANARY", "doesn't want", "Request interrupted"] {
+                assert!(!shown.contains(c), "{name}: {c} in {shown}");
+            }
+        }
+    }
+
+    fn run_id(path: &std::path::Path, prev: Option<(Checkpoint, Aggregate)>, id: &str) -> Outcome {
+        let mut f = File::open(path).unwrap();
+        parse(&mut f, id, prev.as_ref().map(|(c, a)| (c, a)), &read_all).unwrap()
     }
 
     #[test]

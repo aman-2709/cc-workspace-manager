@@ -111,6 +111,39 @@ pub fn daemon(ping: &std::result::Result<Value, String>, not_running: bool) -> C
     }
 }
 
+/// The session activity indicator (REQUIREMENTS.md §21.10): informational only — hooks are
+/// opt-in, so none received is no failure. No settings file is read.
+pub fn hooks(status: Option<&Value>) -> Check {
+    let Some(h) = status else {
+        return check(
+            "hooks",
+            Level::Info,
+            "the daemon is not running: hook events cannot be checked",
+        );
+    };
+    match h.get("last_event_at").and_then(Value::as_i64) {
+        None => check(
+            "hooks",
+            Level::Info,
+            "no hook event since the daemon started; the session activity indicator is opt-in (`ccwm hooks print`)",
+        ),
+        Some(_) => check(
+            "hooks",
+            Level::Info,
+            format!(
+                "last hook event {}; {} received, {} refused; {} open session(s)",
+                crate::cli::when(h, "/last_event_at"),
+                n(h, "/received").unwrap_or(0),
+                ["malformed", "no_claude_ancestor", "pid_mismatch", "limit"]
+                    .iter()
+                    .filter_map(|k| n(h, &format!("/refused/{k}")))
+                    .sum::<u64>(),
+                n(h, "/open").unwrap_or(0) + n(h, "/hidden_noninteractive").unwrap_or(0),
+            ),
+        ),
+    }
+}
+
 /// The TCP port: the daemon's, or (no daemon) whether the configured one is free.
 pub fn port(status: Option<&Value>, configured: u16, free: Option<bool>) -> Check {
     if let Some(st) = status {
@@ -607,6 +640,7 @@ pub fn checks() -> Result<Vec<Check>> {
         &session_dir_state(&session_dir),
         discovery.as_ref(),
     ));
+    out.push(hooks(status.as_ref().and_then(|s| s.get("hooks"))));
 
     let mut entries: Vec<Entry> = dirs.all().iter().map(|d| entry(d, &owner)).collect();
     for f in [

@@ -478,15 +478,27 @@ fn a_fake_claude_tree_reports_through_the_printed_hooks() {
     let mut first = fake.start(&env, "self", 60, &turn, &[]);
     fake.wait_hooks(turn.len());
     let mut want = vec![
-        entry("SessionStart", "startup", SID, "true", "opened"),
-        entry("UserPromptSubmit", "-", SID, "true", "accepted"),
-        entry("Notification", "permission_prompt", SID, "true", "accepted"),
-        entry("PostToolUse", "-", SID, "true", "accepted"),
-        entry("PostToolUseFailure", "-", SID, "true", "accepted"),
-        entry("PostToolBatch", "-", SID, "true", "accepted"),
-        entry("Stop", "-", SID, "true", "accepted"),
-        entry("StopFailure", "-", SID, "true", "accepted"),
-        entry("Notification", "idle_prompt", SID, "true", "accepted"),
+        entry("SessionStart", "startup", SID, "true", "opened: waiting"),
+        entry("UserPromptSubmit", "-", SID, "true", "→ working"),
+        entry(
+            "Notification",
+            "permission_prompt",
+            SID,
+            "true",
+            "→ needs_approval",
+        ),
+        entry("PostToolUse", "-", SID, "true", "→ working"),
+        entry("PostToolUseFailure", "-", SID, "true", "unchanged: working"),
+        entry("PostToolBatch", "-", SID, "true", "unchanged: working"),
+        entry("Stop", "-", SID, "true", "→ waiting"),
+        entry("StopFailure", "-", SID, "true", "unchanged: waiting"),
+        entry(
+            "Notification",
+            "idle_prompt",
+            SID,
+            "true",
+            "unchanged: waiting",
+        ),
     ];
     assert_eq!(log(&env, 0), want);
     assert_eq!(events(&env)["open"], 1);
@@ -504,7 +516,13 @@ fn a_fake_claude_tree_reports_through_the_printed_hooks() {
         &[],
     );
     fake2.wait_hooks(1);
-    want.push(entry("SessionStart", "startup", SID2, "false", "opened"));
+    want.push(entry(
+        "SessionStart",
+        "startup",
+        SID2,
+        "false",
+        "opened: waiting",
+    ));
     assert_eq!(log(&env, 0), want);
 
     // 3. CLAUDE_PID naming another process (this test): refused.
@@ -566,7 +584,7 @@ fn a_fake_claude_tree_reports_through_the_printed_hooks() {
         "-",
         SID3,
         "true",
-        "opened (non-interactive)",
+        "opened: working (non-interactive)",
     ));
     assert_eq!(log(&env, 0), want);
     let v = events(&env);
@@ -704,7 +722,7 @@ fn a_restart_restores_open_sessions_whose_process_still_runs() {
     assert_eq!(
         outcomes,
         [
-            (SID.to_string(), "restored".to_string()),
+            (SID.to_string(), "restored: unknown".to_string()),
             (
                 SID2.to_string(),
                 "dropped at start: process gone".to_string()
@@ -748,5 +766,325 @@ fn a_restart_restores_open_sessions_whose_process_still_runs() {
     let d = Daemon::start(&env, &[]);
     assert_eq!(events(&env)["open"], 0, "nothing left to restore");
     kill_group(&mut again);
+    assert_eq!(d.stop().0, Some(0));
+}
+
+// ---- stop 2: states, projects, recorded facts, the toggle --------------------------------------
+
+/// A fake `claude` (`bash` with `argv[0]` `claude`, `CLAUDE_PID=$$`) that runs one hook per line
+/// written to its control FIFO (`<event> <input file>`), through the printed guarded command, and
+/// stays alive until `exit` or it is killed. One process for a whole session, as Claude Code.
+struct StepClaude {
+    dir: PathBuf,
+    child: Child,
+    done: usize,
+}
+
+impl StepClaude {
+    fn start(env: &SynthEnv, name: &str, options: &[&str]) -> Self {
+        let dir = env.root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("step-claude.sh");
+        common::write_executable(
+            &script,
+            r#"#!/bin/bash
+set -u
+here=$(dirname "$0")
+export CLAUDE_PID=$$
+n=0
+while read -r event input < "$here/ctl"; do
+  [ "$event" = exit ] && break
+  cmd=$(cat "$here/cmd-$event")
+  sh -c "$cmd" < "$input" > "$here/out-$n"
+  echo "$? $(wc -c < "$here/out-$n")" >> "$here/results"
+  n=$((n + 1))
+done
+"#,
+        );
+        let ctl = dir.join("ctl");
+        nix::unistd::mkfifo(&ctl, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        for event in cc_workspace_manager::claude::hook::EVENT_NAMES {
+            std::fs::write(
+                dir.join(format!("cmd-{event}")),
+                guarded_command(BIN, event),
+            )
+            .unwrap();
+        }
+        let mut c = std::process::Command::new("/bin/bash");
+        c.arg0("claude")
+            .arg(&script)
+            .args(options)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .envs(env.env_pairs())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = c.spawn().unwrap();
+        Self {
+            dir,
+            child,
+            done: 0,
+        }
+    }
+
+    /// Run one hook with `input` and wait until it exited (0, nothing on stdout).
+    fn step(&mut self, event: &str, input: &str) {
+        let file = self.dir.join(format!("in-{}", self.done));
+        std::fs::write(&file, input).unwrap();
+        std::fs::write(
+            self.dir.join("ctl"),
+            format!("{event} {}\n", file.display()),
+        )
+        .unwrap();
+        self.done += 1;
+        let results = self.dir.join("results");
+        let n = self.done;
+        wait_until("the hook", 10, || {
+            std::fs::read_to_string(&results).is_ok_and(|r| r.lines().count() == n)
+        });
+        let last = std::fs::read_to_string(&results)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert_eq!(last, "0 0", "{event}: status and stdout size");
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for StepClaude {
+    fn drop(&mut self) {
+        kill_group(&mut self.child);
+    }
+}
+
+const P2: &str = "7a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c62";
+
+/// The hook input of `file` for session `sid`, in the project at `cwd`, with `prompt` as its
+/// prompt id (where it has one).
+fn input(file: &str, sid: &str, cwd: &Path, prompt: &str) -> String {
+    fixture(file)
+        .replace(SID, sid)
+        .replace("/home/synthetic/dev/alpha", cwd.to_str().unwrap())
+        .replace("9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", prompt)
+}
+
+fn project<'a>(page: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("{name} in {page}"))
+}
+
+fn live_state(d: &Daemon, token: &str, name: &str) -> Option<String> {
+    let page = d.get_json(token, "/api/v1/projects?limit=200");
+    project(&page, name)["live"]["state"]
+        .as_str()
+        .map(str::to_string)
+}
+
+fn wait_live(d: &Daemon, token: &str, name: &str, want: Option<&str>) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let got = live_state(d, token, name);
+        if got.as_deref() == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name}: live {got:?}, want {want:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// REQUIREMENTS.md §21.6–§21.8 at process level: a fake Claude Code session in a synthetic
+/// project goes through every state; the daemon resolves the session's project from its cwd,
+/// publishes each change over the WebSocket, learns an interruption that no hook reports from
+/// the session file (§21.2a), shows the state in the session list, and closes the session when
+/// its process is killed.
+#[test]
+fn a_session_goes_through_every_state_in_the_api_and_the_websocket() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 0).unwrap();
+    let d = Daemon::start(&env, &[]);
+    let token = d.login(&env);
+    d.wait_scan_done(&token);
+    let alpha = env.home.join("dev/alpha");
+    let page = d.get_json(&token, "/api/v1/projects?limit=200");
+    let alpha_id = project(&page, "alpha")["id"].as_str().unwrap().to_string();
+    assert_eq!(project(&page, "alpha")["live"], serde_json::Value::Null);
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", d.port).parse().unwrap();
+    let mut ws = common::WsClient::connect(addr, d.port, Some(&d.origin())).unwrap();
+    ws.send_text(&format!(r#"{{"type":"auth","token":"{token}"}}"#));
+    assert_eq!(ws.recv_json(Duration::from_secs(5))["type"], "ready");
+
+    let sid = "4b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f";
+    let mut claude = StepClaude::start(&env, "step1", &[]);
+    claude.step("SessionStart", &input("SessionStart.json", sid, &alpha, P2));
+    // The project comes from the session's cwd; the change is published live.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(Instant::now() < deadline, "no live update for alpha");
+        if let Some(common::Frame::Text(text)) = ws.recv(Duration::from_secs(1)) {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if v["type"] == "project"
+                && v["project"]["id"] == alpha_id.as_str()
+                && v["project"]["live"]["state"] == "waiting"
+            {
+                assert_eq!(v["project"]["live"]["sessions"], 1);
+                break;
+            }
+        }
+    }
+    claude.step(
+        "UserPromptSubmit",
+        &input("UserPromptSubmit.json", sid, &alpha, P2),
+    );
+    wait_live(&d, &token, "alpha", Some("working"));
+    claude.step(
+        "Notification",
+        &input("Notification-permission_prompt.json", sid, &alpha, P2),
+    );
+    wait_live(&d, &token, "alpha", Some("needs_approval"));
+    let page = d.get_json(&token, "/api/v1/projects?limit=200&live=waiting");
+    assert_eq!(page["items"].as_array().unwrap().len(), 1, "Waiting for me");
+    assert!(project(&page, "alpha")["live"]["needs_approval_since"].is_i64());
+    claude.step("PostToolUse", &input("PostToolUse.json", sid, &alpha, P2));
+    wait_live(&d, &token, "alpha", Some("working"));
+    claude.step("Stop", &input("Stop.json", sid, &alpha, P2));
+    wait_live(&d, &token, "alpha", Some("waiting"));
+
+    // A new prompt, then "No" in a permission dialog: no hook says so, the session file does.
+    let p3 = "8a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c63";
+    claude.step(
+        "UserPromptSubmit",
+        &input("UserPromptSubmit.json", sid, &alpha, p3),
+    );
+    claude.step(
+        "Notification",
+        &input("Notification-permission_prompt.json", sid, &alpha, p3),
+    );
+    wait_live(&d, &token, "alpha", Some("needs_approval"));
+    let sessions = env.claude_dir.join("projects/-synthetic-dev-alpha-o11");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let now = jiff::Timestamp::now();
+    let ts = |s: i64| (now + jiff::SignedDuration::from_secs(s)).to_string();
+    let rec = |v: serde_json::Value| format!("{v}\n");
+    let file = [
+        rec(serde_json::json!({"type": "user", "sessionId": sid, "timestamp": ts(-5), "cwd": alpha, "promptId": p3, "promptSource": "typed",
+            "message": {"role": "user", "content": "SYNTHETIC-PROMPT-CANARY"}})),
+        rec(serde_json::json!({"type": "assistant", "sessionId": sid, "timestamp": ts(-4), "cwd": alpha,
+            "message": {"role": "assistant", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "SYNTHETIC-TOOL-CANARY"}}]}})),
+        rec(serde_json::json!({"type": "user", "sessionId": sid, "timestamp": ts(-1), "cwd": alpha, "promptId": p3,
+            "toolUseResult": "User rejected tool use", "toolDenialKind": "user-rejected", "toolDenialBeforeRun": true,
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": "SYNTHETIC-TOOL-CANARY"}]}})),
+        rec(serde_json::json!({"type": "user", "sessionId": sid, "timestamp": ts(0), "cwd": alpha, "promptId": p3, "rowSource": "harness",
+            "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}})),
+    ]
+    .concat();
+    std::fs::write(sessions.join(format!("{sid}.jsonl")), file).unwrap();
+    wait_live(&d, &token, "alpha", Some("waiting"));
+    let log = events(&env)["events"].to_string();
+    assert!(
+        log.contains("interrupted (session file): → waiting"),
+        "{log}"
+    );
+    // The session file made the session indexed: the session list shows its state.
+    let list = d.get_json(
+        &token,
+        &format!("/api/v1/projects/{alpha_id}/sessions?limit=1"),
+    );
+    assert_eq!(list["items"][0]["id"], sid);
+    assert_eq!(list["items"][0]["live"]["state"], "waiting", "{list}");
+
+    // The process ends without SessionEnd: closed within one sweep.
+    let pid = claude.pid();
+    drop(claude);
+    assert!(nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap()),
+        None
+    )
+    .is_err());
+    wait_live(&d, &token, "alpha", None);
+    let list = d.get_json(
+        &token,
+        &format!("/api/v1/projects/{alpha_id}/sessions?limit=1"),
+    );
+    assert_eq!(list["items"][0]["live"], serde_json::Value::Null);
+    let (code, log) = d.stop();
+    assert_eq!(code, Some(0), "{log}");
+    assert!(!log.contains("SYNTHETIC-PROMPT-CANARY") && !log.contains("SYNTHETIC-TOOL-CANARY"));
+}
+
+/// A restart shows an open session as "unknown" (never guessed) in its project at once; a `-p`
+/// session is hidden until the Settings toggle is on, which applies without a restart.
+#[test]
+fn a_restart_shows_unknown_and_non_interactive_sessions_wait_for_the_toggle() {
+    let t = common::tempdir();
+    let env = synth::generate(&t.path().join("e"), 0).unwrap();
+    let d = Daemon::start(&env, &[]);
+    let token = d.login(&env);
+    d.wait_scan_done(&token);
+    let (alpha, beta) = (env.home.join("dev/alpha"), env.home.join("dev/beta"));
+    let mut interactive = StepClaude::start(&env, "i", &[]);
+    interactive.step(
+        "UserPromptSubmit",
+        &input("UserPromptSubmit.json", SID, &alpha, P2),
+    );
+    wait_live(&d, &token, "alpha", Some("working"));
+    let mut print = StepClaude::start(&env, "p", &["-p"]);
+    print.step(
+        "UserPromptSubmit",
+        &input("UserPromptSubmit.json", SID2, &beta, P2),
+    );
+    // Hidden: in no aggregate, count or filter; counted in the status.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(live_state(&d, &token, "beta"), None);
+    let stats = d.get_json(&token, "/api/v1/stats");
+    assert_eq!(stats["live"]["open"], 1);
+    let hooks = &d.get_json(&token, "/api/v1/service/status")["hooks"];
+    assert_eq!(hooks["hidden_noninteractive"], 1);
+    let origin = d.origin();
+    let put = |on: bool| {
+        let (s, _, b) = d.http(
+            "PUT",
+            "/api/v1/settings",
+            &[
+                ("Authorization", &format!("Bearer {token}")),
+                ("Origin", &origin),
+                ("Content-Type", "application/json"),
+            ],
+            &format!(r#"{{"indicator":{{"show_noninteractive":{on}}}}}"#),
+        );
+        assert_eq!(s, 200, "{b}");
+    };
+    put(true);
+    wait_live(&d, &token, "beta", Some("working"));
+    put(false);
+    wait_live(&d, &token, "beta", None);
+
+    // A restart: the sessions whose process still runs are back, state unknown, in their
+    // projects without waiting for a scan.
+    assert_eq!(d.stop().0, Some(0));
+    let d = Daemon::start(&env, &[]);
+    let token = d.login(&env);
+    wait_live(&d, &token, "alpha", Some("unknown"));
+    assert_eq!(live_state(&d, &token, "beta"), None, "still hidden");
+    // The next event tells the state again.
+    interactive.step("Stop", &input("Stop.json", SID, &alpha, P2));
+    wait_live(&d, &token, "alpha", Some("waiting"));
+    drop(print);
+    drop(interactive);
+    wait_live(&d, &token, "alpha", None);
     assert_eq!(d.stop().0, Some(0));
 }

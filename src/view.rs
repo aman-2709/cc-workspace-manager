@@ -116,6 +116,9 @@ pub struct ProjectView {
     pub monitoring: Option<Monitoring>,
     pub monitoring_reason: Option<PollReason>,
     pub sessions: SessionsView,
+    /// v0.2: the project's open Claude Code sessions (states, counts and times only; the same in
+    /// privacy mode), `null` without any (REQUIREMENTS.md §21.8). Set by the service.
+    pub live: Option<crate::presence::store::LiveView>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -227,6 +230,7 @@ pub fn project_view(
         monitoring: monitoring.map(|m| m.0),
         monitoring_reason: monitoring.and_then(|m| m.1),
         sessions: sessions_view(&row.sessions, privacy),
+        live: None,
     }
 }
 
@@ -320,6 +324,8 @@ pub struct SessionView {
     /// Only when the session has no recorded title (labelled "first prompt").
     pub first_prompt: Option<PromptView>,
     pub resume: ResumeView,
+    /// v0.2: the session's state when it is open and shown (§21.8), else `null`.
+    pub live: Option<crate::presence::store::SessionLive>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

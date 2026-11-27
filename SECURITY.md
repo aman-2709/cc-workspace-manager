@@ -255,6 +255,24 @@ written into `config.toml` by hand; the sandbox report then lists it as a broad 
 Saves are serialized from merge to apply, and the page sends only the fields you changed, so a stale Settings tab
 cannot revert a change made elsewhere.
 
+**Session activity indicator (v0.2, opt-in; [docs/session-hooks.md](docs/session-hooks.md)).** `ccwm hook
+<Event>` runs as you, from the Claude Code hooks you add; it reads the event's JSON from stdin with an allowlist
+(event, session id, working folder, prompt id, `source`, `notification_type`; the prompt, Claude's reply and the
+tool fields are skipped unread), reads no environment variable but `CLAUDE_PID` and those that locate ccwm's
+socket, never writes to stdout, always exits 0, and gives the socket exchange at most 100 ms. The message travels
+over the Unix socket like every CLI request (peer UID verified both ways; requests up to 32 KiB). Its working
+folder is the **only path a socket client ever sends**: the daemon handles it like a cwd recorded in a session
+file — untrusted, resolved with the discovery rules, never opened for content, never logged; it is stored only
+with an open session (deleted when the session closes, and by "Clear session index"). The daemon decides which
+process a report comes from itself: from the sender's pid (`SO_PEERCRED`) up the parent chain, at most 8 levels,
+only through processes of your user that started no later than their child, to the nearest Claude Code process
+(by `argv[0]`); `CLAUDE_PID` must name that same process. Liveness reads `/proc/<pid>/stat` (pid + start time +
+boot id). The daemon starts no process, opens no socket and gets no new sandbox rule for any of it. The API
+payload of the indicator holds states, counts and times only (no path, pid, id or text), so privacy mode leaves it
+unchanged. From session files the ingest reads six more top-level fields (`promptId`, `rowSource`,
+`interruptedMessageId`, `toolDenialKind`, `isAbortedMidStream`, `subtype`) to see the ends of a turn no hook
+reports; no message text.
+
 **Dependencies.** `cargo-deny` bans HTTP/TLS client and DNS resolver crates (`deny.toml`). Note:
 axum's WebSocket support enables the `connect` feature of `tokio-tungstenite` (a WebSocket *client*
 entry point). ccwm never calls it, it adds no crate to the tree, and Landlock denies TCP connect.
@@ -360,6 +378,11 @@ entry point). ccwm never calls it, it adds no crate to the tree, and Landlock de
   What `connect()` tracing cannot see — datagrams sent without a connect — is covered by the seccomp
   filter, which lets the daemon and its children create no socket at all after startup and is tested on
   its own (`tests/sandbox.rs`).
+
+- **A process of your own user can report false sessions** (v0.2): same-user processes are outside the
+  threat model, and a child can name itself `claude`. The process walk stops stale or garbage pids and reports
+  from outside a Claude Code process tree; it is no defence against a process running as you. At worst the
+  indicator shows a wrong state (it is never activity and registers no project).
 
 ## Optional defense in depth
 

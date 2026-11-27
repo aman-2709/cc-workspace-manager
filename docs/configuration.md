@@ -39,6 +39,7 @@ be widened afterwards.
 | `ui.default_view` | `cards` | `cards`, `table` | yes | live |
 | `ui.theme` | `system` | `system`, `light`, `dark` | yes | live |
 | `ui.privacy` | `false` | bool (privacy-mode default for new browsers) | yes | live |
+| `indicator.show_noninteractive` | `false` | bool: show `claude -p` and SDK sessions in the [session activity indicator](session-hooks.md) | yes | live |
 
 The Settings page accepts only the keys marked "yes". The others (`watch.debounce_ms`,
 `activity.events_per_project` and especially `git.allow_unhardened_status`) can be changed only by editing

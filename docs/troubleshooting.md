@@ -143,3 +143,25 @@ Sign-in links are single-use and valid for 30 s. Run `ccwm open` again. Use the 
 
 ccwm refuses to use a configuration file or directory that another user could change, because they could
 redirect it. Run the `chmod` the message suggests. Group write is acceptable only by your own private group.
+
+## The session activity indicator shows nothing
+
+The indicator is opt-in ([docs/session-hooks.md](session-hooks.md)). Check, in this order:
+
+1. `ccwm status` — "hooks: no hook event since the daemon started" means no hook reached the daemon. Add the
+   output of `ccwm hooks print` to `~/.claude/settings.json` (or a project's `.claude/settings.local.json`),
+   start a **new** Claude Code session, and accept the folder's trust dialog: hooks start only after it.
+2. `ccwm hooks events --follow` while you send a prompt: every event, and what the daemon did with it.
+   - `refused: no_claude_ancestor` — the hook was not run by a Claude Code process ccwm recognises (Claude Code
+     in a container, or under another name).
+   - `refused: pid_mismatch` — `CLAUDE_PID` names another process than the nearest Claude Code process. Report
+     it with `ccwm hooks events` and the output of `ps -o pid,ppid,comm -p <pids>` for the chain.
+   - Nothing at all — `claude --debug hooks` shows the hook's stderr line (for example "the ccwm daemon is not
+     running"), or whether the hooks run at all (`--bare`, `--safe-mode`, `disableAllHooks`).
+3. The events arrive but no dot appears: the session's folder is no ccwm project yet (`ccwm status` counts it
+   under "not in a project"; the session file registers the project at the next scan), the project is ignored,
+   or the session is non-interactive (`-p`, an SDK host) and hidden — Settings → "Show non-interactive sessions".
+
+"Needs approval · N min" after you approved a tool is expected: Claude Code reports no approval, so the state
+changes when the tool finishes. After an interrupt the state changes about 2 seconds later (from the session
+file); if Claude Code's session folder has no watch (the watch budget), at the next scan.

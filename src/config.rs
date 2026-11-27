@@ -18,6 +18,15 @@ pub struct Config {
     pub git: GitConfig,
     pub sessions: SessionsConfig,
     pub ui: UiConfig,
+    /// v0.2, the session activity indicator (REQUIREMENTS.md §21.8).
+    pub indicator: IndicatorConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct IndicatorConfig {
+    /// Show non-interactive sessions (`-p`, SDK hosts); hidden by default (O17). Live.
+    pub show_noninteractive: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

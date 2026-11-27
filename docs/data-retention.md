@@ -12,6 +12,8 @@ ccwm stores an **index**, never copies of your work. Everything is in `~/.local/
 | Git summary per project: branch, upstream, counts, up to 200 file paths per list, latest commit (hash, subject, author, time), remote URL **without credentials** | the next refresh replaces it; deleted with the project |
 | Session aggregates: id, file path, first/last cwd, start/last activity, AI title (redacted, ≤ 300 characters), branch, version, entrypoint, continuation links, unassigned reason, parse checkpoint | the session file disappears, **Clear session index**, or a parser upgrade (rebuilt from the files) |
 | Last prompt text (redacted, ≤ 2,000 characters) | **only if "Store prompt text" is on**; turning it off deletes it |
+| Open sessions of the activity indicator (v0.2, only with its hooks added): session id, the Claude Code process (pid, start time, boot id), the session's first working folder, when it opened — **no** prompt, state or text | the session closes (its `SessionEnd`, or its process exits), **Clear session index**, or a reboot (dropped at the next start) |
+| The last 256 hook events (`ccwm hooks events`): time, event name, session id, outcome | in the daemon's memory only; gone at a restart |
 | Ignored paths | you un-ignore them |
 | Browser sessions: SHA-256 of the token, timestamps | 30 days after last use, sign-out, `ccwm auth revoke-all`, or LRU beyond 10 |
 
@@ -24,7 +26,7 @@ never contain session text, prompts, tokens or credentials, and remote URLs are 
 | Action | Effect | Touches your files? |
 |---|---|---|
 | Settings → **Store prompt text** off | deletes every cached prompt | no |
-| Settings → **Clear session index** | deletes every session aggregate; projects stay; the next scan re-reads the session files from byte 0 | no |
+| Settings → **Clear session index** | deletes every session aggregate and the open sessions of the activity indicator; projects stay; the next scan re-reads the session files from byte 0 | no |
 | **Forget** (missing projects only) | removes the project from the index; its sessions are resolved again | no |
 | **Ignore** | hides a project and stops tracking it | no |
 | `ccwm auth revoke-all` / Sign out | revokes browser sessions | no |

@@ -504,7 +504,7 @@ fn s<'a>(v: &'a serde_json::Value, path: &str) -> std::borrow::Cow<'a, str> {
 }
 
 /// A Unix time from the status as local date and time ("unknown" when absent).
-fn when(v: &serde_json::Value, path: &str) -> String {
+pub(crate) fn when(v: &serde_json::Value, path: &str) -> String {
     v.pointer(path)
         .and_then(serde_json::Value::as_i64)
         .and_then(|t| jiff::Timestamp::from_second(t).ok())
@@ -571,6 +571,7 @@ pub fn format_status(v: &serde_json::Value) -> String {
         s(v, "/claude/version"),
         s(v, "/claude/resume_supported")
     ));
+    out.push_str(&format_hooks(&v["hooks"]));
     out.push_str(&format!(
         "  sandbox: {} (abi {}, filesystem {}, network {}, seccomp {})\n",
         s(v, "/sandbox/status"),
@@ -587,6 +588,69 @@ pub fn format_status(v: &serde_json::Value) -> String {
         ));
     }
     out
+}
+
+/// The session activity indicator's line of `ccwm status` (§21.10); nothing from a daemon that
+/// does not report it.
+pub fn format_hooks(h: &serde_json::Value) -> String {
+    if !h.is_object() {
+        return String::new();
+    }
+    let n = |k: &str| {
+        h.pointer(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    if h.get("last_event_at")
+        .and_then(serde_json::Value::as_i64)
+        .is_none()
+        && n("/open") == 0
+    {
+        return "  hooks: no hook event since the daemon started (opt-in: `ccwm hooks print`)\n"
+            .into();
+    }
+    let mut parts = vec![format!(
+        "{} needs approval, {} working, {} waiting, {} unknown",
+        n("/needs_approval"),
+        n("/working"),
+        n("/waiting"),
+        n("/unknown")
+    )];
+    if n("/hidden_noninteractive") > 0 {
+        parts.push(format!(
+            "{} non-interactive hidden",
+            n("/hidden_noninteractive")
+        ));
+    }
+    let unassigned: Vec<String> = h
+        .get("unassigned")
+        .and_then(serde_json::Value::as_object)
+        .map(|o| {
+            o.iter()
+                .map(|(k, v)| format!("{} {}", v.as_u64().unwrap_or(0), k.replace('_', " ")))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !unassigned.is_empty() {
+        parts.push(format!("not in a project: {}", unassigned.join(", ")));
+    }
+    let refused: Vec<String> = crate::presence::store::Refusal::ALL
+        .iter()
+        .filter_map(|r| {
+            let k = n(&format!("/refused/{}", r.as_str()));
+            (k > 0).then(|| format!("{k} {}", r.as_str()))
+        })
+        .collect();
+    format!(
+        "  hooks: {} open session(s) ({}), last event {}; {} received, {} stale, {} from session files, refused: {}\n",
+        n("/open"),
+        parts.join("; "),
+        when(h, "/last_event_at"),
+        n("/received"),
+        n("/stale"),
+        n("/session_file_facts"),
+        if refused.is_empty() { "none".to_string() } else { refused.join(", ") },
+    )
 }
 
 /// The strings of the array `key` of a status object (empty when absent).

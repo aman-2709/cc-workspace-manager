@@ -34,6 +34,9 @@ pub struct Filters {
     pub has_sessions: bool,
     /// Privacy mode: `q` matches the name and branch only, never the (hidden) path.
     pub private: bool,
+    /// v0.2: only these projects (the activity indicator's filter; at most 256 ids, from the
+    /// daemon's memory). `Some(empty)` matches nothing.
+    pub live: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,8 +184,8 @@ fn project_from_row(
     })
 }
 
-/// The `WHERE` clause for [`Filters`], using parameters `?1`..`?9` (`?2`: 0 present only,
-/// 1 present and missing, 2 missing only).
+/// The `WHERE` clause for [`Filters`], using parameters `?1`..`?10` (`?2`: 0 present only,
+/// 1 present and missing, 2 missing only; `?10`: a JSON array of project ids, or `NULL`).
 const FILTER_SQL: &str =
     "(?1 IS NULL OR p.name LIKE ?1 ESCAPE '\\' OR (NOT ?9 AND p.canonical_path LIKE ?1 ESCAPE '\\')
                            OR g.branch LIKE ?1 ESCAPE '\\')
@@ -193,7 +196,8 @@ const FILTER_SQL: &str =
      AND (?5 IS NULL OR p.activity_at >= ?5)
      AND (?6 IS NULL OR p.activity_at < ?6)
      AND (NOT ?7 OR p.activity_at IS NULL)
-     AND (NOT ?8 OR p.session_count > 0)";
+     AND (NOT ?8 OR p.session_count > 0)
+     AND (?10 IS NULL OR p.id IN (SELECT value FROM json_each(?10)))";
 
 fn filter_values(f: &Filters) -> Vec<Value> {
     let range = f.activity.unwrap_or_default();
@@ -214,6 +218,9 @@ fn filter_values(f: &Filters) -> Vec<Value> {
         Value::Integer(i64::from(range.unknown)),
         Value::Integer(i64::from(f.has_sessions)),
         Value::Integer(i64::from(f.private)),
+        f.live.as_ref().map_or(Value::Null, |ids| {
+            Value::Text(serde_json::Value::from(ids.clone()).to_string())
+        }),
     ]
 }
 
@@ -250,9 +257,9 @@ pub fn list_projects(
     let k1 = k1_expr(p.sort, p.order);
     let sql = format!(
         "SELECT {PROJECT_COLUMNS}, {k1} AS k1 {PROJECT_JOINS}
-         WHERE {FILTER_SQL} AND (?10 IS NULL OR ({k1}, p.sort_key, p.id) {cmp} (?10, ?11, ?12))
+         WHERE {FILTER_SQL} AND (?11 IS NULL OR ({k1}, p.sort_key, p.id) {cmp} (?11, ?12, ?13))
          ORDER BY k1 {dir}, p.sort_key {dir}, p.id {dir}
-         LIMIT ?13"
+         LIMIT ?14"
     );
     match &p.after {
         Some((k, key, id)) => values.extend([
@@ -332,6 +339,23 @@ pub fn stat_counts(
             })
         },
     )
+}
+
+/// How many of `ids` are present, non-ignored projects (the activity indicator's filter counts,
+/// on the same terms as the other summary counts).
+pub fn count_present(conn: &Connection, ids: &[String]) -> rusqlite::Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    conn.query_row(
+        &format!(
+            "SELECT count(*) {PROJECT_JOINS} WHERE p.missing_since IS NULL AND i.canonical_path IS NULL
+             AND p.id IN (SELECT value FROM json_each(?1))"
+        ),
+        [serde_json::Value::from(ids.to_vec()).to_string()],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| u64::try_from(n).unwrap_or(0))
 }
 
 /// What the tracker needs to know about every registered project.
@@ -688,7 +712,10 @@ pub fn count_sessions(conn: &Connection) -> rusqlite::Result<u64> {
 pub fn open_sessions(
     conn: &Connection,
 ) -> rusqlite::Result<Vec<(String, crate::presence::store::Open)>> {
-    use crate::presence::{proc::Identity, store::Open};
+    use crate::presence::{
+        proc::Identity,
+        store::{Open, State},
+    };
     let int = |v: i64, i: usize| {
         u64::try_from(v).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -710,18 +737,22 @@ pub fn open_sessions(
                 Box::new(e),
             )
         })?;
+        let identity = Identity {
+            pid,
+            start: int(r.get(2)?, 2)?,
+            boot_id: r.get(3)?,
+        };
+        let opened_at: i64 = r.get(5)?;
+        // The interactive flag is read again from the process, the state set, at restore.
         Ok((
             r.get(0)?,
-            Open {
-                identity: Identity {
-                    pid,
-                    start: int(r.get(2)?, 2)?,
-                    boot_id: r.get(3)?,
-                },
-                interactive: true, // read again from the process at restore
-                first_cwd: r.get(4)?,
-                opened_at: r.get(5)?,
-            },
+            Open::new(
+                identity,
+                true,
+                r.get(4)?,
+                opened_at.saturating_mul(1000),
+                State::Unknown,
+            ),
         ))
     })?
     .collect()

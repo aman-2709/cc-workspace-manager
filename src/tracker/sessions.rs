@@ -27,6 +27,8 @@ struct Scanned {
     /// The directory does not exist (as opposed to being unreadable).
     absent: bool,
     parsed: Vec<(SessionFile, parse::Checkpoint, parse::Aggregate)>,
+    /// The latest recorded end of a turn of each session read (§21.2a), for the indicator.
+    facts: Vec<(String, parse::TurnFact)>,
     /// Files skipped because another file has the same session id.
     duplicates: u64,
 }
@@ -190,6 +192,10 @@ impl Tracker {
             self.notifier.project(&u.id);
         }
 
+        // v0.2: the ends of a turn the files recorded (§21.2a), after the projects were stored.
+        if let Some(presence) = self.presence.get() {
+            presence.apply_facts(&scanned.facts);
+        }
         if full {
             if let Some(l) = &scanned.listing {
                 let mut dirs = vec![projects_dir.clone()];
@@ -201,7 +207,7 @@ impl Tracker {
         Ok(upserted)
     }
 
-    fn resolve_context(
+    pub(super) fn resolve_context(
         &self,
         cfg: &super::SessionSettings,
         tracked: &[queries::Tracked],
@@ -356,6 +362,7 @@ fn scan(
         v
     };
     let mut parsed = Vec::new();
+    let mut facts = Vec::new();
     for f in listing.iter().flat_map(|l| l.files.iter()) {
         let state = states
             .get(&f.id)
@@ -370,8 +377,14 @@ fn scan(
             Ok(Outcome::Updated {
                 checkpoint,
                 aggregate,
+                fact,
                 ..
-            }) => parsed.push((f.clone(), checkpoint, *aggregate)),
+            }) => {
+                if let Some(fact) = fact {
+                    facts.push((f.id.clone(), fact));
+                }
+                parsed.push((f.clone(), checkpoint, *aggregate));
+            }
             Ok(Outcome::Unchanged) => {}
             Err(e) => tracing::debug!(error = %e, "a session file could not be read"),
         }
@@ -380,6 +393,7 @@ fn scan(
         listing,
         absent,
         parsed,
+        facts,
         duplicates,
     }
 }

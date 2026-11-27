@@ -62,3 +62,8 @@ store_prompt_text = false
 default_view = "cards"
 theme = "system"
 privacy = false
+
+[indicator]
+# The session activity indicator (docs/session-hooks.md; opt-in through Claude Code hooks). Show
+# non-interactive sessions too (`claude -p`, SDK hosts such as editor extensions); hidden by default.
+show_noninteractive = false

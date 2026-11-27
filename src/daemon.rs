@@ -378,7 +378,10 @@ async fn run(p: Prepared) -> Result<()> {
         std::process::id(),
         Arc::clone(&writer),
         Arc::clone(&clock),
+        notifier.clone(),
     ));
+    presence.set_show_noninteractive(file_config.indicator.show_noninteractive);
+    tracker.set_presence(Arc::clone(&presence));
     match presence.restore(&reader).await {
         Ok((0, 0)) => {}
         Ok((restored, dropped)) => {
@@ -391,6 +394,10 @@ async fn run(p: Prepared) -> Result<()> {
         Err(e) => {
             tracing::warn!(error = %e, "cannot restore the open sessions of the activity indicator")
         }
+    }
+    // Their projects are known from the database: resolved now, not after the first scan.
+    if let Err(e) = tracker.resolve_open_sessions().await {
+        tracing::warn!(error = %e, "cannot resolve the open sessions' projects");
     }
     let service = Arc::new(Service::new(Deps {
         clock: Arc::clone(&clock),

@@ -824,6 +824,7 @@ async fn stats_discovery_and_service_status_shapes() {
                 "uncommitted_changes": 0,
                 "missing": 0,
                 "total_sessions": 0,
+                "live": {"waiting_for_me": 0, "working": 0, "open": 0},
             })
         )
     );

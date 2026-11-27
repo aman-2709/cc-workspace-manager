@@ -12,8 +12,9 @@ use std::path::Path;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// The longest response the CLI reads.
-pub const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+/// The longest response the CLI reads (v0.2: 256 KiB, was 64 KiB — `hooks.events` with its full
+/// debug log is about 50 KB).
+pub const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 
 pub fn verify_peer(peer_uid: u32, expected_uid: u32) -> Result<()> {
     if peer_uid != expected_uid {
