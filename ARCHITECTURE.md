@@ -1305,6 +1305,13 @@ the background session (left to the maintainer: it changes Claude Code's state).
   in the light theme the teal dot of "Waiting for input" (`#0f766e`) and the green dot of the "Today" activity
   (`#1a7f37`) look alike at a glance in the table (different columns, both labelled). **Not seen:** a screen
   reader; the reduced-motion setting (unchanged since stop 2).
+- **Follow-up (maintainer decision 2026-11-26):** "waiting" moved to a more cyan teal, `#0b7285` (light; hue 189°,
+  52° from `--today` `#1a7f37`, 5.59:1 on the page, 5.25:1 on cards) and `#2bb3c0` (dark; hue 185°, 57° from
+  `#3fb950`, 7.49:1 and 6.85:1). The node test now requires a hue of 175°–200° for `--live-waiting` and at least 30°
+  from `--today` in both themes. The first teal was 38° (light) and 45° (dark) from the green by hue, so the 30°
+  rule alone passes it; the 175° floor is what fails it (`#2ea89a`, 173°; checked against the old stylesheet).
+  Not looked at again in a browser. Also near: the "recent" blue (`--recent`, 212°/214°) is 23° (light) and 29°
+  (dark) from the new cyan; not tested.
 - Demo cleaned up: the daemon stopped by its `instance.json` pid, the four fake processes killed (their `bash`
   had exec'd the final `sleep`), the directory removed.
 
@@ -1770,8 +1777,8 @@ against a socket that never answers, the 1 s watchdog, the guarded snippet with 
   rank ascends whatever the direction: `rank > ?16 OR (rank = ?16 AND (k1, key, id) cmp (?11, ?12, ?13))`.
   `ListParams::after` is a `queries::After {live_rank, k1, sort_key, id}` (was a tuple); `ProjectRow::live_rank`
   (`NOT_LIVE` outside a listing). The count query is unchanged.
-- **UI:** `--live-approval` magenta (`#bf3989` / dark `#f778ba`), new `--live-waiting` teal (`#0f766e` /
-  `#2ea89a`), `--live-idle` gray only for the "Session open" ring; the card's `.live` moved out of `.head` into a
+- **UI:** `--live-approval` magenta (`#bf3989` / dark `#f778ba`), new `--live-waiting` cyan teal (`#0b7285` /
+  `#2bb3c0`; first `#0f766e` / `#2ea89a`, changed after the browser check, below), `--live-idle` gray only for the "Session open" ring; the card's `.live` moved out of `.head` into a
   `p.line.live-line` right under it; the Settings checkbox `s-livefirst`; `settingsPatch` sends
   `indicator.live_first`. The UI loads every page (`loadAll`), so the server's order is the order shown.
 - **I1** `guarded_command` adds `>/dev/null` to the ccwm call; **I2** `cli::hooks_path_warning` (another binary, or

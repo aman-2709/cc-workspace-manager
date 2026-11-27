@@ -462,7 +462,7 @@ function themes(css) {
   return { light, dark: { ...light, ...system }, chosen: { ...light, ...chosen } };
 }
 
-test("each indicator colour has 4.5:1 contrast; needs approval is far from the dirty orange; waiting is not gray", () => {
+test("each indicator colour has 4.5:1 contrast; needs approval is far from the dirty orange; waiting is a cyan teal, far from the Today green", () => {
   const css = fs.readFileSync(path.join(__dirname, "../../web/app.css"), "utf8");
   for (const [name, t] of Object.entries(themes(css))) {
     for (const v of ["live-approval", "live-working", "live-waiting", "live-idle"]) {
@@ -471,12 +471,16 @@ test("each indicator colour has 4.5:1 contrast; needs approval is far from the d
         assert.ok(ratio >= 4.5, `${name}: --${v} ${t[v]} on --${bg} ${t[bg]} is ${ratio.toFixed(2)}:1`);
       }
     }
-    const approval = hueAndSaturation(t["live-approval"]).hue;
-    const dirty = hueAndSaturation(t.dirty).hue;
-    const apart = Math.min(Math.abs(approval - dirty), 360 - Math.abs(approval - dirty));
-    assert.ok(apart >= 45, `${name}: needs approval ${t["live-approval"]} is ${apart.toFixed(0)}° from the dirty orange ${t.dirty}`);
+    const apart = (a, b) => {
+      const d = Math.abs(hueAndSaturation(t[a]).hue - hueAndSaturation(t[b]).hue);
+      return Math.min(d, 360 - d);
+    };
+    const fromDirty = apart("live-approval", "dirty");
+    assert.ok(fromDirty >= 45, `${name}: needs approval ${t["live-approval"]} is ${fromDirty.toFixed(0)}° from the dirty orange ${t.dirty}`);
     const waiting = hueAndSaturation(t["live-waiting"]);
-    assert.ok(waiting.saturation >= 0.4 && waiting.hue >= 150 && waiting.hue <= 190, `${name}: waiting is a teal, not a gray: ${t["live-waiting"]}`);
+    assert.ok(waiting.saturation >= 0.4 && waiting.hue >= 175 && waiting.hue <= 200, `${name}: waiting is a cyan teal, not a gray: ${t["live-waiting"]} (hue ${waiting.hue.toFixed(0)}°)`);
+    const fromToday = apart("live-waiting", "today");
+    assert.ok(fromToday >= 30, `${name}: waiting ${t["live-waiting"]} is ${fromToday.toFixed(0)}° from the Today green ${t.today}`);
   }
   const t = themes(css);
   assert.deepStrictEqual(
