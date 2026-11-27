@@ -358,6 +358,15 @@ After v0.1.1:
 - [ ] **Maintainer:** review (choices in ARCHITECTURE.md §14 "The v0.2 review" and REQUIREMENTS.md §21.12); then
   pushing, CI, tagging and the release stay with the maintainer
 
+## Next release
+
+- [ ] **Ship `docs/` in the release archive** (`scripts/package-release.sh`, `DOCS`; today only `LICENSE`,
+  `README.md`, `SECURITY.md`, `CHANGELOG.md`): the README links to `docs/user-guide.md`, `docs/configuration.md`,
+  `docs/session-hooks.md`, `docs/troubleshooting.md` and more, which do not resolve inside an unpacked archive.
+  Decide whether `docs/images/` (≈ 530 KB) and `docs/reviews/` belong in it. The exact archive listing is
+  pinned by `tests/service.rs::the_release_archive_verifies_is_reproducible_and_installs_from_its_own_layout`:
+  update it with the script.
+
 ---
 
 ## Backlog — v0.2 and later (REQUIREMENTS.md §18; **do not implement in v0.1**)
