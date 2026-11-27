@@ -16,6 +16,7 @@ use crate::db::writer::Writer;
 use crate::discovery::status::{DiscoverySnapshot, SharedStatus};
 use crate::events::{next_batch, Batch, Change, Hub, Notifier};
 use crate::git::GitSummary;
+use crate::presence::{EventsView, HookRequest, Presence};
 use crate::sandbox::SandboxReport;
 use crate::tracker::{Control, Tracker};
 use crate::view::{self, Privacy, ProjectDetail, ProjectView, PromptView, ResumeView, SessionView};
@@ -285,6 +286,8 @@ pub struct Deps {
     pub claude: Option<Arc<Verifier>>,
     /// How the TCP peer check finds a connection's owner (`sock_diag` or `procfs`).
     pub peer_lookup: &'static str,
+    /// The activity indicator's open sessions (v0.2, REQUIREMENTS.md §21).
+    pub presence: Arc<Presence>,
 }
 
 pub struct Service {
@@ -316,6 +319,7 @@ pub struct Service {
     started_at: i64,
     /// Last monitoring message sent (to skip repeats).
     last_monitoring: Mutex<Option<String>>,
+    presence: Arc<Presence>,
 }
 
 impl Service {
@@ -356,6 +360,7 @@ impl Service {
             port: d.port,
             started_at,
             last_monitoring: Mutex::new(None),
+            presence: d.presence,
         }
     }
 
@@ -857,7 +862,9 @@ impl Service {
     /// "Clear session index": ccwm's derived session data only, never the session files. The
     /// projects stay; the index is rebuilt at the next reconciliation.
     pub async fn clear_session_index(&self) -> Result<Cleared, ApiError> {
+        // The writer deletes the indicator's persisted open sessions in the same command (O16).
         let affected = self.writer.clear_session_index().await?;
+        self.presence.clear();
         for id in &affected {
             self.notifier.project(id);
         }
@@ -1019,6 +1026,28 @@ impl Service {
                 websocket_clients: self.hub.clients(),
             },
         }
+    }
+
+    // ---- activity indicator (v0.2) -----------------------------------------------------------
+
+    /// `hook.event` from `ccwm hook` (REQUIREMENTS.md §21.4–§21.6), with the socket peer's pid.
+    /// Answered as soon as the event is validated, walked and applied in memory; an
+    /// `invalid_argument` error names the reason of a refusal.
+    pub fn hook_event(
+        &self,
+        peer_pid: Option<i32>,
+        request: HookRequest,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.presence
+            .report(peer_pid, request)
+            .map(|()| serde_json::json!({ "accepted": true }))
+            .map_err(|r| ApiError::invalid(r.as_str()))
+    }
+
+    /// The counters and debug log of hook events (`ccwm hooks events`): names, times and session
+    /// ids only.
+    pub fn hook_events(&self) -> EventsView {
+        self.presence.events()
     }
 
     // ---- live updates -----------------------------------------------------------------------

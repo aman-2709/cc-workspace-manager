@@ -371,6 +371,27 @@ async fn run(p: Prepared) -> Result<()> {
         Some(notifier.clone()),
     );
 
+    // v0.2: the activity indicator's open sessions, restored before the socket accepts events.
+    let presence = Arc::new(crate::presence::Presence::new(
+        crate::presence::proc::ProcFs::default(),
+        uid,
+        std::process::id(),
+        Arc::clone(&writer),
+        Arc::clone(&clock),
+    ));
+    match presence.restore(&reader).await {
+        Ok((0, 0)) => {}
+        Ok((restored, dropped)) => {
+            tracing::info!(
+                restored,
+                dropped,
+                "open sessions of the activity indicator restored"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot restore the open sessions of the activity indicator")
+        }
+    }
     let service = Arc::new(Service::new(Deps {
         clock: Arc::clone(&clock),
         writer: Arc::clone(&writer),
@@ -389,6 +410,7 @@ async fn run(p: Prepared) -> Result<()> {
         roots,
         claude: Some(claude),
         peer_lookup: peer_method,
+        presence: Arc::clone(&presence),
     }));
     write_instance(
         &dirs,
@@ -416,6 +438,7 @@ async fn run(p: Prepared) -> Result<()> {
         tokio::spawn(Arc::clone(&tracker).run_reconciler(stop_rx.clone())),
         tokio::spawn(Arc::clone(&tracker).run_signals(signals_rx, stop_rx.clone())),
         tokio::spawn(Arc::clone(&service).run_publisher(changes, stop_rx.clone())),
+        tokio::spawn(Arc::clone(&presence).run_sweeper(stop_rx.clone())),
     ];
 
     let purge = {

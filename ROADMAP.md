@@ -307,26 +307,38 @@ After v0.1.1:
   hidden by default, Settings toggle), a 100 ms budget for `ccwm hook` and a guarded snippet; every v0.2 Appendix
   A row approved. Left: O11 (phase 2, on the real home) and the choices for review (REQUIREMENTS.md §21.12)
 
-### Phase 2 — build (on the maintainer's go-ahead; ARCHITECTURE.md §15 "Phase 2")
-- [ ] `claude/hook.rs` (allowlist stdin parser, fixtures `tests/fixtures/hooks/2.1.332/`), `ccwm hook <Event>`
-  (before clap, exit 0, no stdout, 100 ms socket budget, 1 s watchdog, 16 MiB stdin), `ccwm hooks print` (the
-  guarded command for the nine events)
-- [ ] Socket op `hook.event` (32 KiB limit, shape and field validation, the peer's pid)
-- [ ] `presence/` (state machine with `needs_approval`, `ProcFs`, the walk to the nearest `claude` and the
-  `CLAUDE_PID` cross-check — both paths tested —, identity, non-interactive detection, 5 s sweep, limit,
-  counters); tracker resolution and re-resolution; migration 6, restore at start; "Clear session index" clears it
+### Phase 2 — build (go-ahead 2026-11-26; two stops; ARCHITECTURE.md §15)
+
+#### Stop 1 — plumbing (built 2026-11-26; one local commit, not pushed)
+- [x] `claude/hook.rs` (allowlist stdin parser, fixtures `tests/fixtures/hooks/2.1.332/` with canaries in every
+  skipped field), `ccwm hook <Event>` (before clap, exit 0, no stdout, 100 ms socket budget, 1 s watchdog, 16 MiB
+  stdin), `ccwm hooks print` (the guarded command for the nine events)
+- [x] Socket op `hook.event` (32 KiB limit, shape and field validation, the peer's pid); the trace log names ops
+  only
+- [x] `presence/`: `ProcFs` (bounded reads, injectable root), the walk to the nearest `claude` with the
+  `CLAUDE_PID` cross-check — both paths tested —, identity (pid, start time, boot id), non-interactive detection,
+  the open-session store (open/closed, limit 256, counters), 5 s sweep; migration 6, restore at start; "Clear
+  session index" clears it
+- [x] Debug command `ccwm hooks events [--follow]` (maintainer request; REQUIREMENTS.md §21.10)
+- [x] Tests: unit, `tests/hooks.rs` (fake `claude` tree, budgets, the guarded snippet under dash, restart, sweep,
+  canaries in the trace log, database and debug output)
+- [x] fmt / clippy / test green; one local commit; O11 steps for the maintainer
+- [ ] **Maintainer on the real home:** O11 with `ccwm hooks events --follow` (interrupt and `idle_prompt`, a
+  background session, permission dialogs, the `claude` command line, SDK hosts)
+
+#### Stop 2 — after O11
+- [ ] Adjust REQUIREMENTS.md §21 if O11 calls for it
+- [ ] The state machine (`needs_approval`, `working`, `waiting`, `unknown`; stale `prompt_id`s; subagent events);
+  tracker resolution and re-resolution of the session's project
 - [ ] `[indicator] show_noninteractive` (live setting, Settings toggle)
 - [ ] API and WebSocket (`live` fields, `live=waiting|working|open`, `/stats`, `/service/status` `hooks`);
   `ccwm status`, `ccwm doctor`
 - [ ] UI: dot and label for four states, pulse, reduced motion, "Claude" column, detail panel, the three filters
-  with counts
-- [ ] Tests (§21.11): unit, `tests/hooks.rs` with a fake `claude` tree, the budget and the guarded snippet, canaries
-  (test 8), DOM tests
+  with counts; privacy mode
+- [ ] Tests (§21.11): the state machine, aggregates, filters, API/WebSocket, DOM tests
 - [ ] Docs: docs/session-hooks.md (the snippet, where it goes, cost, limitations), README section, SECURITY.md (who
-  may report, same-user limit), configuration and troubleshooting
+  may report, same-user limit), configuration and troubleshooting; CHANGELOG 0.2.0
 - [ ] fmt / clippy / test green; synthetic daemon + real browser check; one local commit; report
-- [ ] Maintainer on the real home: adds the snippet; checks O11 (interrupt and `idle_prompt`, a background
-  session, permission dialogs, an npm install's `cmdline`, SDK hosts' arguments)
 
 ---
 

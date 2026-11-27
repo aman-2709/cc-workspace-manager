@@ -1,0 +1,9 @@
+{
+  "session_id": "0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f",
+  "transcript_path": "/home/synthetic/.claude/projects/-home-synthetic-dev-alpha/SYNTHETIC-TRANSCRIPT-CANARY.jsonl",
+  "cwd": "/home/synthetic/dev/alpha",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "synthetic-model",
+  "session_title": "SYNTHETIC-TITLE-CANARY"
+}

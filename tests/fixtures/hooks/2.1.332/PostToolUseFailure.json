@@ -1,0 +1,17 @@
+{
+  "session_id": "0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f",
+  "transcript_path": "/home/synthetic/.claude/projects/-home-synthetic-dev-alpha/SYNTHETIC-TRANSCRIPT-CANARY.jsonl",
+  "cwd": "/home/synthetic/dev/alpha",
+  "hook_event_name": "PostToolUseFailure",
+  "prompt_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+  "permission_mode": "default",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo SYNTHETIC-TOOL-CANARY",
+    "description": "SYNTHETIC-TOOL-CANARY"
+  },
+  "tool_use_id": "toolu_SYNTHETIC03",
+  "error": "SYNTHETIC-TOOL-CANARY: exit status 1",
+  "is_interrupt": false,
+  "duration_ms": 40
+}

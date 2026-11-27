@@ -17,7 +17,7 @@ struct Migration {
 }
 
 /// Ordered migrations; index + 1 is the `PRAGMA user_version` after applying it.
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     Migration {
         sql: include_str!("migrations/001_init.sql"),
         backfill: None,
@@ -36,6 +36,10 @@ const MIGRATIONS: [Migration; 5] = [
     },
     Migration {
         sql: include_str!("migrations/005_partial_checkpoints.sql"),
+        backfill: None,
+    },
+    Migration {
+        sql: include_str!("migrations/006_open_sessions.sql"),
         backfill: None,
     },
 ];
@@ -142,6 +146,7 @@ mod tests {
                 "git_cache",
                 "ignored_paths",
                 "meta",
+                "open_sessions",
                 "project_sources",
                 "projects",
                 "session_file_checkpoints",

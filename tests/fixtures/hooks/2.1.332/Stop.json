@@ -1,0 +1,25 @@
+{
+  "session_id": "0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f",
+  "transcript_path": "/home/synthetic/.claude/projects/-home-synthetic-dev-alpha/SYNTHETIC-TRANSCRIPT-CANARY.jsonl",
+  "cwd": "/home/synthetic/dev/alpha",
+  "hook_event_name": "Stop",
+  "prompt_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+  "permission_mode": "default",
+  "stop_hook_active": false,
+  "last_assistant_message": "SYNTHETIC-ASSISTANT-CANARY done.",
+  "background_tasks": [
+    {
+      "id": "bg1",
+      "command": "sleep 1 # SYNTHETIC-TOOL-CANARY"
+    }
+  ],
+  "session_crons": [
+    {
+      "id": "c1",
+      "prompt": "SYNTHETIC-CRON-CANARY"
+    }
+  ],
+  "effort": {
+    "level": "medium"
+  }
+}

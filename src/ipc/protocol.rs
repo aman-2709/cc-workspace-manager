@@ -3,11 +3,14 @@
 //! the same [`Service`] the HTTP handlers use.
 
 use crate::api_error::ApiError;
+use crate::claude::hook::Report;
+use crate::presence::HookRequest;
 use crate::service::Service;
 use serde_json::{json, Value};
 
-/// Requests larger than this are refused.
-pub const MAX_REQUEST_BYTES: usize = 4096;
+/// Requests larger than this are refused: a `hook.event` with a cwd of 4,096 bytes, each byte
+/// JSON-escaped (`\u00XX`), still fits (REQUIREMENTS.md §21.4).
+pub const MAX_REQUEST_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
@@ -18,25 +21,61 @@ pub enum Request {
     /// Coalesced reconciliation (`ccwm scan`).
     ScanRefresh,
     DiscoveryStatus,
+    /// A Claude Code hook event from `ccwm hook` (§21.4); a malformed one is answered (and
+    /// counted) by the service.
+    HookEvent(HookRequest),
+    /// The activity indicator's counters and debug log (`ccwm hooks events`).
+    HooksEvents,
 }
 
-/// Exactly `{"op": "<name>"}` and nothing else (serde cannot reject extra fields on tagged unit variants).
+impl Request {
+    /// The op's name, for the trace log (never a field of a request: a hook's cwd stays out).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::AuthBootstrap => "auth.bootstrap",
+            Self::AuthRevokeAll => "auth.revoke_all",
+            Self::ServiceStatus => "service.status",
+            Self::ScanRefresh => "scan.refresh",
+            Self::DiscoveryStatus => "discovery.status",
+            Self::HookEvent(_) => "hook.event",
+            Self::HooksEvents => "hooks.events",
+        }
+    }
+}
+
+/// Exactly `{"op": "<name>"}` and nothing else (serde cannot reject extra fields on tagged unit
+/// variants); `hook.event` has its fields, checked by hand ([`Report::from_request`]).
 pub fn parse_request(line: &str) -> Result<Request, ApiError> {
     let bad = || ApiError::invalid("unknown or malformed request");
     let value: Value = serde_json::from_str(line.trim()).map_err(|_| bad())?;
-    let obj = value.as_object().filter(|o| o.len() == 1).ok_or_else(bad)?;
-    match obj.get("op").and_then(Value::as_str).ok_or_else(bad)? {
+    let obj = value.as_object().ok_or_else(bad)?;
+    let op = obj.get("op").and_then(Value::as_str).ok_or_else(bad)?;
+    if op == "hook.event" {
+        return Ok(Request::HookEvent(Report::from_request(obj)));
+    }
+    if obj.len() != 1 {
+        return Err(bad());
+    }
+    match op {
         "ping" => Ok(Request::Ping),
         "auth.bootstrap" => Ok(Request::AuthBootstrap),
         "auth.revoke_all" => Ok(Request::AuthRevokeAll),
         "service.status" => Ok(Request::ServiceStatus),
         "scan.refresh" => Ok(Request::ScanRefresh),
         "discovery.status" => Ok(Request::DiscoveryStatus),
+        "hooks.events" => Ok(Request::HooksEvents),
         _ => Err(bad()),
     }
 }
 
-pub async fn dispatch(service: &Service, req: Request) -> Result<Value, ApiError> {
+/// Run `req` for the peer whose pid `SO_PEERCRED` gave (`hook.event` is the only op that uses
+/// it: the daemon finds the session's process from it, §21.5).
+pub async fn dispatch(
+    service: &Service,
+    req: Request,
+    peer_pid: Option<i32>,
+) -> Result<Value, ApiError> {
     match req {
         Request::Ping => Ok(json!({
             "version": crate::service::VERSION,
@@ -54,6 +93,10 @@ pub async fn dispatch(service: &Service, req: Request) -> Result<Value, ApiError
         }
         Request::DiscoveryStatus => {
             Ok(serde_json::to_value(service.discovery_status()).map_err(ApiError::internal)?)
+        }
+        Request::HookEvent(request) => service.hook_event(peer_pid, request),
+        Request::HooksEvents => {
+            Ok(serde_json::to_value(service.hook_events()).map_err(ApiError::internal)?)
         }
     }
 }
@@ -106,6 +149,61 @@ mod tests {
             parse_request(r#"{"op":"discovery.status"}"#).unwrap(),
             Request::DiscoveryStatus
         );
+        assert_eq!(
+            parse_request(r#"{"op":"hooks.events"}"#).unwrap(),
+            Request::HooksEvents
+        );
+    }
+
+    const SID: &str = "0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f";
+
+    #[test]
+    fn hook_events_are_parsed_by_hand_and_malformed_ones_kept_for_the_service() {
+        let line =
+            format!(r#"{{"op":"hook.event","event":"Stop","session_id":"{SID}","cwd":"/p"}}"#);
+        let Request::HookEvent(Ok(r)) = parse_request(&line).unwrap() else {
+            panic!("a valid hook event")
+        };
+        assert_eq!(
+            (r.event, r.cwd.as_str()),
+            (crate::claude::hook::Event::Stop, "/p")
+        );
+        // Malformed fields are not a protocol error: the service counts and answers them.
+        let bad = format!(
+            r#"{{"op":"hook.event","event":"Stop","session_id":"{SID}","cwd":"/p","x":1}}"#
+        );
+        assert!(matches!(
+            parse_request(&bad).unwrap(),
+            Request::HookEvent(Err(_))
+        ));
+        assert!(matches!(
+            parse_request(r#"{"op":"hook.event"}"#).unwrap(),
+            Request::HookEvent(Err(_))
+        ));
+        assert_eq!(parse_request(&line).unwrap().name(), "hook.event");
+        // Another op with fields is still refused.
+        assert!(parse_request(r#"{"op":"hooks.events","x":1}"#).is_err());
+    }
+
+    /// A cwd of 4,096 bytes, every one JSON-escaped, fits in a request.
+    #[test]
+    fn the_longest_hook_event_fits_in_the_request_limit() {
+        let cwd = format!(
+            "/{}",
+            "\\u0001".repeat(crate::claude::hook::MAX_CWD_BYTES - 1)
+        );
+        let line = format!(
+            r#"{{"op":"hook.event","event":"Notification","session_id":"{SID}","cwd":"{cwd}","notification_type":"permission_prompt","prompt_id":"{SID}","claude_pid":4194304}}"#
+        );
+        assert!(
+            line.len() < MAX_REQUEST_BYTES,
+            "{} bytes with the newline",
+            line.len() + 1
+        );
+        assert!(matches!(
+            parse_request(&line).unwrap(),
+            Request::HookEvent(Ok(_))
+        ));
     }
 
     #[test]

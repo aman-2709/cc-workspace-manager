@@ -683,6 +683,50 @@ pub fn count_sessions(conn: &Connection) -> rusqlite::Result<u64> {
     .map(|n| u64::try_from(n).unwrap_or(0))
 }
 
+/// The persisted open sessions of the activity indicator (§21.7), oldest first. A row whose
+/// values do not fit the types (impossible through the writer's checks) is an error.
+pub fn open_sessions(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(String, crate::presence::store::Open)>> {
+    use crate::presence::{proc::Identity, store::Open};
+    let int = |v: i64, i: usize| {
+        u64::try_from(v).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                i,
+                rusqlite::types::Type::Integer,
+                Box::new(e),
+            )
+        })
+    };
+    conn.prepare(
+        "SELECT session_id, pid, pid_start, boot_id, first_cwd, opened_at FROM open_sessions
+         ORDER BY opened_at, session_id",
+    )?
+    .query_map([], |r| {
+        let pid = u32::try_from(int(r.get(1)?, 1)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Integer,
+                Box::new(e),
+            )
+        })?;
+        Ok((
+            r.get(0)?,
+            Open {
+                identity: Identity {
+                    pid,
+                    start: int(r.get(2)?, 2)?,
+                    boot_id: r.get(3)?,
+                },
+                interactive: true, // read again from the process at restore
+                first_cwd: r.get(4)?,
+                opened_at: r.get(5)?,
+            },
+        ))
+    })?
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

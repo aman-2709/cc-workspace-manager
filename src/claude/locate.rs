@@ -4,7 +4,7 @@
 //! skipped and counted. Directories are opened by descriptor ([`DirHandle`]), files with
 //! `O_NOFOLLOW`; nothing is ever written. Directory names are never decoded into paths.
 
-use super::resume::is_uuid;
+use super::resume::is_lower_uuid;
 use crate::discovery::dirfd::{DirHandle, Kind};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -54,7 +54,7 @@ impl Listing {
 /// not sessions (folding them would let two files share one id, M3 review L4).
 pub fn session_id_of(name: &OsStr) -> Option<String> {
     let stem = name.to_str()?.strip_suffix(".jsonl")?;
-    (is_uuid(stem) && !stem.bytes().any(|b| b.is_ascii_uppercase())).then(|| stem.to_string())
+    is_lower_uuid(stem).then(|| stem.to_string())
 }
 
 /// Keep one file per session id (the same `<uuid>.jsonl` copied into a second

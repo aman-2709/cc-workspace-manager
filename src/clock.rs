@@ -5,6 +5,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> i64;
+
+    /// Milliseconds since the epoch (the debug log of hook events orders them more finely than a
+    /// second). A clock without a finer source ticks in whole seconds.
+    fn now_ms(&self) -> i64 {
+        self.now().saturating_mul(1000)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -15,6 +21,12 @@ impl Clock for SystemClock {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    }
+
+    fn now_ms(&self) -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
     }
 }
 
@@ -52,5 +64,8 @@ mod tests {
     #[test]
     fn system_clock_is_after_2024() {
         assert!(SystemClock.now() > 1_704_067_200);
+        let (s, ms) = (SystemClock.now(), SystemClock.now_ms());
+        assert!((ms / 1000 - s).abs() <= 1, "{s} {ms}");
+        assert_eq!(FakeClock::new(7).now_ms(), 7000);
     }
 }

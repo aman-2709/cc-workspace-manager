@@ -202,12 +202,33 @@ async fn protocol_errors_get_json_errors_and_never_crash_the_server() {
             "{bad:?} -> {out:?}"
         );
     }
-    // a request line that is too long, and one that never ends
-    let out = raw(vec![b'a'; 5000]).await.unwrap();
+    // A request of exactly the limit (32 KiB with its newline, §21.4) is read; one byte more
+    // is too large, and so is a line that never ends.
+    let max = cc_workspace_manager::ipc::protocol::MAX_REQUEST_BYTES;
+    let padded = |len: usize| {
+        let mut r = b"{\"op\":\"ping\"}".to_vec();
+        r.resize(len - 1, b' ');
+        r.push(b'\n');
+        r
+    };
+    let out = raw(padded(max)).await.unwrap();
+    assert!(out.contains("\"ok\"") && out.contains("version"), "{out}");
+    let out = raw(padded(max + 1)).await.unwrap();
+    assert!(out.contains("too large"), "{out}");
+    let out = raw(vec![b'a'; max + 10]).await.unwrap();
     assert!(out.contains("invalid_argument"), "{out}");
-    let mut long = vec![b'a'; 5000];
-    long.push(b'\n');
-    assert!(raw(long).await.unwrap().contains("invalid_argument"));
+    // A malformed hook event is answered `malformed` and counted, never a protocol crash.
+    let out = raw(b"{\"op\":\"hook.event\",\"event\":\"Stop\"}\n".to_vec())
+        .await
+        .unwrap();
+    assert!(
+        out.contains("invalid_argument") && out.contains("malformed"),
+        "{out}"
+    );
+    let events = srv.call("hooks.events").await.unwrap();
+    assert_eq!(events["refused"]["malformed"], 1);
+    assert_eq!(events["events"][0]["event"], "Stop");
+    assert_eq!(events["events"][0]["outcome"], "refused: malformed");
     // still alive afterwards
     assert!(srv.call("ping").await.is_ok());
     srv.stop().await;

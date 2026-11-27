@@ -101,7 +101,7 @@ macro_rules! skip_map {
 }
 
 /// A string field, or `None` if it is absent, `null` or not a string.
-fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+pub(crate) fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     struct V;
     impl<'de> Visitor<'de> for V {
         type Value = Option<String>;

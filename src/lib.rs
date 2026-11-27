@@ -19,6 +19,7 @@ pub mod http;
 pub mod instance;
 pub mod ipc;
 pub mod paths;
+pub mod presence;
 pub mod sandbox;
 pub mod service;
 pub mod synth;

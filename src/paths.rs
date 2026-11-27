@@ -355,13 +355,18 @@ pub(crate) fn private_tempdir() -> tempfile::TempDir {
     t
 }
 
-/// The real process's home directory.
+/// The real process's home directory. The passwd entry is looked up only when `$HOME` does not
+/// qualify: the lookup can go through NSS (LDAP, sssd), too slow for `ccwm hook` (§21.3).
 pub fn current_home(uid: u32) -> Result<PathBuf> {
+    let env_home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Ok(home) = resolve_home(None, env_home.clone(), uid) {
+        return Ok(home);
+    }
     let passwd = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
         .ok()
         .flatten()
         .map(|u| u.dir);
-    resolve_home(passwd, std::env::var_os("HOME").map(PathBuf::from), uid)
+    resolve_home(passwd, env_home, uid)
 }
 
 #[cfg(test)]

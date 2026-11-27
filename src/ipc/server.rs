@@ -74,14 +74,14 @@ pub async fn serve(
 }
 
 async fn handle(stream: UnixStream, service: &Service, daemon_uid: u32) {
-    match stream.peer_cred() {
-        Ok(cred) if peer_allowed(cred.uid(), daemon_uid) => {}
+    let peer_pid = match stream.peer_cred() {
+        Ok(cred) if peer_allowed(cred.uid(), daemon_uid) => cred.pid(),
         Ok(_) => {
             tracing::warn!("rejected a socket connection from a different user");
             return;
         }
         Err(_) => return,
-    }
+    };
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half.take(MAX_REQUEST_BYTES as u64 + 1));
     let mut line = Vec::new();
@@ -91,8 +91,8 @@ async fn handle(stream: UnixStream, service: &Service, daemon_uid: u32) {
             match std::str::from_utf8(&line) {
                 Ok(text) => match parse_request(text) {
                     Ok(req) => {
-                        tracing::trace!(op = ?req, "socket request");
-                        dispatch(service, req).await
+                        tracing::trace!(op = req.name(), "socket request");
+                        dispatch(service, req, peer_pid).await
                     }
                     Err(e) => Err(e),
                 },

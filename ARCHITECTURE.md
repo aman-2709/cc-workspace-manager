@@ -68,7 +68,11 @@ src/
   claude/         # M3: the ONLY module that knows Claude Code's formats: locate.rs (top-level session files, fd-based),
                   #     record.rs (allowlisted serde structs, lenient fields), parse.rs (checkpoints + aggregates),
                   #     prompt.rs (genuine-prompt classifier, bounded on-demand reads), redact.rs, resume.rs (UUID, POSIX quoting),
-                  #     cli.rs (`claude --version/--help`, cached by path+size+mtime)
+                  #     cli.rs (`claude --version/--help`, cached by path+size+mtime);
+                  #     v0.2: hook.rs (hook stdin allowlist parser, the `hook.event` report and its validation, the `hooks print` snippet)
+  presence/       # v0.2: mod.rs (Presence: hook events -> walk -> store, persistence, restore, 5 s sweep, debug log view),
+                  #     store.rs (open sessions without I/O: apply, limit, counters, debug log ring), proc.rs (ProcFs: bounded
+                  #     status/stat/cmdline/boot_id reads, the walk to the nearest `claude`, liveness; injectable root)
   discovery/resolve.rs         # M3: session cwd -> project root, unassigned reasons
   systemd.rs      # M4: the user unit text, `systemctl --user` wrapper (found on PATH), unit write (trusted dir, atomic),
                   #     purge of ccwm's four directories, linger check; CLI-side only, never a daemon child
@@ -243,6 +247,11 @@ clears it before `ClearPromptCache`, sets it when the setting turns on); after a
 replies. v0.1.1: the pragma's result row is read (`busy = 1` means a reader blocked it; that is not an
 SQL error); a truncation that did not happen is logged and stays owed, and the writer tries it again
 after every later batch until it succeeds (`truncate_wal`). `session_counts` adds the top 10 `(reason, first_cwd, n)` of unassigned sessions.
+
+### Migration 6 (v0.2 stop 1)
+`open_sessions` (§15): the activity indicator's open sessions, for the restore at start. Written best effort
+(`try_send`, no reply) when a session opens, moves to another process or closes; `ClearSessionIndex` deletes it
+too (a reindex after a parser change does not).
 
 ### Parser version (M4)
 `claude::parse::PARSER_VERSION` (2 = M3.1 rules; an M3 database has no entry) is compared with
@@ -590,7 +599,8 @@ Path `<runtime dir>/ccwm.sock` (runtime dir = `$XDG_RUNTIME_DIR/ccwm`, else `$XD
 owned by the user, verified; socket `0600`; path must be ≤ 107 bytes or startup fails). Per connection:
 1. Daemon: `peer_cred().uid == geteuid()` else close silently (counted, logged without content).
 2. Client, before sending anything: `getsockopt(SO_PEERCRED)` uid must equal its own `getuid()`.
-3. One request line (≤ 4 KiB, 2 s read timeout) → one response line → close.
+3. One request line (≤ 32 KiB since v0.2, was 4 KiB; 2 s read timeout) → one response line → close. The
+   daemon passes the peer's pid (`SO_PEERCRED`) to the op; only `hook.event` uses it.
 
 ```
 {"op":"ping"}                → {"ok":{"version":"0.1.1"}}
@@ -599,6 +609,8 @@ owned by the user, verified; socket `0600`; path must be ≤ 107 bytes or startu
 {"op":"service.status"}      → {"ok":{…same body as GET /service/status…}}
 {"op":"scan.refresh"}        → {"ok":{"status":"accepted","done_at_scans_finished":n}}   (M2; `ccwm scan`)
 {"op":"discovery.status"}    → {"ok":{…same body as GET /discovery/status…}}               (M2)
+{"op":"hook.event",…}        → {"ok":{"accepted":true}} | invalid_argument "malformed|no_claude_ancestor|pid_mismatch|limit"  (v0.2, §15)
+{"op":"hooks.events"}        → {"ok":{started_at, received, refused{…}, last_event_at, open, open_noninteractive, kept, events[…]}}  (v0.2; `ccwm hooks events`)
 {"op":"ping"} also returns "commit"; `ccwm status` warns when it differs from the CLI's build.
 errors                       → {"error":{"code":"…","message":"…"}}   (same codes as HTTP)
 ```
@@ -1160,6 +1172,32 @@ Verification and design only; no product code changed. Same host; Claude Code 2.
 
 ---
 
+## 13l. v0.2 stop 1 — what was actually run (2026-11-26)
+
+Same host (Ubuntu 24.04, Linux 7.0, rustc 1.94.0, dash 0.5.12 as `/bin/sh`); synthetic environments only; the
+real `claude` was never started, and no test or command reached the maintainer's daemon (every `ccwm` process ran
+with a synthetic `HOME`/`XDG_*`).
+
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `CCWM_REQUIRE_LANDLOCK=1
+  CCWM_REQUIRE_LANDLOCK_ABI=8 CCWM_REQUIRE_INOTIFY=1 cargo test`: green (300 unit tests; every integration suite,
+  `tests/hooks.rs` 6 of 6). `tests/hooks.rs` 15 more times in a row: green. musl
+  (`CARGO_TARGET_DIR=/tmp/ccwm-musl cargo test --locked --target x86_64-unknown-linux-musl --test hooks --test
+  ipc`): green. `cargo-deny check`: ok (no new dependency). gitleaks 8.30.1 `dir` on the new files: no leaks.
+- **Reparenting, checked before writing the "no `claude` ancestor" test:** a `setsid -f sh -c …` child's parent
+  chain is `systemd --user` → pid 1 here; without `setsid` the chain from a test process reaches the real Claude
+  Code session that runs `cargo test` (bash → `claude`), which the walk would find.
+- **Latency (release build, glibc, synthetic daemon):** a fake `claude` (`bash` with `argv[0]` `claude`,
+  `CLAUDE_PID=$$`) ran the printed guarded command 200 times for `PostToolUse` and 200 times for
+  `UserPromptSubmit` (the fixtures as stdin): **3.7 ms and 3.2 ms per hook**, including the `sh` fork, ccwm's start
+  and the socket round trip; 400 received, 400 accepted, nothing refused; no canary in the daemon log.
+- Measured in the tests: without a daemon `ccwm hook` exits in < 800 ms (debug build, asserted); against a socket
+  that never answers the socket part ends at 100 ms (unit: ≥ 95 ms and < 250 ms) and the process exits in < 700 ms
+  (asserted); a stdin that never closes ends at 0.9–3 s (asserted; the watchdog is 1 s); a full listen queue
+  (backlog 0, one unaccepted connection) costs < 250 ms.
+- Not run: anything with the real `claude` (O11 is the maintainer's), CI.
+
+---
+
 ## 14. Decisions log and remaining open items
 
 Decided (2026-11-23): Git fix accepted (min 2.41.0, disabled-by-default fallback + opt-in); all schema findings
@@ -1344,16 +1382,19 @@ Open:
 - **O4:** `app.js` DOM tests only if Node is present.
 - **O11 (v0.2):** interactive checks on the real home in phase 2 (the maintainer): `idle_prompt` after an
   interrupt, a background session's process, permission dialogs (approve, deny, Esc) and the events after them, an
-  npm-installed Claude Code's `cmdline`, the arguments SDK hosts start the CLI with. O9, O10, O12–O17 were decided on
+  npm-installed Claude Code's `cmdline`, the arguments SDK hosts start the CLI with. Stop 1 built the tool for
+  it: `ccwm hooks events --follow` (REQUIREMENTS.md §21.10). O9, O10, O12–O17 were decided on
   2026-11-26 (above; REQUIREMENTS.md §21.12).
 
 ---
 
-## 15. v0.2 design — session activity indicator (approved 2026-11-26; not built)
+## 15. v0.2 design — session activity indicator (approved 2026-11-26; stop 1 built)
 
 The spec is REQUIREMENTS.md §21 (approved with the decisions of §21.12); this is how phase 2 builds it, written
-against the v0.1.1 code. Phase 2 starts on the maintainer's go-ahead. Rules marked *(choice, for review)* in §21 are
-marked here too.
+against the v0.1.1 code. Rules marked *(choice, for review)* in §21 are marked here too. Phase 2 runs in two stops
+(maintainer, 2026-11-26): **stop 1 — the plumbing — is built** (below, "Stop 1 as built"); stop 2 (the state
+machine, project resolution, API/WebSocket, UI, the Settings toggle, status/doctor lines, docs) follows the
+maintainer's O11 checks on the real home.
 
 ### Data flow
 ```mermaid
@@ -1466,6 +1507,54 @@ new `tests/hooks.rs` (process level, real daemon in a synthetic environment, a f
 against a socket that never answers, the 1 s watchdog, the guarded snippet with ccwm missing, present and broken.
 `tests/ui.rs` for the DOM. `ccwm hook` writes only through `cli::errln!` (`tests/hygiene.rs` already bans
 `println!`/`eprintln!`); `tests/hooks.rs` asserts that its stdout is empty.
+
+### Stop 1 as built (2026-11-26)
+- **`claude/hook.rs`**: `Event` (the nine events, `SessionStart` carrying its `Source`, `Notification` its
+  `Notice`), `Report::from_hook` (stdin → report; `Skip::{NotUsed, WrongEvent, Malformed}`),
+  `Report::to_request_line`, `Report::from_request` (the daemon's hand-checked shape; `Malformed` keeps a known
+  event name and a valid session id for the debug log), `snippet`/`guarded_command`. stdin is read with a
+  `StreamDeserializer` over `take(16 MiB)`: parsing stops at the end of the first value, so a stdin that stays
+  open after the event costs nothing; the struct is read through `deserialize_map` (an array is not an object).
+  Found while testing: serde_json skips an ignored value **iteratively** (a million nested brackets in `prompt`
+  cost no stack) and does **not** validate UTF-8 inside a skipped string (it is never decoded) — both harmless,
+  both tested. `Report`'s `Debug` omits the cwd. A `Notification` with `agent_id` is still sent (a subagent's
+  permission dialog blocks the session); every other event with `agent_id` is not *(reading of §21.3, for
+  review)*.
+- **`ccwm hook`** (`cli::hook`, dispatched in `main` before clap; a clap variant exists for `--help` only):
+  panic hook → exit 0, watchdog thread (1 s) → exit 0, stdin a terminal → hint, then report → socket. Reads
+  `CLAUDE_PID` and the variables that locate the socket (`HOME`, `XDG_*`); `paths::current_home` now looks up
+  the passwd entry only when `$HOME` does not qualify (NSS can be slow).
+- **`client::send_hook`**: one deadline over connect (`SO_SNDTIMEO` bounds a blocking `connect()` on a full listen
+  queue: `EAGAIN`), the daemon's UID check, write and a bounded read loop (each read's timeout = what is left);
+  `HookSent::{Accepted, Refused, NotRunning, TimedOut, Failed}`.
+- **`ipc`**: `MAX_REQUEST_BYTES` 32 KiB; `Request::HookEvent(Result<Report, Malformed>)` (a malformed hook event
+  is the service's to count, not a protocol error), `Request::HooksEvents`; the trace log names the op only
+  (`Request::name`) — it used to print the request's `Debug`, which for a hook event would hold the cwd.
+- **`presence::proc`**: as planned, plus one rule: every parent on the walk must have **started no later than
+  its child** (a later start means the pid was reused) *(added in stop 1, for review)*. `still_claude` (restore)
+  also checks the UID and reads the interactive flag again.
+- **`presence::store`** (pure): open/closed only — `Opened`, `NewProcess`, `Accepted`, `Closed`, `Ignored`;
+  `SessionStart` moves a session to the reporting process, and so does any event once the session's process is
+  gone (the liveness check "at every event", for the event's own session); the first cwd is kept. Counters
+  (`received`, `refused{…}`, `last_event_at`) and the **debug log**: a ring of 256 `LogEntry {seq, at_ms, event,
+  detail, session_id, claude_pid_sent, outcome}` (no cwd, pid or text), with the daemon's own closes ("closed:
+  process gone", "restored", "dropped at start: process gone", "cleared: …"). The activity states arrive in stop 2.
+- **`presence::Presence`**: `report` (walk outside the lock, apply under it, persistence queued after),
+  `sweep` (`/proc` reads outside the lock, `close_if` the identity is unchanged), `restore` (before the socket
+  serves), `clear` (with "Clear session index"), `events`, `run_sweeper` (5 s, stopped with the other tasks).
+  `Clock::now_ms` (default: seconds × 1000) times the log.
+- **`ccwm hooks print`** (stdout: the snippet only; stderr: a warning when the binary is not
+  `~/.local/bin/ccwm`, and a one-line hint when stdout is a terminal) and **`ccwm hooks events [--follow]`**
+  (the debug log, local times with milliseconds; `--follow` polls every 300 ms and notices a daemon restart).
+- **Tests**: unit (fixtures with canaries in every skipped field; 16 MiB; hostile shapes; the request's bounds;
+  fake `/proc` trees for both `CLAUDE_PID` paths, `pid_mismatch`, 8 steps, other UIDs, reused pids, zombies, `)`
+  in names, the `argv[0]` and non-interactive forms; the store; `Presence` with a temporary database; the
+  client's budget against a socket that never answers and a full listen queue) and `tests/hooks.rs` (the real
+  binary: no daemon, a stdin that never closes, a socket that never answers, the snippet under dash with ccwm
+  present/missing/broken, a fake `claude` tree through the printed commands with and without `CLAUDE_PID`, a
+  wrong `CLAUDE_PID`, a detached hook, `-p`, `SessionEnd`, a killed process, a restart, "Clear session
+  index", canaries in the trace log, the database and `ccwm hooks events`). `tests/common/daemon.rs` now holds
+  the daemon harness `tests/process.rs` had.
 
 ### Phase 2 — the build, once the maintainer gives the go-ahead
 Accept (synthetic environment, a real browser): a fake session's `SessionStart` shows "Waiting for input" on its

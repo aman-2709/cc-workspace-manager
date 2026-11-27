@@ -17,6 +17,12 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
+/// [`is_uuid`] in lower case only, as Claude Code writes session and prompt ids: another spelling
+/// of the same id is not accepted (folding it would let two spellings share one id, M3 review L4).
+pub fn is_lower_uuid(s: &str) -> bool {
+    is_uuid(s) && !s.bytes().any(|b| b.is_ascii_uppercase())
+}
+
 /// POSIX single-quoting: the whole string in `'…'`, each `'` written as `'\''`. Nothing inside
 /// single quotes is special to the shell (no `$`, backtick, `\` or newline handling).
 pub fn shell_quote(s: &str) -> String {

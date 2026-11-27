@@ -264,6 +264,16 @@ enum Cmd {
         now: i64,
         reply: Reply<Vec<String>>,
     },
+    /// Insert or replace an open session of the activity indicator (§21.7). Best effort: no
+    /// reply (the hook's acknowledgement never waits for the database).
+    PutOpenSession {
+        id: String,
+        open: crate::presence::store::Open,
+    },
+    /// Delete open sessions (closed, gone, or not restorable at start). Best effort.
+    DeleteOpenSessions {
+        ids: Vec<String>,
+    },
     Flush {
         reply: Reply<()>,
     },
@@ -519,6 +529,29 @@ impl Writer {
         self.call(|reply| Cmd::ClearPromptCache { reply }).await
     }
 
+    /// Persist an open session (best effort: dropped with a warning when the queue is full; the
+    /// session then returns with its next hook event after a restart).
+    pub fn put_open_session(&self, id: &str, open: &crate::presence::store::Open) {
+        self.send_best_effort(Cmd::PutOpenSession {
+            id: id.to_string(),
+            open: open.clone(),
+        });
+    }
+
+    /// Delete persisted open sessions (best effort, like [`Self::put_open_session`]; a row left
+    /// behind is dropped at the next start, when its process is gone).
+    pub fn delete_open_sessions(&self, ids: Vec<String>) {
+        if !ids.is_empty() {
+            self.send_best_effort(Cmd::DeleteOpenSessions { ids });
+        }
+    }
+
+    fn send_best_effort(&self, cmd: Cmd) {
+        if self.tx.try_send(cmd).is_err() {
+            tracing::warn!("the database queue is full: an open session of the activity indicator was not saved");
+        }
+    }
+
     pub async fn forget(&self, id: &str) -> Result<bool> {
         let id = id.to_string();
         self.call(|reply| Cmd::Forget { id, reply }).await
@@ -709,7 +742,10 @@ fn fail(cmd: Cmd, err: &Error) {
         | Cmd::Revive { reply, .. } => drop(reply.send(Err(e()))),
         Cmd::Forget { reply, .. } => drop(reply.send(Err(e()))),
         Cmd::ClearPromptCache { reply } => drop(reply.send(Err(e()))),
-        Cmd::TouchSession { .. } | Cmd::CachePrompt { .. } => {}
+        Cmd::TouchSession { .. }
+        | Cmd::CachePrompt { .. }
+        | Cmd::PutOpenSession { .. }
+        | Cmd::DeleteOpenSessions { .. } => {}
     }
 }
 
@@ -830,7 +866,50 @@ fn execute(tx: &rusqlite::Transaction<'_>, cmd: Cmd, store_prompts: &AtomicBool)
         Cmd::DeleteSessions { file_paths, reply } => {
             run!(reply, |c| delete_sessions(c, &file_paths))
         }
-        Cmd::ClearSessionIndex { reply } => run!(reply, clear_session_index),
+        // "Clear session index" also empties the open sessions of the indicator (§21.7, O16);
+        // a reindex after a parser change does not (it is not about live sessions).
+        Cmd::ClearSessionIndex { reply } => run!(reply, |c| {
+            let affected = clear_session_index(c)?;
+            c.execute("DELETE FROM open_sessions", [])
+                .map_err(|e| db_err("clear open sessions", &e))?;
+            Ok(affected)
+        }),
+        Cmd::PutOpenSession { id, open } => {
+            let _ = savepoint(tx, |c| {
+                c.execute(
+                    "INSERT INTO open_sessions (session_id, pid, pid_start, boot_id, first_cwd, opened_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(session_id) DO UPDATE SET pid = excluded.pid,
+                       pid_start = excluded.pid_start, boot_id = excluded.boot_id",
+                    params![
+                        id,
+                        open.identity.pid,
+                        i64::try_from(open.identity.start).unwrap_or(i64::MAX),
+                        open.identity.boot_id,
+                        open.first_cwd,
+                        open.opened_at
+                    ],
+                )
+                .map(|_| ())
+                .map_err(|e| db_err("save open session", &e))
+            })
+            .inspect_err(|e| tracing::warn!(error = %e, "an open session of the activity indicator was not saved"));
+            Box::new(|_| {})
+        }
+        Cmd::DeleteOpenSessions { ids } => {
+            let _ = savepoint(tx, |c| {
+                let mut st = c
+                    .prepare_cached("DELETE FROM open_sessions WHERE session_id = ?1")
+                    .map_err(|e| db_err("prepare delete open session", &e))?;
+                for id in &ids {
+                    st.execute(params![id])
+                        .map_err(|e| db_err("delete open session", &e))?;
+                }
+                Ok(())
+            })
+            .inspect_err(|e| tracing::warn!(error = %e, "a closed session of the activity indicator was not deleted"));
+            Box::new(|_| {})
+        }
         Cmd::CachePrompt { session_id, prompt } => {
             if prompt.is_some() && !store_prompts.load(Ordering::SeqCst) {
                 return Box::new(|_| {});

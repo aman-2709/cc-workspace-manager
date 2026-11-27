@@ -21,6 +21,8 @@ use std::path::Path;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+pub mod daemon;
+
 /// A temporary directory with mode 0700 regardless of the umask: ccwm refuses group-writable
 /// ancestors that do not belong to the user's private group.
 pub fn tempdir() -> tempfile::TempDir {
@@ -204,6 +206,13 @@ pub async fn env_with_sandbox(sandbox: SandboxReport) -> Env {
         roots: vec![std::path::PathBuf::from(HOME)],
         claude: None,
         peer_lookup: "procfs",
+        presence: Arc::new(cc_workspace_manager::presence::Presence::new(
+            cc_workspace_manager::presence::proc::ProcFs::default(),
+            nix::unistd::geteuid().as_raw(),
+            std::process::id(),
+            writer.clone(),
+            clock.clone(),
+        )),
     }));
     let router = http::router(service.clone());
     Env {

@@ -104,6 +104,36 @@ pub enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Report a Claude Code hook event to the daemon. Claude Code runs this, with the event's
+    /// JSON on stdin, from the settings `ccwm hooks print` prints; it always exits 0 and never
+    /// prints on stdout.
+    Hook {
+        /// The hook event: SessionStart, UserPromptSubmit, Notification, PostToolUse,
+        /// PostToolUseFailure, PostToolBatch, Stop, StopFailure or SessionEnd.
+        event: Option<std::ffi::OsString>,
+        /// Ignored.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        rest: Vec<std::ffi::OsString>,
+    },
+    /// The Claude Code hooks of the session activity indicator (opt-in).
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HooksAction {
+    /// Print the `hooks` settings to merge into a Claude Code settings file (ccwm never reads
+    /// or edits those files).
+    Print,
+    /// Show the hook events the daemon received since it started, oldest first: time, event,
+    /// session id and what the daemon did with each (a debugging aid).
+    Events {
+        /// Keep printing new events as they arrive (Ctrl-C to stop).
+        #[arg(long)]
+        follow: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,7 +177,229 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Auth {
             action: AuthAction::RevokeAll,
         } => revoke_all(),
+        Command::Hook { event, .. } => hook(event.as_deref()),
+        Command::Hooks {
+            action: HooksAction::Print,
+        } => hooks_print(),
+        Command::Hooks {
+            action: HooksAction::Events { follow },
+        } => hooks_events(follow),
     }
+}
+
+/// `ccwm hook` ends with status 0 after this long, whatever it waits for (a stdin that never
+/// closes, a slow lookup): Claude Code waits for a synchronous hook (§21.3).
+pub const HOOK_WATCHDOG: Duration = Duration::from_secs(1);
+
+/// `ccwm hook <Event>` (REQUIREMENTS.md §21.3), dispatched by `main` before argument parsing and
+/// run by Claude Code with the event's JSON on stdin. **Exits 0 on every path and never writes
+/// to stdout** (Claude Code adds a `SessionStart`/`UserPromptSubmit` hook's stdout to the
+/// model's context and reads status 2 as "block"): a failure is one line on stderr, never input
+/// content. Only `CLAUDE_PID` of the hook's environment is read, besides the variables every
+/// command uses to find the daemon's socket (`HOME`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`).
+pub fn hook(event: Option<&std::ffi::OsStr>) -> ! {
+    std::panic::set_hook(Box::new(|_| {
+        errln!("ccwm hook: internal error; the event is dropped");
+        std::process::exit(0);
+    }));
+    let watchdog = std::thread::Builder::new()
+        .name("ccwm-hook-watchdog".into())
+        .spawn(|| {
+            std::thread::sleep(HOOK_WATCHDOG);
+            std::process::exit(0);
+        });
+    match watchdog {
+        Ok(_) => {
+            if let Some(problem) = hook_problem(event) {
+                errln!("ccwm hook: {problem}");
+            }
+        }
+        Err(_) => errln!("ccwm hook: cannot start its watchdog; the event is dropped"),
+    }
+    std::process::exit(0)
+}
+
+/// Read, validate and send the event; `None` when it was accepted or is one the indicator does
+/// not use, otherwise the one line `ccwm hook` writes to stderr.
+fn hook_problem(event: Option<&std::ffi::OsStr>) -> Option<String> {
+    use crate::claude::hook::{Report, Skip};
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Some(
+            "Claude Code runs this command with a hook event's JSON on stdin; `ccwm hooks print` prints the settings that make it do so".into(),
+        );
+    }
+    let arg = event.and_then(std::ffi::OsStr::to_str).unwrap_or("");
+    let report =
+        match Report::from_hook(arg, stdin.lock(), std::env::var_os("CLAUDE_PID").as_deref()) {
+            Ok(r) => r,
+            Err(Skip::NotUsed) => return None,
+            Err(skip) => return Some(skip.to_string()),
+        };
+    let (socket, uid) = match daemon_socket() {
+        Ok(s) => s,
+        Err(e) if e.is_not_running() => return Some(client::HookSent::NotRunning.to_string()),
+        Err(e) => return Some(e.to_string()),
+    };
+    match client::send_hook(&socket, uid, &report.to_request_line(), client::HOOK_BUDGET) {
+        client::HookSent::Accepted => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// `ccwm hooks print` (§21.9): the snippet for this binary's canonical path, on stdout only.
+fn hooks_print() -> Result<()> {
+    use std::io::IsTerminal;
+    let exe = std::env::current_exe().map_err(|e| Error::io("cannot find this ccwm binary", &e))?;
+    let path = std::fs::canonicalize(&exe)
+        .map_err(|e| Error::io(format!("cannot resolve {}", exe.display()), &e))?;
+    let snippet = crate::claude::hook::snippet(&path).map_err(Error::new)?;
+    let (_, uid) = daemon_dirs()?;
+    let installed = current_home(uid)?.join(systemd::BINARY_IN_HOME);
+    if std::fs::canonicalize(&installed).ok().as_deref() != Some(path.as_path()) {
+        errln!(
+            "warning: this ccwm is {}, not {}: the hooks below call it by that path (scripts/install.sh installs ccwm at {})",
+            path.display(),
+            installed.display(),
+            installed.display()
+        );
+    }
+    if std::io::stdout().is_terminal() {
+        errln!(
+            "Merge this `hooks` object into ~/.claude/settings.json (every project) or a project's .claude/settings.local.json (that project only); ccwm never reads or edits these files."
+        );
+    }
+    out!("{snippet}");
+    Ok(())
+}
+
+/// How often `ccwm hooks events --follow` asks the daemon for new events.
+const FOLLOW_EVERY: Duration = Duration::from_millis(300);
+
+/// `ccwm hooks events [--follow]`: the debug log of hook events (names, times, session ids).
+fn hooks_events(follow: bool) -> Result<()> {
+    let (socket, uid, v) = first_call("hooks.events")?;
+    out!("{}", format_hook_events_header(&v));
+    let (lines, mut last) = hook_event_lines(&v, 0);
+    if lines.is_empty() && !follow {
+        outln!("No hook events yet: `ccwm hooks print` prints the settings that send them.");
+        return Ok(());
+    }
+    outln!("{}", hook_events_columns());
+    for l in lines {
+        outln!("{l}");
+    }
+    if !follow {
+        return Ok(());
+    }
+    let mut started = v.get("started_at").and_then(serde_json::Value::as_i64);
+    loop {
+        std::thread::sleep(FOLLOW_EVERY);
+        let v = client::call(&socket, uid, "hooks.events")?;
+        let now_started = v.get("started_at").and_then(serde_json::Value::as_i64);
+        if now_started != started {
+            outln!("-- the daemon restarted; its log starts over --");
+            started = now_started;
+            last = 0;
+        }
+        let (lines, newest) = hook_event_lines(&v, last);
+        if newest < last {
+            last = 0; // cannot happen without a restart; start over rather than go quiet
+            continue;
+        }
+        last = newest;
+        for l in lines {
+            outln!("{l}");
+        }
+    }
+}
+
+/// The counters above the debug log.
+pub fn format_hook_events_header(v: &serde_json::Value) -> String {
+    let n = |p: &str| {
+        v.pointer(p)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let refused: Vec<String> = crate::presence::store::Refusal::ALL
+        .iter()
+        .filter_map(|r| {
+            let k = n(&format!("/refused/{}", r.as_str()));
+            (k > 0).then(|| format!("{k} {}", r.as_str()))
+        })
+        .collect();
+    format!(
+        "Hook events since the daemon started ({}): {} received, refused: {}.\nOpen sessions: {} ({} non-interactive). The daemon keeps the last {} events; times are local.\n",
+        when(v, "/started_at"),
+        n("/received"),
+        if refused.is_empty() { "none".to_string() } else { refused.join(", ") },
+        n("/open"),
+        n("/open_noninteractive"),
+        n("/kept"),
+    )
+}
+
+pub fn hook_events_columns() -> String {
+    format!(
+        "{:>6}  {:<23}  {:<18}  {:<17}  {:<36}  {:<10}  outcome",
+        "#", "time", "event", "detail", "session", "CLAUDE_PID"
+    )
+}
+
+/// The entries after `after` (by sequence number), formatted, and the newest sequence number
+/// seen (`after` when there is none).
+pub fn hook_event_lines(v: &serde_json::Value, after: u64) -> (Vec<String>, u64) {
+    let mut newest = after;
+    let mut lines = Vec::new();
+    let entries = v
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for e in &entries {
+        let Some(seq) = e.get("seq").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        newest = newest.max(seq);
+        if seq <= after {
+            continue;
+        }
+        let text = |k: &str| e.get(k).and_then(serde_json::Value::as_str).unwrap_or("-");
+        let time = e
+            .get("at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+            .map_or_else(
+                || "unknown".to_string(),
+                |t| {
+                    t.to_zoned_datetime(
+                        jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC),
+                    )
+                    .strftime("%Y-%m-%d %H:%M:%S%.3f")
+                    .to_string()
+                },
+            );
+        let pid = match e
+            .get("claude_pid_sent")
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => "sent",
+            Some(false) => "absent",
+            None => "-",
+        };
+        let event = e
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(daemon)");
+        lines.push(format!(
+            "{seq:>6}  {time:<23}  {event:<18}  {:<17}  {:<36}  {pid:<10}  {}",
+            text("detail"),
+            text("session_id"),
+            text("outcome")
+        ));
+    }
+    (lines, newest)
 }
 
 fn daemon_dirs() -> Result<(Dirs, u32)> {
@@ -793,6 +1045,40 @@ mod tests {
         assert!(Cli::try_parse_from(["ccwm", "serve", "--port", "99999"]).is_err());
         assert!(Cli::try_parse_from(["ccwm", "bogus"]).is_err());
     }
+
+    #[test]
+    fn parses_the_hook_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["ccwm", "hooks", "print"])
+                .unwrap()
+                .command,
+            Command::Hooks {
+                action: HooksAction::Print
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ccwm", "hooks", "events", "--follow"])
+                .unwrap()
+                .command,
+            Command::Hooks {
+                action: HooksAction::Events { follow: true }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ccwm", "hooks", "events"])
+                .unwrap()
+                .command,
+            Command::Hooks {
+                action: HooksAction::Events { follow: false }
+            }
+        ));
+        // `main` dispatches `hook` before clap; clap accepts it too (for `--help`), with
+        // anything after the event.
+        let c = Cli::try_parse_from(["ccwm", "hook", "Stop", "--x", "y"]).unwrap();
+        assert!(matches!(c.command, Command::Hook { event: Some(ref e), .. } if e == "Stop"));
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("hook ") && help.contains("hooks "), "{help}");
+    }
 }
 
 #[cfg(test)]
@@ -919,6 +1205,73 @@ mod status_tests {
             "absent: not claimed"
         );
         assert!(string_list(report, "notes").is_empty());
+    }
+
+    #[test]
+    fn hook_events_are_listed_with_counters_and_only_new_ones_when_following() {
+        let v = serde_json::json!({
+            "started_at": 0, "received": 5, "open": 2, "open_noninteractive": 1, "kept": 256,
+            "refused": {"malformed": 0, "no_claude_ancestor": 2, "pid_mismatch": 1, "limit": 0},
+            "events": [
+                {"seq": 7, "at_ms": 1_000, "event": "SessionStart", "detail": "startup",
+                 "session_id": "0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f", "claude_pid_sent": true, "outcome": "opened"},
+                {"seq": 8, "at_ms": 2_500, "event": null, "detail": null,
+                 "session_id": "0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f", "claude_pid_sent": null, "outcome": "closed: process gone"},
+                {"seq": 9, "at_ms": 3_000, "event": "Stop", "detail": null, "session_id": null,
+                 "claude_pid_sent": false, "outcome": "refused: malformed"}
+            ]
+        });
+        let head = format_hook_events_header(&v);
+        assert!(
+            head.contains(": 5 received, refused: 2 no_claude_ancestor, 1 pid_mismatch.\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains(
+                "Open sessions: 2 (1 non-interactive). The daemon keeps the last 256 events"
+            ),
+            "{head}"
+        );
+        let none = format_hook_events_header(&serde_json::json!({"refused": {}}));
+        assert!(none.contains("refused: none."), "{none}");
+        let (lines, newest) = hook_event_lines(&v, 0);
+        assert_eq!(newest, 9);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].starts_with("     7  ") && lines[0].contains("SessionStart        startup"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with("0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f  sent        opened"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains(".000  "), "milliseconds: {}", lines[0]);
+        assert!(
+            lines[1].contains("(daemon)") && lines[1].ends_with("-           closed: process gone"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].contains(".500  "), "{}", lines[1]);
+        assert!(
+            lines[2].contains("Stop") && lines[2].ends_with("absent      refused: malformed"),
+            "{}",
+            lines[2]
+        );
+        // Following: only what is newer.
+        let (lines, newest) = hook_event_lines(&v, 8);
+        assert_eq!((lines.len(), newest), (1, 9));
+        let (lines, newest) = hook_event_lines(&v, 9);
+        assert!(lines.is_empty() && newest == 9);
+        assert_eq!(hook_event_lines(&serde_json::json!({}), 4), (Vec::new(), 4));
+        // The column header lines up with the rows.
+        let cols = hook_events_columns();
+        assert_eq!(cols.find("event"), lines_col(&v, "SessionStart"));
+    }
+
+    fn lines_col(v: &serde_json::Value, what: &str) -> Option<usize> {
+        hook_event_lines(v, 0).0[0].find(what)
     }
 
     #[test]
