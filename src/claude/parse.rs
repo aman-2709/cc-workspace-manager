@@ -626,6 +626,123 @@ mod tests {
         }
     }
 
+    /// v0.2 review L6: the guard behind "message text and `toolUseResult` stay unread". serde_json
+    /// does not validate UTF-8 inside a string it skips, but a string it decodes must be valid:
+    /// raw invalid bytes in every field the parser must not read leave every record parsed — a
+    /// parser that started decoding one of them would count the record as malformed (or lose
+    /// the fact). The output-canary test above cannot see a field decoded and then dropped.
+    #[test]
+    fn unread_fields_stay_undecoded_even_with_invalid_utf8() {
+        const RAW: &[u8] = b"\xff\xfe\xc3(";
+        let record = |kind: &str, ts: &str, fields: &[(&str, &[u8])]| -> Vec<u8> {
+            let mut l = format!(
+                r#"{{"type":"{kind}","sessionId":"{TURN_SID}","timestamp":"{ts}","cwd":"/w/a""#
+            )
+            .into_bytes();
+            for (k, v) in fields {
+                l.extend_from_slice(format!(",\"{k}\":").as_bytes());
+                l.extend_from_slice(v);
+            }
+            l.extend_from_slice(b"}\n");
+            l
+        };
+        let s = |inner: &[u8]| [b"\"".as_slice(), inner, b"\""].concat();
+        let text = s(RAW);
+        let content = [br#"[{"type":"text","text":""#.as_slice(), RAW, br#""}]"#].concat();
+        let message = [br#"{"role":"user","content":""#.as_slice(), RAW, br#""}"#].concat();
+        let assistant_message = [
+            br#"{"role":"assistant","content":"#.as_slice(),
+            &content,
+            b"}",
+        ]
+        .concat();
+        let prompt_id = s(TURN_P.as_bytes());
+        let lines = [
+            // "No" in a permission dialog: the denial's result record.
+            record(
+                "user",
+                "2026-01-01T00:00:01.000Z",
+                &[
+                    ("promptId", &prompt_id),
+                    ("toolDenialKind", br#""user-rejected""#),
+                    ("toolUseResult", &text),
+                    ("message", &message),
+                ],
+            ),
+            // A tool result whose structured output is an object.
+            record(
+                "user",
+                "2026-01-01T00:00:02.000Z",
+                &[
+                    (
+                        "toolUseResult",
+                        &[br#"{"stdout":"#.as_slice(), &text, b"}"].concat(),
+                    ),
+                    ("message", &message),
+                ],
+            ),
+            record(
+                "assistant",
+                "2026-01-01T00:00:03.000Z",
+                &[
+                    ("isAbortedMidStream", b"true"),
+                    ("message", &assistant_message),
+                ],
+            ),
+            record(
+                "system",
+                "2026-01-01T00:00:04.000Z",
+                &[("subtype", br#""turn_duration""#), ("content", &text)],
+            ),
+            record(
+                "attachment",
+                "2026-01-01T00:00:05.000Z",
+                &[(
+                    "attachment",
+                    &[br#"{"content":"#.as_slice(), &text, b"}"].concat(),
+                )],
+            ),
+            // `interruptedMessageId` is read for its presence only, never decoded.
+            record(
+                "user",
+                "2026-01-01T00:00:06.000Z",
+                &[
+                    ("promptId", &prompt_id),
+                    ("interruptedMessageId", &text),
+                    ("rowSource", br#""harness""#),
+                    ("message", &message),
+                ],
+            ),
+        ];
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("raw.jsonl");
+        std::fs::write(&p, lines.concat()).unwrap();
+        let (_, aggregate, _) = updated(run_id(&p, None, TURN_SID));
+        assert_eq!(
+            (aggregate.counts.lines, aggregate.counts.malformed),
+            (6, 0),
+            "every record parsed: no unread field was decoded"
+        );
+        assert_eq!(aggregate.first_cwd.as_deref(), Some("/w/a"));
+        assert_eq!(
+            fact_of(run_id(&p, None, TURN_SID)),
+            Some(TurnFact {
+                end: TurnEnd::Interrupted,
+                prompt_id: Some(TURN_P.into()),
+                at_ms: ms("2026-01-01T00:00:06.000Z"),
+            })
+        );
+        // The same bytes in a field the parser does read make the record malformed: the
+        // technique detects decoding.
+        std::fs::write(
+            &p,
+            record("user", "2026-01-01T00:00:07.000Z", &[("promptId", &text)]),
+        )
+        .unwrap();
+        let (_, aggregate, _) = updated(run_id(&p, None, TURN_SID));
+        assert_eq!(aggregate.counts.malformed, 1);
+    }
+
     fn run_id(path: &std::path::Path, prev: Option<(Checkpoint, Aggregate)>, id: &str) -> Outcome {
         let mut f = File::open(path).unwrap();
         parse(&mut f, id, prev.as_ref().map(|(c, a)| (c, a)), &read_all).unwrap()

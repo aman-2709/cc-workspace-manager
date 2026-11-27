@@ -12,7 +12,7 @@ mod common;
 
 use cc_workspace_manager::claude::hook::guarded_command;
 use cc_workspace_manager::synth::{self, SynthEnv};
-use common::daemon::{command, socket_call, wait_until, Daemon, BIN};
+use common::daemon::{command, socket_call, wait_until, wrapped_command, Daemon, BIN};
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -226,9 +226,108 @@ fn a_daemon_that_never_answers_costs_the_hook_100_ms() {
     }
 }
 
+/// v0.2 review L5: `ccwm hook` makes no NSS lookup (REQUIREMENTS.md §21.3) — with a private
+/// runtime directory and a `$HOME` that qualifies it opens neither `/etc/passwd` nor `/etc/group`
+/// nor `nsswitch.conf`, and asks no nscd or sssd, from start to the daemon's answer (a stand-in
+/// listener here). The control: a group-writable runtime ancestor needs the private-group lookup,
+/// and the same trace sees it.
+#[test]
+fn the_hook_makes_no_user_or_group_database_lookup() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let t = common::tempdir();
+    let env = synth_env(&t);
+    let probe = std::process::Command::new("strace")
+        .args(["-f", "-qq", "-e", "trace=openat", "-o", "/dev/null", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|s| s.success()) {
+        common::skipped_coverage(
+            "strace is not usable here: the NSS check of `ccwm hook` is skipped",
+        );
+        return;
+    }
+    let run = env.runtime_dir.join("ccwm");
+    std::fs::DirBuilder::new().mode(0o700).create(&run).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(run.join("ccwm.sock")).unwrap();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { return };
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !got.contains(&b'\n') {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = s.write_all(b"{\"ok\":{\"accepted\":true}}\n");
+        }
+    });
+    let traced = |name: &str| -> (String, String) {
+        let log = t.path().join(format!("{name}.strace"));
+        let strace = [
+            "strace",
+            "-f",
+            "-qq",
+            "-s",
+            "256",
+            "-e",
+            "trace=open,openat,connect",
+            "-o",
+            log.to_str().unwrap(),
+        ]
+        .map(String::from);
+        let mut child = wrapped_command(&env, &strace)
+            .args(["hook", "Stop"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(fixture("Stop.json").as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stdout.is_empty());
+        (
+            std::fs::read_to_string(&log).unwrap(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    const NSS: [&str; 5] = [
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/nsswitch.conf",
+        "nscd",
+        "/var/lib/sss",
+    ];
+    let (trace, stderr) = traced("private");
+    assert!(stderr.is_empty(), "the event was accepted: {stderr}");
+    assert!(
+        trace.contains("ccwm.sock"),
+        "the trace saw the socket: {trace}"
+    );
+    for f in NSS {
+        assert!(!trace.contains(f), "{f} in\n{trace}");
+    }
+    // Control: a group-writable ancestor of the runtime directory needs the private group.
+    std::fs::set_permissions(&env.runtime_dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let (trace, _) = traced("group-writable");
+    assert!(
+        NSS[..3].iter().any(|f| trace.contains(f)),
+        "the lookup is visible to the trace:\n{trace}"
+    );
+}
+
 /// `ccwm hooks print`: the snippet on stdout and nothing else; each command, run by dash, exits
 /// 0 with ccwm present, missing, or replaced by a stand-in that fails loudly, and prints nothing
-/// on stdout where ccwm is real or missing.
+/// on stdout in every case (the stand-in's stdout is discarded, its stderr stays visible).
 #[test]
 fn the_printed_hooks_are_safe_when_ccwm_is_present_missing_or_broken() {
     let t = common::tempdir();
@@ -262,10 +361,10 @@ fn the_printed_hooks_are_safe_when_ccwm_is_present_missing_or_broken() {
     );
     let bin = bin.to_str().unwrap();
     for (event, cmd) in &commands {
-        for (variant, command_text, stdout_empty) in [
-            ("present", cmd.clone(), true),
-            ("missing", cmd.replace(bin, "/nonexistent/ccwm"), true),
-            ("broken", cmd.replace(bin, broken.to_str().unwrap()), false),
+        for (variant, command_text) in [
+            ("present", cmd.clone()),
+            ("missing", cmd.replace(bin, "/nonexistent/ccwm")),
+            ("broken", cmd.replace(bin, broken.to_str().unwrap())),
         ] {
             let mut c = std::process::Command::new(&dash);
             c.env_clear()
@@ -285,8 +384,9 @@ fn the_printed_hooks_are_safe_when_ccwm_is_present_missing_or_broken() {
                 .write_all(fixture("Stop.json").as_bytes());
             let out = child.wait_with_output().unwrap();
             assert_eq!(out.status.code(), Some(0), "{event} {variant}");
-            if stdout_empty {
-                assert!(out.stdout.is_empty(), "{event} {variant}: {:?}", out.stdout);
+            assert!(out.stdout.is_empty(), "{event} {variant}: {:?}", out.stdout);
+            if variant == "broken" {
+                assert_eq!(out.stderr, b"oops\n", "{event}: its stderr stays visible");
             }
             if variant == "missing" {
                 assert!(
@@ -296,6 +396,58 @@ fn the_printed_hooks_are_safe_when_ccwm_is_present_missing_or_broken() {
             }
         }
     }
+}
+
+/// v0.2 review I7: `ccwm hooks events --follow` waits for a restarted daemon and says so,
+/// instead of ending with an error at the first poll that finds no daemon.
+#[test]
+fn hooks_events_follow_waits_for_a_restarted_daemon() {
+    let t = common::tempdir();
+    let env = synth_env(&t);
+    let first = Daemon::start(&env, &[]);
+    let mut follow = command(&env)
+        .args(["hooks", "events", "--follow"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    for pipe in [
+        Box::new(follow.stdout.take().unwrap()) as Box<dyn Read + Send>,
+        Box::new(follow.stderr.take().unwrap()),
+    ] {
+        let out = std::sync::Arc::clone(&out);
+        std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                out.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+    }
+    let shown = |what: &str| out.lock().unwrap().contains(what);
+    wait_until("the follow header", 10, || shown("Hook events since"));
+    // Timestamps are whole seconds: the next daemon must start in a later second.
+    std::thread::sleep(Duration::from_millis(1100));
+    drop(first);
+    wait_until("the wait notice", 10, || shown("not reachable; waiting"));
+    let _second = Daemon::start(&env, &[]);
+    wait_until("the restart notice", 10, || {
+        shown("-- the daemon restarted")
+    });
+    assert!(
+        matches!(follow.try_wait(), Ok(None)),
+        "--follow still runs:\n{}",
+        out.lock().unwrap()
+    );
+    let _ = follow.kill();
+    let _ = follow.wait();
 }
 
 // ---- a real daemon and a fake Claude Code process tree -------------------------------------
@@ -601,7 +753,8 @@ fn a_fake_claude_tree_reports_through_the_printed_hooks() {
         (Some(13), Some(1), Some(1))
     );
 
-    // 6. SessionEnd closes; killing a fake claude closes its session within one sweep.
+    // 6. SessionEnd from another process than the session's is ignored (v0.2 review L1);
+    // killing a fake claude closes its session within one sweep.
     let fake5 = FakeClaude::new(&env, "fake5");
     let mut fifth = fake5.start(
         &env,
@@ -615,13 +768,20 @@ fn a_fake_claude_tree_reports_through_the_printed_hooks() {
     );
     fake5.wait_hooks(1);
     let _ = fifth.wait();
-    // The `-p` claude (fake4) is another process: its session is closed by the event all the
-    // same (the session ended).
-    want.push(entry("SessionEnd", "-", SID3, "true", "closed"));
+    // The session is the `-p` claude's (fake4), which still runs: the event of another process
+    // (the same session resumed elsewhere, then left) does not close it there.
+    want.push(entry(
+        "SessionEnd",
+        "-",
+        SID3,
+        "true",
+        "ignored (another process)",
+    ));
     assert_eq!(log(&env, 0), want);
+    assert_eq!(events(&env)["open"], 3);
     kill_group(&mut second);
     let killed = Instant::now();
-    wait_until("the sweep", 12, || events(&env)["open"] == 1);
+    wait_until("the sweep", 12, || events(&env)["open"] == 2);
     assert!(
         killed.elapsed() < Duration::from_secs(11),
         "within a sweep: {:?}",
@@ -635,7 +795,7 @@ fn a_fake_claude_tree_reports_through_the_printed_hooks() {
     assert!(out.status.success());
     let shown = String::from_utf8(out.stdout).unwrap();
     assert!(
-        shown.contains("Open sessions: 1 (0 non-interactive)"),
+        shown.contains("Open sessions: 2 (1 non-interactive)"),
         "{shown}"
     );
     assert!(

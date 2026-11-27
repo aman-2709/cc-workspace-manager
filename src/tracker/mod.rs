@@ -164,7 +164,9 @@ impl Tracker {
         else {
             return Ok(());
         };
-        let wanted = presence.cwds();
+        // The sequence number is taken before the projects are read: a resolution that started
+        // later (and so read the projects later) wins over this one (v0.2 review L8).
+        let (seq, wanted) = presence.cwds();
         if wanted.is_empty() {
             return Ok(());
         }
@@ -194,7 +196,7 @@ impl Tracker {
             })
             .await
             .map_err(|e| crate::error::Error::new(format!("session resolution failed: {e}")))?;
-        presence.assign(results);
+        presence.assign(seq, results);
         Ok(())
     }
 

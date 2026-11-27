@@ -45,8 +45,36 @@ pub struct ListParams {
     pub sort: SortBy,
     pub order: Order,
     pub limit: u32,
-    /// Keyset position: `(k1, sort_key, id)` of the last row of the previous page.
-    pub after: Option<(i64, String, String)>,
+    /// Keyset position: the last row of the previous page.
+    pub after: Option<After>,
+    /// v0.2, "Show live sessions first" (REQUIREMENTS.md §21.8): these projects lead, by rank
+    /// (0 first: needs approval, working, waiting, unknown); every other project has
+    /// [`NOT_LIVE`] and follows. The requested sort orders each rank. `None`: one rank for all.
+    pub live_ranks: Option<std::collections::BTreeMap<String, i64>>,
+}
+
+/// The rank of a project without an open session in [`ListParams::live_ranks`].
+pub const NOT_LIVE: i64 = 4;
+
+/// A keyset position: the sort values of one row (see [`list_projects`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct After {
+    pub live_rank: i64,
+    pub k1: i64,
+    pub sort_key: String,
+    pub id: String,
+}
+
+impl After {
+    /// The position right after `row`.
+    pub fn of(row: &ProjectRow) -> Self {
+        Self {
+            live_rank: row.live_rank,
+            k1: row.k1,
+            sort_key: row.sort_key.clone(),
+            id: row.id.clone(),
+        }
+    }
 }
 
 /// The Git cache of one project as stored.
@@ -78,6 +106,9 @@ pub struct ProjectRow {
     pub sort_key: String,
     /// The primary keyset value for the requested sort (see [`list_projects`]).
     pub k1: i64,
+    /// The leading keyset value: the project's rank in [`ListParams::live_ranks`]
+    /// ([`NOT_LIVE`] outside a listing).
+    pub live_rank: i64,
     pub name: String,
     pub path: String,
     pub sources: Vec<String>,
@@ -132,7 +163,8 @@ const PROJECT_JOINS: &str = "FROM projects p
     LEFT JOIN git_cache g ON g.project_id = p.id
     LEFT JOIN ignored_paths i ON i.canonical_path = p.canonical_path";
 
-/// Rows are read with [`PROJECT_COLUMNS`] at indexes 0..29, then `k1` and `files` if selected.
+/// Rows are read with [`PROJECT_COLUMNS`] at indexes 0..29, then either `k1` and the live rank
+/// (a listing) or a placeholder and `files` (one project).
 fn project_from_row(
     r: &rusqlite::Row<'_>,
     k1_at: Option<usize>,
@@ -181,6 +213,7 @@ fn project_from_row(
             latest_title: r.get(28)?,
         },
         k1: k1_at.map(|i| r.get(i)).transpose()?.unwrap_or(0),
+        live_rank: k1_at.map(|i| r.get(i + 1)).transpose()?.unwrap_or(NOT_LIVE),
     })
 }
 
@@ -255,21 +288,32 @@ pub fn list_projects(
         _ => ("ASC", ">"),
     };
     let k1 = k1_expr(p.sort, p.order);
+    // The live rank leads in ascending order whatever the direction of the rest, so the keyset
+    // condition is spelled out: a later rank, or the same rank and a later (k1, key, id).
+    let rank = format!("coalesce(lr.value, {NOT_LIVE})");
     let sql = format!(
-        "SELECT {PROJECT_COLUMNS}, {k1} AS k1 {PROJECT_JOINS}
-         WHERE {FILTER_SQL} AND (?11 IS NULL OR ({k1}, p.sort_key, p.id) {cmp} (?11, ?12, ?13))
-         ORDER BY k1 {dir}, p.sort_key {dir}, p.id {dir}
+        "SELECT {PROJECT_COLUMNS}, {k1} AS k1, {rank} AS live_rank {PROJECT_JOINS}
+         LEFT JOIN json_each(?15) lr ON lr.key = p.id
+         WHERE {FILTER_SQL} AND (?11 IS NULL OR {rank} > ?16
+               OR ({rank} = ?16 AND ({k1}, p.sort_key, p.id) {cmp} (?11, ?12, ?13)))
+         ORDER BY live_rank ASC, k1 {dir}, p.sort_key {dir}, p.id {dir}
          LIMIT ?14"
     );
     match &p.after {
-        Some((k, key, id)) => values.extend([
-            Value::Integer(*k),
-            Value::Text(key.clone()),
-            Value::Text(id.clone()),
+        Some(a) => values.extend([
+            Value::Integer(a.k1),
+            Value::Text(a.sort_key.clone()),
+            Value::Text(a.id.clone()),
         ]),
         None => values.extend([Value::Null, Value::Null, Value::Null]),
     }
     values.push(Value::Integer(i64::from(p.limit)));
+    values.push(p.live_ranks.as_ref().map_or(Value::Null, |ranks| {
+        Value::Text(serde_json::to_string(ranks).unwrap_or_else(|_| "{}".into()))
+    }));
+    values.push(Value::Integer(
+        p.after.as_ref().map_or(NOT_LIVE, |a| a.live_rank),
+    ));
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params_from_iter(values.iter()), |r| {

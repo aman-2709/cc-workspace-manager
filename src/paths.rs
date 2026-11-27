@@ -167,6 +167,30 @@ impl Dirs {
         self.check_socket_path()
     }
 
+    /// [`Self::verify_runtime`] for user `uid`, looking up the private group (`lookup`, in
+    /// production [`private_group`]) only when the strict check — no group write anywhere —
+    /// fails for another reason than a missing directory. The lookup reads the user and group
+    /// databases through NSS (files, but also sssd or LDAP), on every CLI command and every
+    /// `ccwm hook` event: with a private runtime directory (`/run/user/<uid>/ccwm`) it is never
+    /// needed (REQUIREMENTS.md §21.3; v0.2 review L5).
+    pub fn verify_runtime_lazily(
+        &self,
+        uid: u32,
+        lookup: impl FnOnce(u32) -> Option<u32>,
+    ) -> Result<()> {
+        let strict = Owner {
+            uid,
+            private_gid: None,
+        };
+        match self.verify_runtime(&strict) {
+            Err(e) if !e.is_not_running() => self.verify_runtime(&Owner {
+                uid,
+                private_gid: lookup(uid),
+            }),
+            done => done,
+        }
+    }
+
     /// Verify (without creating anything) that the runtime directory is private and ours and that
     /// no other user can replace any of its ancestors. Used by the CLI before it talks to the daemon.
     pub fn verify_runtime(&self, owner: &Owner) -> Result<()> {
@@ -645,6 +669,44 @@ mod tests {
             "nothing is created under an untrusted ancestor"
         );
         assert!(d.verify_runtime(&owner()).is_err());
+    }
+
+    /// v0.2 review L5: the private group is looked up only when a group-writable ancestor needs
+    /// it, never for a private tree or a missing runtime directory.
+    #[test]
+    fn the_runtime_check_looks_up_the_private_group_only_when_needed() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let lookup = |gid: Option<u32>| {
+            let calls = &calls;
+            move |_uid: u32| {
+                calls.set(calls.get() + 1);
+                gid
+            }
+        };
+        let t = private_tempdir();
+        let d = Dirs::resolve(&env(t.path()), t.path());
+        let err = d.verify_runtime_lazily(uid(), lookup(None)).unwrap_err();
+        assert!(err.is_not_running(), "{err}");
+        d.ensure(&owner()).unwrap();
+        d.verify_runtime_lazily(uid(), lookup(None)).unwrap();
+        assert_eq!(calls.get(), 0, "a private tree needs no lookup");
+        // A group-writable ancestor: accepted only when its group is the user's private group.
+        let gw = dir_with_mode(t.path(), "gw", 0o775);
+        let gid = fs::metadata(&gw).unwrap().gid();
+        let d = Dirs::resolve(&env(&gw), &gw);
+        d.ensure(&Owner {
+            uid: uid(),
+            private_gid: Some(gid),
+        })
+        .unwrap();
+        assert!(d.verify_runtime_lazily(uid(), lookup(None)).is_err());
+        assert_eq!(calls.get(), 1);
+        d.verify_runtime_lazily(uid(), lookup(Some(gid))).unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(d
+            .verify_runtime_lazily(uid(), lookup(Some(gid + 1)))
+            .is_err());
     }
 
     #[test]

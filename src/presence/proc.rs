@@ -212,6 +212,11 @@ impl ProcFs {
     ///
     /// `claimed` (`CLAUDE_PID`) must equal it: otherwise `PidMismatch`. Without it the walk's
     /// result is used.
+    ///
+    /// The peer itself must be the same live process before and after the walk (same start
+    /// time, not a zombie), otherwise `ClientGone` (v0.2 review L7): a client that left before
+    /// the daemon handled its event leaves a pid that names nobody, or another process, and
+    /// parents that are not its own.
     pub fn find_claude(
         &self,
         peer: u32,
@@ -219,9 +224,36 @@ impl ProcFs {
         uid: u32,
         boot_id: &str,
     ) -> Result<Found, Refusal> {
+        let gone = |_| Refusal::ClientGone;
+        let peer_stat = self.stat(peer).map_err(gone)?;
+        if peer_stat.is_dead() {
+            return Err(Refusal::ClientGone);
+        }
+        let parent = self.status(peer).map_err(gone)?.ppid;
+        let found = self.walk(parent, peer_stat.start, claimed, uid, boot_id);
+        if !self.still_running(peer, peer_stat.start) {
+            return Err(Refusal::ClientGone);
+        }
+        found
+    }
+
+    /// Process `pid` runs and started at `start` (not a zombie).
+    fn still_running(&self, pid: u32, start: u64) -> bool {
+        self.stat(pid)
+            .is_ok_and(|s| s.start == start && !s.is_dead())
+    }
+
+    /// The walk of [`Self::find_claude`] from the peer's parent `parent`, the peer having
+    /// started at `child_start`.
+    fn walk(
+        &self,
+        mut parent: u32,
+        mut child_start: u64,
+        claimed: Option<u32>,
+        uid: u32,
+        boot_id: &str,
+    ) -> Result<Found, Refusal> {
         let none = |_| Refusal::NoClaudeAncestor;
-        let mut child_start = self.stat(peer).map_err(none)?.start;
-        let mut parent = self.status(peer).map_err(none)?.ppid;
         for _ in 0..MAX_STEPS {
             if parent <= 1 {
                 break;
@@ -257,8 +289,7 @@ impl ProcFs {
     /// The session's process still runs: same pid and start time, not a zombie. (The boot id is
     /// the daemon's own for every session it opened; [`Self::still_claude`] checks it at start.)
     pub fn alive(&self, id: &Identity) -> bool {
-        self.stat(id.pid)
-            .is_ok_and(|s| s.start == id.start && !s.is_dead())
+        self.still_running(id.pid, id.start)
     }
 
     /// At start (§21.7): a persisted session's process is the same, still the user's and still
@@ -454,10 +485,81 @@ mod tests {
             p.find_claude(510, Some(100), UID, BOOT),
             Err(Refusal::NoClaudeAncestor)
         );
-        // An unknown peer.
+    }
+
+    /// v0.2 review L7: the walk starts from the peer the socket recorded at `connect()`; a peer
+    /// that is gone (no entry, a zombie) is refused as `client_gone`, before and after the walk,
+    /// never counted as a missing Claude Code.
+    #[test]
+    fn a_client_that_is_gone_is_refused_as_client_gone() {
+        let fake = FakeProc::new();
+        let p = chain(&fake, &["claude"]);
+        assert_eq!(p.find_claude(300, None, UID, BOOT), found(100, 20, true));
+        // An unknown peer (the client left and was reaped).
         assert_eq!(
             p.find_claude(999, None, UID, BOOT),
-            Err(Refusal::NoClaudeAncestor)
+            Err(Refusal::ClientGone)
+        );
+        // The client exited and waits to be reaped by its shell.
+        fake.process_full(300, "ccwm", UID, UID, 200, 40, 'Z', &[b"ccwm"]);
+        assert_eq!(
+            p.find_claude(300, None, UID, BOOT),
+            Err(Refusal::ClientGone)
+        );
+        // A peer without a readable status (it vanished between the two reads).
+        fake.process(300, UID, 200, 40, &["ccwm", "hook", "Stop"]);
+        std::fs::remove_file(fake.root().join("300/status")).unwrap();
+        assert_eq!(
+            p.find_claude(300, None, UID, BOOT),
+            Err(Refusal::ClientGone)
+        );
+        // After the walk: the same pid, another start time (reused), or gone.
+        fake.process(300, UID, 200, 40, &["ccwm", "hook", "Stop"]);
+        assert!(p.still_running(300, 40));
+        assert!(!p.still_running(300, 41), "the pid was reused");
+        fake.process_full(300, "ccwm", UID, UID, 200, 40, 'Z', &[b"ccwm"]);
+        assert!(!p.still_running(300, 40), "a zombie");
+        fake.remove(300);
+        assert!(!p.still_running(300, 40), "gone");
+    }
+
+    /// v0.2 review L7, after the walk: the peer's `stat` is a FIFO that serves the client's
+    /// start time to the first read and another one (the pid reused while the daemon walked) to
+    /// the second, so only the check after the walk can refuse it.
+    #[test]
+    fn a_client_replaced_during_the_walk_is_refused_as_client_gone() {
+        let fake = FakeProc::new();
+        let p = chain(&fake, &["claude"]);
+        let stat = fake.root().join("300/stat");
+        let first = std::fs::read_to_string(&stat).unwrap();
+        let second = first.replacen(" 31 0 0 0", " 99 0 0 0", 1);
+        assert_ne!(first, second);
+        std::fs::remove_file(&stat).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&stat)
+            .status()
+            .unwrap()
+            .success());
+        // Opening for writing waits for a reader, and closing ends its read. The pause lets the
+        // first reader close before the second content is offered (a reader still attached
+        // would get both). Not joined: without the check after the walk nobody reads the second
+        // content, and the writer waits for good.
+        std::thread::spawn({
+            let stat = stat.clone();
+            move || {
+                std::fs::write(&stat, first).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(&stat, second).unwrap();
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(p.find_claude(300, None, UID, BOOT));
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the walk read the peer's stat once only"),
+            Err(Refusal::ClientGone)
         );
     }
 

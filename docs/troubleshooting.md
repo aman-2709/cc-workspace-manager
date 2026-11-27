@@ -156,6 +156,10 @@ The indicator is opt-in ([docs/session-hooks.md](session-hooks.md)). Check, in t
      in a container, or under another name).
    - `refused: pid_mismatch` — `CLAUDE_PID` names another process than the nearest Claude Code process. Report
      it with `ccwm hooks events` and the output of `ps -o pid,ppid,comm -p <pids>` for the chain.
+   - `refused: client_gone` — the `ccwm hook` process had exited before the daemon handled its event (a very
+     busy daemon, or the 100 ms budget ran out); occasional ones are harmless, the next event sets the state.
+   - `ignored (another process)` after a `SessionEnd` — the session is open in another Claude Code process (you
+     resumed it in a second terminal); it stays open there.
    - Nothing at all — `claude --debug hooks` shows the hook's stderr line (for example "the ccwm daemon is not
      running"), or whether the hooks run at all (`--bare`, `--safe-mode`, `disableAllHooks`).
 3. The events arrive but no dot appears: the session's folder is no ccwm project yet (`ccwm status` counts it

@@ -428,6 +428,65 @@ test("the Settings toggle for non-interactive sessions is sent only when it chan
   assert.deepStrictEqual(settingsPatch({}).indicator, {});
 });
 
+test("the Settings toggle for live sessions first is sent only when it changed", () => {
+  const saved = { indicator: { show_noninteractive: false, live_first: true } };
+  assert.deepStrictEqual(changedSettings(settingsPatch({ live_first: false }), saved), { indicator: { live_first: false } });
+  assert.deepStrictEqual(changedSettings(settingsPatch({ live_first: true, show_noninteractive: false }), saved), {});
+});
+
+// WCAG relative luminance and contrast of #rrggbb colours, and the hue in degrees.
+function luminance(hex) {
+  const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((x) => (x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+}
+function contrast(a, b) {
+  const [x, y] = [luminance(a), luminance(b)].sort((p, q) => q - p);
+  return (x + 0.05) / (y + 0.05);
+}
+function hueAndSaturation(hex) {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  if (d === 0) return { hue: 0, saturation: 0 };
+  const hue = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return { hue: (hue * 60 + 360) % 360, saturation: d / (1 - Math.abs(max + min - 1)) };
+}
+
+// The custom properties of each theme block of the stylesheet: the light defaults, then the
+// dark ones (system preference and the explicit choice) on top.
+function themes(css) {
+  const vars = (block) => Object.fromEntries([...block.matchAll(/--([a-z-]+):\s*(#[0-9a-f]{6})/g)].map((m) => [m[1], m[2]]));
+  const light = vars(css.match(/^:root \{([^}]*)\}/m)[1]);
+  const system = vars(css.match(/@media \(prefers-color-scheme: dark\) \{\s*:root:not\(\[data-theme="light"\]\) \{([^}]*)\}/)[1]);
+  const chosen = vars(css.match(/:root\[data-theme="dark"\] \{([^}]*)\}/)[1]);
+  return { light, dark: { ...light, ...system }, chosen: { ...light, ...chosen } };
+}
+
+test("each indicator colour has 4.5:1 contrast; needs approval is far from the dirty orange; waiting is not gray", () => {
+  const css = fs.readFileSync(path.join(__dirname, "../../web/app.css"), "utf8");
+  for (const [name, t] of Object.entries(themes(css))) {
+    for (const v of ["live-approval", "live-working", "live-waiting", "live-idle"]) {
+      for (const bg of ["bg", "card"]) {
+        const ratio = contrast(t[v], t[bg]);
+        assert.ok(ratio >= 4.5, `${name}: --${v} ${t[v]} on --${bg} ${t[bg]} is ${ratio.toFixed(2)}:1`);
+      }
+    }
+    const approval = hueAndSaturation(t["live-approval"]).hue;
+    const dirty = hueAndSaturation(t.dirty).hue;
+    const apart = Math.min(Math.abs(approval - dirty), 360 - Math.abs(approval - dirty));
+    assert.ok(apart >= 45, `${name}: needs approval ${t["live-approval"]} is ${apart.toFixed(0)}° from the dirty orange ${t.dirty}`);
+    const waiting = hueAndSaturation(t["live-waiting"]);
+    assert.ok(waiting.saturation >= 0.4 && waiting.hue >= 150 && waiting.hue <= 190, `${name}: waiting is a teal, not a gray: ${t["live-waiting"]}`);
+  }
+  const t = themes(css);
+  assert.deepStrictEqual(
+    ["live-approval", "live-working", "live-waiting", "live-idle"].map((v) => t.dark[v]),
+    ["live-approval", "live-working", "live-waiting", "live-idle"].map((v) => t.chosen[v]),
+    "both ways to the dark theme use the same colours");
+  assert.match(css, /\.live--waiting \.live-dot \{ background: var\(--live-waiting\); \}/);
+  assert.match(css, /\.live--needs-approval \.live-label \{ color: var\(--live-approval\);/);
+});
+
 test("the stylesheet pulses only `working`, stops it under reduced motion, and the dot is decorative", () => {
   const css = fs.readFileSync(path.join(__dirname, "../../web/app.css"), "utf8");
   assert.match(css, /\.live--working \.live-dot \{[^}]*animation: live-pulse 2s ease-in-out infinite/);

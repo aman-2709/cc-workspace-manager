@@ -12,21 +12,29 @@ checked on the maintainer's machine (REQUIREMENTS.md §21.12, O11).
 ### Added
 - **Which projects have an open Claude Code session, and what it is doing** — opt-in, from Claude Code hooks
   you add to your Claude Code settings ([docs/session-hooks.md](docs/session-hooks.md)). Cards and table rows
-  show a dot and a label: **Needs approval** (from the first minute "Needs approval · N min"), **Working** (the
-  dot pulses, except with reduced motion), **Waiting for input**, **Session open** (state unknown, after a ccwm
-  restart). Several sessions in one project: the most urgent state, with the counts in the tooltip. The table
-  has a "Claude" column, the detail panel lists the open sessions and the latest session's state. Three
+  show a dot and a label: **Needs approval** (magenta; from the first minute "Needs approval · N min"),
+  **Working** (purple; the dot pulses, except with reduced motion), **Waiting for input** (teal), **Session
+  open** (a gray ring: state unknown, after a ccwm restart). Every colour has at least 4.5:1 contrast in both
+  themes, and the label is always there. On cards the state has its own line under the project name. Several
+  sessions in one project: the most urgent state, with the counts in the tooltip. The table has a "Claude"
+  column, the detail panel lists the open sessions and the latest session's state. Three
   toolbar filters with counts: **Waiting for me**, **Working**, **Open**. Changes appear live. Privacy mode
   keeps the indicator (states, counts and times only).
+- **Projects with an open session come first** (on by default): needs approval, then working, then waiting,
+  then open; within each group, and after them, the chosen sort. Settings → "Show live sessions first"
+  (`[indicator] live_first`) turns it off at once. The order also holds across `GET /api/v1/projects` pages.
 - **`ccwm hooks print`** prints the hooks to add: one per event, each a guarded command
-  (`command -v '<ccwm>' >/dev/null 2>&1 && '<ccwm>' hook <Event>; exit 0`) that does nothing when ccwm is
-  missing and never fails a Claude Code hook. ccwm never reads or edits Claude Code's settings.
+  (`command -v '<ccwm>' >/dev/null 2>&1 && '<ccwm>' hook <Event> >/dev/null; exit 0`) that does nothing when
+  ccwm is missing, discards anything a foreign binary at that path would print, and never fails a Claude Code
+  hook. It warns when the binary is not `~/.local/bin/ccwm`, or when that is a symbolic link (the hooks then
+  name its target). ccwm never reads or edits Claude Code's settings.
 - **`ccwm hook <Event>`**, run by those hooks: reads the event's JSON (at most 16 MiB; the prompt, Claude's reply
   and the tool fields are skipped unread), sends the event name, session id, working folder and prompt id over
   ccwm's Unix socket within 100 ms, never prints on stdout, always exits 0, and ends after 1 s whatever it waits
   for.
 - **`ccwm hooks events [--follow]`**: the last 256 hook events the daemon received — time, event, session id,
-  what the daemon did with it — for checking the hooks (in memory only).
+  what the daemon did with it — for checking the hooks (in memory only). `--follow` waits for the daemon through
+  a restart.
 - **Turn ends Claude Code reports to no hook** — Esc during a reply, "No" or Esc in a permission dialog, Esc
   while an approved tool runs — are taken from the session file: the session shows "Waiting for input" about
   2 seconds later. Only structural fields of those records are read, never their text.
@@ -41,11 +49,24 @@ checked on the maintainer's machine (REQUIREMENTS.md §21.12, O11).
 ### Changed
 - The daemon decides which Claude Code process an event comes from itself (the nearest Claude Code process
   above the hook, at most 8 levels, of your user; `CLAUDE_PID` must name the same one) and closes a session when
-  that process exits (checked every 5 s). Open sessions survive a ccwm restart as "Session open" while their
-  process runs (database migration 6); a reboot or "Clear session index" forgets them.
+  that process exits (checked every 5 s). Only that process ends the session: resuming the same session in a
+  second terminal and leaving the first does not close it. One process holds one session: when `/clear` or
+  `/resume` starts the next one, the previous one closes even if its end event was lost. An event whose
+  `ccwm hook` process was already gone when the daemon handled it is refused as `client_gone`. Open sessions
+  survive a ccwm restart as "Session open" while their process runs (database migration 6); a reboot or "Clear
+  session index" forgets them.
 - Unix-socket requests may be up to 32 KiB (was 4 KiB), and the CLI reads responses up to 256 KiB (was 64 KiB).
 - The socket's trace log names the request type only (it printed the whole request).
-- `ccwm` looks up the passwd entry only when `$HOME` does not qualify.
+- `ccwm` (every command, `ccwm hook` included) looks up the passwd entry only when `$HOME` does not qualify, and
+  the user's private group only when a directory on the runtime path is group-writable: no NSS, LDAP or sssd
+  round trip on a normal setup.
+
+### Known limits (documented in docs/session-hooks.md)
+- After you approve a tool, "Needs approval" stays until the tool finishes; inside a subagent, until the whole
+  subagent finishes.
+- A Stop hook of your own that keeps Claude working leaves the session "Waiting for input" until the continued
+  turn ends.
+- Hidden non-interactive sessions count toward the limit of 256 open sessions.
 
 ### Not run
 - A release build of 0.2.0, CI, the release workflow, and the fresh-account install (the maintainer's steps,

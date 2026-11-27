@@ -16,9 +16,12 @@
   --dormant: #818b98;
   --unknown: #d1d9e0;
   --dirty: #bc4c00;
-  /* The session activity indicator: each at least 3:1 against the page and card backgrounds. */
-  --live-approval: #bc4c00;
+  /* The session activity indicator: each at least 4.5:1 against the page and card backgrounds
+     (tests/ui/app.test.js checks it); "needs approval" is magenta, far from the uncommitted-
+     changes orange (--dirty), "waiting" a dim teal (gray would read as "off"). */
+  --live-approval: #bf3989;
   --live-working: #8250df;
+  --live-waiting: #0f766e;
   --live-idle: #59636e;
   --radius: 8px;
 }
@@ -27,7 +30,7 @@
     --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --border: #3d444d; --card: #151b23;
     --accent: #4493f8; --badge-bg: #10243e; --badge-fg: #79c0ff; --warn-bg: #3b2e00; --warn-fg: #f2cc60;
     --today: #3fb950; --recent: #4493f8; --inactive: #d29922; --dormant: #6e7681; --unknown: #3d444d; --dirty: #f0883e;
-    --live-approval: #f0883e; --live-working: #a371f7; --live-idle: #9198a1;
+    --live-approval: #f778ba; --live-working: #a371f7; --live-waiting: #2ea89a; --live-idle: #9198a1;
   }
 }
 :root[data-theme="dark"] {
@@ -35,7 +38,7 @@
   --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --border: #3d444d; --card: #151b23;
   --accent: #4493f8; --badge-bg: #10243e; --badge-fg: #79c0ff; --warn-bg: #3b2e00; --warn-fg: #f2cc60;
   --today: #3fb950; --recent: #4493f8; --inactive: #d29922; --dormant: #6e7681; --unknown: #3d444d; --dirty: #f0883e;
-  --live-approval: #f0883e; --live-working: #a371f7; --live-idle: #9198a1;
+  --live-approval: #f778ba; --live-working: #a371f7; --live-waiting: #2ea89a; --live-idle: #9198a1;
 }
 :root[data-theme="light"] { color-scheme: light; }
 
@@ -147,7 +150,7 @@ td .actions button { flex: none; }
 .live--needs-approval .live-dot { background: var(--live-approval); }
 .live--needs-approval .live-label { color: var(--live-approval); font-weight: 600; }
 .live--working .live-dot { background: var(--live-working); animation: live-pulse 2s ease-in-out infinite; }
-.live--waiting .live-dot { background: var(--live-idle); }
+.live--waiting .live-dot { background: var(--live-waiting); }
 .live--unknown .live-dot { background: transparent; border: 2px solid var(--live-idle); }
 @keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 @media (prefers-reduced-motion: reduce) {

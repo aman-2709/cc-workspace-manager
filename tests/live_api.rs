@@ -15,6 +15,15 @@ const A: &str = "0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f";
 const B: &str = "1b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f";
 const P1: &str = "9a8b7c6d-5e4f-4a3b-8c2d-000000000001";
 
+/// Apply a project resolution started now (the latest one, so it is never dropped as older).
+fn assign(
+    p: &cc_workspace_manager::presence::Presence,
+    results: Vec<(String, Result<String, &'static str>)>,
+) {
+    let (seq, _) = p.cwds();
+    p.assign(seq, results);
+}
+
 /// An interactive claude (100 → sh 200 → hook 300) and a `-p` one (400 → sh 410 → hook 420).
 fn fake_proc() -> FakeProc {
     let fake = FakeProc::new();
@@ -135,7 +144,7 @@ async fn project_objects_carry_the_live_state_and_the_filters_select_by_it() {
 
     // A prompt: working.
     t.hook(300, report(Event::UserPromptSubmit, A));
-    t.e.presence.assign(vec![(A.into(), Ok(alpha.clone()))]);
+    assign(&t.e.presence, vec![(A.into(), Ok(alpha.clone()))]);
     assert_eq!(t.published(), std::slice::from_ref(&alpha));
     assert_eq!(
         t.live("alpha").await,
@@ -192,7 +201,7 @@ async fn project_objects_carry_the_live_state_and_the_filters_select_by_it() {
             ..report(Event::UserPromptSubmit, B)
         },
     );
-    t.e.presence.assign(vec![(B.into(), Ok(alpha.clone()))]);
+    assign(&t.e.presence, vec![(B.into(), Ok(alpha.clone()))]);
     let live = t.live("alpha").await;
     assert_eq!(live["state"], "needs_approval");
     assert_eq!(
@@ -225,7 +234,7 @@ async fn project_objects_carry_the_live_state_and_the_filters_select_by_it() {
             ..report(Event::UserPromptSubmit, B)
         },
     );
-    t.e.presence.assign(vec![(B.into(), Ok(beta.clone()))]);
+    assign(&t.e.presence, vec![(B.into(), Ok(beta.clone()))]);
     assert_eq!(t.live("beta").await, Value::Null);
     assert!(t.names("&live=working").await.is_empty());
     let hooks = t.get("/api/v1/service/status").await["hooks"].clone();
@@ -291,6 +300,64 @@ async fn project_objects_carry_the_live_state_and_the_filters_select_by_it() {
     assert_eq!(r.status(), 400, "no other indicator key");
 }
 
+/// "Show live sessions first" (§21.8): on by default, a project with an open session leads the
+/// listing in every sort and across cursor pages; the Settings toggle turns it off live and
+/// republishes the projects with an open session.
+#[tokio::test]
+async fn live_sessions_come_first_until_the_toggle_turns_it_off() {
+    let mut t = T::new().await;
+    let beta = t.id("beta").await;
+    assert_eq!(t.names("").await, ["alpha", "beta"]);
+    let settings = t.get("/api/v1/settings").await;
+    assert_eq!(settings["config"]["indicator"]["live_first"], true);
+    t.hook(300, report(Event::Stop, A));
+    assign(&t.e.presence, vec![(A.into(), Ok(beta.clone()))]);
+    t.published();
+    assert_eq!(t.names("").await, ["beta", "alpha"]);
+    assert_eq!(t.names("&order=desc").await, ["beta", "alpha"]);
+    assert_eq!(t.names("&live=open").await, ["beta"]);
+    // Cursor pages carry the rank.
+    let first = t.get("/api/v1/projects?sort=name&limit=1").await;
+    assert_eq!(first["items"][0]["name"], "beta");
+    let cursor = first["next_cursor"].as_str().unwrap().to_string();
+    let second = t
+        .get(&format!(
+            "/api/v1/projects?sort=name&limit=1&cursor={cursor}"
+        ))
+        .await;
+    assert_eq!(second["items"][0]["name"], "alpha");
+    assert_eq!(second["next_cursor"], Value::Null);
+    let r =
+        t.e.send_json(
+            "PUT",
+            "/api/v1/settings",
+            &t.token,
+            r#"{"indicator":{"live_first":false}}"#,
+        )
+        .await;
+    let (status, settings) = json(r).await;
+    assert_eq!(status, 200, "{settings}");
+    assert!(
+        settings["restart_required"].as_array().unwrap().is_empty(),
+        "live: no restart"
+    );
+    assert!(std::fs::read_to_string(&t.e.config_path)
+        .unwrap()
+        .contains("live_first = false"));
+    assert_eq!(t.published(), std::slice::from_ref(&beta));
+    assert_eq!(t.names("").await, ["alpha", "beta"]);
+    assert_eq!(t.live("beta").await["state"], "waiting", "still shown");
+    let r =
+        t.e.send_json(
+            "PUT",
+            "/api/v1/settings",
+            &t.token,
+            r#"{"indicator":{"live_first":1}}"#,
+        )
+        .await;
+    assert_eq!(r.status(), 400, "a boolean only");
+}
+
 /// Privacy mode changes nothing in the indicator's payload (states, counts and times only:
 /// REQUIREMENTS.md §21.10), and the payload holds no path, pid or session text.
 #[tokio::test]
@@ -304,7 +371,7 @@ async fn the_indicator_is_the_same_in_privacy_mode_and_holds_no_path_or_pid() {
             ..report(Event::UserPromptSubmit, A)
         },
     );
-    t.e.presence.assign(vec![(A.into(), Ok(alpha))]);
+    assign(&t.e.presence, vec![(A.into(), Ok(alpha))]);
     let plain = t.live("alpha").await;
     let private = t.get("/api/v1/projects?sort=name&privacy=1").await["items"]
         .as_array()
@@ -336,7 +403,7 @@ async fn service_status_counts_states_refusals_and_unassigned_sessions() {
     let t = T::new().await;
     let alpha = t.id("alpha").await;
     t.hook(300, report(Event::SessionStart(Source::Startup), A));
-    t.e.presence.assign(vec![(A.into(), Ok(alpha))]);
+    assign(&t.e.presence, vec![(A.into(), Ok(alpha))]);
     t.hook(
         300,
         Report {
@@ -344,7 +411,7 @@ async fn service_status_counts_states_refusals_and_unassigned_sessions() {
             ..report(Event::Stop, B)
         },
     );
-    t.e.presence.assign(vec![(B.into(), Err("temporary"))]);
+    assign(&t.e.presence, vec![(B.into(), Err("temporary"))]);
     // A stale event (an older prompt) and a refusal.
     t.hook(300, report(Event::UserPromptSubmit, A));
     t.hook(
@@ -370,13 +437,14 @@ async fn service_status_counts_states_refusals_and_unassigned_sessions() {
         (h["received"].as_u64(), h["stale"].as_u64()),
         (Some(5), Some(1))
     );
-    assert_eq!(h["refused"]["no_claude_ancestor"], 1);
+    assert_eq!(h["refused"]["client_gone"], 1, "pid 999 is no process");
+    assert_eq!(h["refused"]["no_claude_ancestor"], 0);
     assert_eq!(h["last_event_at"], START);
     // `ccwm status` shows the same.
     let text = cc_workspace_manager::cli::format_hooks(&h);
     assert!(text.contains("hooks: 2 open session(s) (0 needs approval, 1 working, 1 waiting, 0 unknown; not in a project: 1 temporary)"), "{text}");
     assert!(
-        text.contains("5 received, 1 stale, 0 from session files, refused: 1 no_claude_ancestor"),
+        text.contains("5 received, 1 stale, 0 from session files, refused: 1 client_gone"),
         "{text}"
     );
     assert_eq!(
@@ -419,7 +487,7 @@ async fn clear_session_index_forgets_open_sessions() {
     let mut t = T::new().await;
     let alpha = t.id("alpha").await;
     t.hook(300, report(Event::UserPromptSubmit, A));
-    t.e.presence.assign(vec![(A.into(), Ok(alpha.clone()))]);
+    assign(&t.e.presence, vec![(A.into(), Ok(alpha.clone()))]);
     t.published();
     let r =
         t.e.post("/api/v1/session-index/clear", Some(&t.token), "")

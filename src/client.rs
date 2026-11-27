@@ -300,7 +300,15 @@ mod tests {
         listen(&fd, Backlog::new(0).unwrap()).unwrap();
         // Never accepted: with a backlog of 0 one connection fills the queue.
         let _queued = UnixStream::connect(&path).unwrap();
-        let (sent, took) = timed(&path);
+        // On a thread: a `connect()` the budget does not bound blocks for good, and the test
+        // must fail rather than hang (v0.2 review I4).
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(timed(&path));
+        });
+        let (sent, took) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("connect() to a full listen queue is not bounded by the budget");
         assert_eq!(sent, HookSent::TimedOut);
         assert!(within_budget(took), "{took:?}");
     }

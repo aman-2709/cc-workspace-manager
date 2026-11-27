@@ -40,6 +40,7 @@ be widened afterwards.
 | `ui.theme` | `system` | `system`, `light`, `dark` | yes | live |
 | `ui.privacy` | `false` | bool (privacy-mode default for new browsers) | yes | live |
 | `indicator.show_noninteractive` | `false` | bool: show `claude -p` and SDK sessions in the [session activity indicator](session-hooks.md) | yes | live |
+| `indicator.live_first` | `true` | bool: projects with an open Claude Code session come first in the listing (needs approval, working, waiting, open), then the chosen sort | yes | live |
 
 The Settings page accepts only the keys marked "yes". The others (`watch.debounce_ms`,
 `activity.events_per_project` and especially `git.allow_unhardened_status`) can be changed only by editing

@@ -249,7 +249,7 @@ const SETTABLE: [(&str, &[&str]); 7] = [
     ("watch", &["budget"]),
     ("activity", &["inactive_after_days", "dormant_after_days"]),
     ("sessions", &["dir", "store_prompt_text"]),
-    ("indicator", &["show_noninteractive"]),
+    ("indicator", &["show_noninteractive", "live_first"]),
     ("ui", &["default_view", "theme", "privacy"]),
 ];
 
@@ -273,6 +273,8 @@ pub struct Accepted {
 struct Cursor {
     s: String,
     o: String,
+    /// The live rank (v0.2, "Show live sessions first"), 0 to [`queries::NOT_LIVE`].
+    r: i64,
     v: i64,
     k: String,
     i: String,
@@ -485,6 +487,12 @@ impl Service {
         let mut params = v.params.clone();
         params.limit = limit + 1;
         params.filters.live = v.live.map(|f| self.presence.projects_matching(f));
+        params.live_ranks = self.presence.live_ranks().map(|ranks| {
+            ranks
+                .into_iter()
+                .map(|(project, state)| (project, state.rank()))
+                .collect()
+        });
         let (mut rows, total) = self
             .reader
             .with(move |c| queries::list_projects(c, &params))
@@ -878,6 +886,7 @@ impl Service {
         }
         self.presence
             .set_show_noninteractive(new.indicator.show_noninteractive);
+        self.presence.set_live_first(new.indicator.live_first);
         Ok(())
     }
 
@@ -1284,6 +1293,7 @@ fn encode_cursor(sort: &str, order: &str, last: &queries::ProjectRow) -> String 
     let c = Cursor {
         s: sort.into(),
         o: order.into(),
+        r: last.live_rank,
         v: last.k1,
         k: last.sort_key.clone(),
         i: last.id.clone(),
@@ -1291,14 +1301,24 @@ fn encode_cursor(sort: &str, order: &str, last: &queries::ProjectRow) -> String 
     base64url_encode(serde_json::to_string(&c).unwrap_or_default().as_bytes())
 }
 
-fn decode_cursor(raw: &str, sort: &str, order: &str) -> Result<(i64, String, String), ApiError> {
+fn decode_cursor(raw: &str, sort: &str, order: &str) -> Result<queries::After, ApiError> {
     let bad = || ApiError::invalid("invalid cursor");
     let bytes = base64url_decode(raw).ok_or_else(bad)?;
     let c: Cursor = serde_json::from_slice(&bytes).map_err(|_| bad())?;
-    if c.s != sort || c.o != order || !is_project_id(&c.i) || c.k.len() > 1024 {
+    if c.s != sort
+        || c.o != order
+        || !is_project_id(&c.i)
+        || c.k.len() > 1024
+        || !(0..=queries::NOT_LIVE).contains(&c.r)
+    {
         return Err(bad());
     }
-    Ok((c.v, c.k, c.i))
+    Ok(queries::After {
+        live_rank: c.r,
+        k1: c.v,
+        sort_key: c.k,
+        id: c.i,
+    })
 }
 
 /// `1`/`true` or `0`/`false`; absent = false.
@@ -1404,6 +1424,7 @@ fn validate_projects_query(
             order,
             limit,
             after,
+            live_ranks: None,
         },
         live,
     })
@@ -1525,6 +1546,7 @@ mod tests {
             id: "0123456789abcdef0123456789abcdef".into(),
             sort_key: "key".into(),
             k1,
+            live_rank: 2,
             name: "n".into(),
             path: "/p".into(),
             sources: vec![],
@@ -1557,11 +1579,12 @@ mod tests {
         let c = encode_cursor("name", "desc", &row(-5));
         assert_eq!(
             decode_cursor(&c, "name", "desc").unwrap(),
-            (
-                -5,
-                "key".to_string(),
-                "0123456789abcdef0123456789abcdef".to_string()
-            )
+            queries::After {
+                live_rank: 2,
+                k1: -5,
+                sort_key: "key".to_string(),
+                id: "0123456789abcdef0123456789abcdef".to_string(),
+            }
         );
         assert!(decode_cursor(&c, "name", "asc").is_err(), "order mismatch");
         assert!(
@@ -1594,6 +1617,35 @@ mod tests {
             )
             .is_err(),
             "an M1 cursor (no v) is rejected"
+        );
+        let with_rank = |r: &str| {
+            base64url_encode(
+                format!(r#"{{"s":"name","o":"asc","r":{r},"v":0,"k":"x","i":"0123456789abcdef0123456789abcdef"}}"#)
+                    .as_bytes(),
+            )
+        };
+        assert_eq!(
+            decode_cursor(&with_rank("4"), "name", "asc")
+                .unwrap()
+                .live_rank,
+            4
+        );
+        for bad in ["-1", "5", "1.5", "\"0\""] {
+            assert!(
+                decode_cursor(&with_rank(bad), "name", "asc").is_err(),
+                "rank {bad}"
+            );
+        }
+        assert!(
+            decode_cursor(
+                &base64url_encode(
+                    br#"{"s":"name","o":"asc","v":0,"k":"x","i":"0123456789abcdef0123456789abcdef"}"#
+                ),
+                "name",
+                "asc"
+            )
+            .is_err(),
+            "a v0.1 cursor (no r) is rejected"
         );
     }
 

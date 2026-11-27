@@ -405,6 +405,7 @@ mod tests {
             id: "a".repeat(32),
             sort_key: "p".into(),
             k1: 0,
+            live_rank: crate::db::queries::NOT_LIVE,
             name: "p".into(),
             path: "/home/u/p".into(),
             sources: vec!["marker".into()],

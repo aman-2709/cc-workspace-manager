@@ -134,10 +134,7 @@ pub fn hooks(status: Option<&Value>) -> Check {
                 "last hook event {}; {} received, {} refused; {} open session(s)",
                 crate::cli::when(h, "/last_event_at"),
                 n(h, "/received").unwrap_or(0),
-                ["malformed", "no_claude_ancestor", "pid_mismatch", "limit"]
-                    .iter()
-                    .filter_map(|k| n(h, &format!("/refused/{k}")))
-                    .sum::<u64>(),
+                crate::cli::refused_total(h),
                 n(h, "/open").unwrap_or(0) + n(h, "/hidden_noninteractive").unwrap_or(0),
             ),
         ),

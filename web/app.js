@@ -409,7 +409,7 @@ function settingsPatch(v) {
     activity: clean({ inactive_after_days: int(v.inactive_after_days), dormant_after_days: int(v.dormant_after_days) }),
     sessions: clean({ store_prompt_text: v.store_prompt_text }),
     ui: clean({ default_view: v.default_view, theme: v.theme, privacy: v.ui_privacy }),
-    indicator: clean({ show_noninteractive: v.show_noninteractive }),
+    indicator: clean({ show_noninteractive: v.show_noninteractive, live_first: v.live_first }),
   };
 }
 
@@ -752,11 +752,13 @@ function startApp() {
     const status = p.activity.status;
     const git = p.git;
     const commit = git && git.commit;
+    const live = liveEl(p.live);
     return h("li", { class: `card${p.missing_since ? " missing" : ""}`, "data-status": status },
       h("div", { class: "head" },
         h("h3", { class: "line", title: p.name, text: p.name }),
-        liveEl(p.live),
         h("span", { class: "small muted", text: STATUS_LABEL[status] || status })),
+      // The session's state on a line of its own, away from the activity label ("Today").
+      live ? h("p", { class: "line live-line" }, live) : null,
       pathEl(p),
       h("p", { class: "line small" }, timeEl(p.activity),
         p.activity.path ? h("span", { class: "muted", text: `, ${p.activity.path}` }) : null),
@@ -1313,6 +1315,7 @@ function startApp() {
       h("fieldset", {}, h("legend", { text: "Claude Code sessions" }),
         input("s-store", "Store prompt text (the last prompt, redacted, cached in ccwm's database; turning this off deletes it)", c.sessions.store_prompt_text, { type: "checkbox" }),
         input("s-noninteractive", "Show non-interactive sessions (-p, SDK) in the activity indicator", Boolean(c.indicator && c.indicator.show_noninteractive), { type: "checkbox" }),
+        input("s-livefirst", "Show live sessions first (needs approval, working, waiting, open; then the chosen sort)", !(c.indicator && c.indicator.live_first === false), { type: "checkbox" }),
         clearIndexButton()),
       h("fieldset", {}, h("legend", { text: "Server and appearance" }),
         input("s-port", "Port on 127.0.0.1", c.server.port, { type: "number", min: "1024", max: "65535" }, true),
@@ -1335,6 +1338,7 @@ function startApp() {
         store_prompt_text: val("s-store").checked, port: val("s-port").value,
         default_view: val("s-view").value, theme: val("s-theme").value, ui_privacy: val("s-privacy").checked,
         show_noninteractive: val("s-noninteractive").checked,
+        live_first: val("s-livefirst").checked,
       }), st.config);
       if (Object.keys(patch).length === 0) { msg.textContent = "Nothing changed."; return; }
       msg.textContent = "Saving…";

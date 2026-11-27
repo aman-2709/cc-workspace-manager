@@ -32,6 +32,7 @@ fn params(limit: u32) -> ListParams {
         order: Order::Asc,
         limit,
         after: None,
+        live_ranks: None,
     }
 }
 
@@ -96,7 +97,7 @@ async fn keyset_pagination_walks_every_row_once_in_both_directions() {
                 break;
             }
             let last = rows.last().unwrap();
-            after = Some((last.k1, last.sort_key.clone(), last.id.clone()));
+            after = Some(queries::After::of(last));
             seen.extend(rows.into_iter().map(|r| r.name));
         }
         assert_eq!(seen.len(), 7, "{order:?}: {seen:?}");
@@ -558,17 +559,145 @@ async fn activity_sort_puts_unknown_last_in_both_orders_and_pages_with_keysets()
                 limit: 2,
                 after: after.clone(),
                 filters: Filters::default(),
+                live_ranks: None,
             };
             let (rows, _) = r
                 .with(move |c| queries::list_projects(c, &p))
                 .await
                 .unwrap();
             let Some(last) = rows.last() else { break };
-            after = Some((last.k1, last.sort_key.clone(), last.id.clone()));
+            after = Some(queries::After::of(last));
             seen.extend(rows.iter().map(|r| r.name.clone()));
         }
         assert_eq!(seen, want, "{order:?}");
     }
+}
+
+/// v0.2, "Show live sessions first" (REQUIREMENTS.md §21.8): projects with a rank lead in rank
+/// order, each rank and the rest in the requested sort, in both directions and across keyset
+/// pages; ranks of unknown projects change nothing, and a filter still applies.
+#[tokio::test]
+async fn live_ranks_lead_the_listing_in_every_sort_and_across_pages() {
+    let t = tempfile::tempdir().unwrap();
+    let (w, r) = open(t.path()).await;
+    let names = ["a", "b", "c", "d", "e", "f", "g"];
+    let v = ids(
+        &w,
+        &names
+            .iter()
+            .map(|n| format!("/h/{n}"))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    for (i, at) in [(0, 30), (1, 20), (2, 10), (3, 20), (4, 40)] {
+        w.record_activity(&v[i], act(at, ActivityKind::Inferred, "x"), vec![], 1)
+            .await
+            .unwrap();
+    }
+    // f: needs approval (0); c and g: waiting (2); a: unknown (3); a project that is not listed.
+    let ranks: std::collections::BTreeMap<String, i64> = [
+        (v[5].clone(), 0),
+        (v[2].clone(), 2),
+        (v[6].clone(), 2),
+        (v[0].clone(), 3),
+        ("f".repeat(32), 1),
+    ]
+    .into_iter()
+    .collect();
+    let list = |sort, order, limit, ranks: Option<std::collections::BTreeMap<String, i64>>| {
+        let r = r.clone();
+        async move {
+            let mut seen = Vec::new();
+            let mut after = None;
+            loop {
+                let p = ListParams {
+                    sort,
+                    order,
+                    limit,
+                    after: after.clone(),
+                    filters: Filters::default(),
+                    live_ranks: ranks.clone(),
+                };
+                let (rows, total) = r
+                    .with(move |c| queries::list_projects(c, &p))
+                    .await
+                    .unwrap();
+                assert_eq!(total, 7);
+                let Some(last) = rows.last() else { break };
+                after = Some(queries::After::of(last));
+                seen.extend(rows.iter().map(|r| (r.name.clone(), r.live_rank)));
+            }
+            seen
+        }
+    };
+    let names_of = |seen: &[(String, i64)]| seen.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+    for limit in [1, 2, 3, 100] {
+        let seen = list(SortBy::Activity, Order::Desc, limit, Some(ranks.clone())).await;
+        assert_eq!(
+            names_of(&seen),
+            ["f", "c", "g", "a", "e", "b", "d"],
+            "limit {limit}"
+        );
+        assert_eq!(
+            seen.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+            [0, 2, 2, 3, 4, 4, 4]
+        );
+        let seen = list(SortBy::Activity, Order::Asc, limit, Some(ranks.clone())).await;
+        assert_eq!(
+            names_of(&seen),
+            ["f", "c", "g", "a", "b", "d", "e"],
+            "limit {limit}"
+        );
+        let seen = list(SortBy::Name, Order::Desc, limit, Some(ranks.clone())).await;
+        assert_eq!(
+            names_of(&seen),
+            ["f", "g", "c", "a", "e", "d", "b"],
+            "limit {limit}"
+        );
+        let seen = list(SortBy::Name, Order::Asc, limit, Some(ranks.clone())).await;
+        assert_eq!(
+            names_of(&seen),
+            ["f", "c", "g", "a", "b", "d", "e"],
+            "limit {limit}"
+        );
+        // The toggle off (or no open session): the plain sort, every rank NOT_LIVE.
+        for off in [None, Some(Default::default())] {
+            let seen = list(SortBy::Activity, Order::Desc, limit, off).await;
+            assert_eq!(names_of(&seen), ["e", "a", "b", "d", "c", "f", "g"]);
+            assert!(seen.iter().all(|(_, r)| *r == queries::NOT_LIVE));
+        }
+    }
+    // Filters still decide what is listed.
+    let p = ListParams {
+        filters: Filters {
+            live: Some(vec![v[2].clone(), v[4].clone()]),
+            ..Filters::default()
+        },
+        live_ranks: Some(ranks.clone()),
+        ..params(10)
+    };
+    let (rows, total) = r
+        .with(move |c| queries::list_projects(c, &p))
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(
+        rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["c", "e"]
+    );
+    // One project outside a listing has no rank.
+    let one = r
+        .with({
+            let id = v[5].clone();
+            move |c| queries::get_project(c, &id)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(one.live_rank, queries::NOT_LIVE);
 }
 
 #[tokio::test]

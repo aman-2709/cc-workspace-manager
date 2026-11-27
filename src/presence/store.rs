@@ -25,14 +25,18 @@ pub enum Refusal {
     NoClaudeAncestor,
     PidMismatch,
     Limit,
+    /// The `ccwm hook` process that connected was gone (or its pid reused) when the daemon
+    /// handled its event (v0.2 review L7): nothing can be said about its ancestry.
+    ClientGone,
 }
 
 impl Refusal {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Malformed,
         Self::NoClaudeAncestor,
         Self::PidMismatch,
         Self::Limit,
+        Self::ClientGone,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -41,6 +45,7 @@ impl Refusal {
             Self::NoClaudeAncestor => "no_claude_ancestor",
             Self::PidMismatch => "pid_mismatch",
             Self::Limit => "limit",
+            Self::ClientGone => "client_gone",
         }
     }
 }
@@ -62,6 +67,16 @@ impl State {
         Self::Waiting,
         Self::Unknown,
     ];
+
+    /// The project's place when live sessions come first (§21.8): 0 leads.
+    pub fn rank(self) -> i64 {
+        match self {
+            Self::NeedsApproval => 0,
+            Self::Working => 1,
+            Self::Waiting => 2,
+            Self::Unknown => 3,
+        }
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -185,6 +200,9 @@ pub enum Outcome {
     Closed,
     /// `SessionEnd` for a session that was not open.
     Ignored,
+    /// `SessionEnd` from a process that does not hold the session while the one that does still
+    /// runs (the same session resumed in a second terminal; v0.2 review L1): ignored.
+    OtherProcess,
 }
 
 impl Outcome {
@@ -197,6 +215,7 @@ impl Outcome {
             Self::Stale => "stale (an older prompt)".into(),
             Self::Closed => "closed".into(),
             Self::Ignored => "ignored (not open)".into(),
+            Self::OtherProcess => "ignored (another process)".into(),
         }
     }
 }
@@ -219,13 +238,16 @@ pub enum Persist {
     Delete(Vec<String>),
 }
 
-/// An applied event: its outcome, the persistence it needs, and the projects whose aggregate may
-/// have changed (to publish).
+/// An applied event: its outcome, the persistence it needs, the projects whose aggregate may
+/// have changed (to publish), and the sessions it closed because their process started this one
+/// (`SessionStart`: one process holds one session; v0.2 review L2). Their projects are in
+/// `projects`; their rows are still to be deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     pub outcome: Outcome,
     pub persist: Option<Persist>,
     pub projects: Vec<String>,
+    pub replaced: Vec<String>,
 }
 
 /// One line of the debug log: names, times and ids only — never a cwd, a pid or any text from a
@@ -264,6 +286,7 @@ pub struct Refused {
     pub no_claude_ancestor: u64,
     pub pid_mismatch: u64,
     pub limit: u64,
+    pub client_gone: u64,
 }
 
 impl Refused {
@@ -273,15 +296,7 @@ impl Refused {
             Refusal::NoClaudeAncestor => &mut self.no_claude_ancestor,
             Refusal::PidMismatch => &mut self.pid_mismatch,
             Refusal::Limit => &mut self.limit,
-        }
-    }
-
-    pub fn get(&self, r: Refusal) -> u64 {
-        match r {
-            Refusal::Malformed => self.malformed,
-            Refusal::NoClaudeAncestor => self.no_claude_ancestor,
-            Refusal::PidMismatch => self.pid_mismatch,
-            Refusal::Limit => self.limit,
+            Refusal::ClientGone => &mut self.client_gone,
         }
     }
 }
@@ -360,13 +375,55 @@ pub struct Store {
     log: VecDeque<LogEntry>,
     seq: u64,
     counters: Counters,
+    /// The sequence number of the last project resolution started ([`Self::cwds`]) and of the
+    /// newest one applied ([`Self::assign`]): an older result never overwrites a newer one
+    /// (v0.2 review L8).
+    resolutions_started: u64,
+    resolution_applied: u64,
 }
 
 impl Store {
     /// An event that passed validation and the process walk, at `now_ms`. `alive` says whether
     /// the process a tracked session is in still runs; it is asked only when another process
     /// reports for it.
+    ///
+    /// A `SessionStart` first closes every other session its process holds: a process holds one
+    /// session at a time (`/clear` and `/resume` end one and start the next in the same process),
+    /// so they are what a lost `SessionEnd` left behind (v0.2 review L2).
     pub fn apply(
+        &mut self,
+        report: &Report,
+        found: &Found,
+        now_ms: i64,
+        alive: impl Fn(&Identity) -> bool,
+    ) -> Result<Applied, Refusal> {
+        let replaced: Vec<String> = if matches!(report.event, Event::SessionStart(_)) {
+            let mut ids: Vec<String> = self
+                .sessions
+                .iter()
+                .filter(|(sid, o)| **sid != report.session_id && o.identity == found.identity)
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            ids.sort();
+            ids
+        } else {
+            Vec::new()
+        };
+        let mut projects: Vec<String> = replaced
+            .iter()
+            .filter_map(|sid| self.sessions.remove(sid)?.project)
+            .collect();
+        // With a session closed above there is room for this one: the limit cannot refuse it.
+        let mut applied = self.apply_event(report, found, now_ms, alive)?;
+        projects.append(&mut applied.projects);
+        projects.sort();
+        projects.dedup();
+        applied.projects = projects;
+        applied.replaced = replaced;
+        Ok(applied)
+    }
+
+    fn apply_event(
         &mut self,
         report: &Report,
         found: &Found,
@@ -378,15 +435,27 @@ impl Store {
             outcome,
             persist,
             projects: project.into_iter().cloned().collect(),
+            replaced: Vec::new(),
         };
         if report.event == Event::SessionEnd {
-            return Ok(match self.sessions.remove(id) {
-                Some(open) => applied(
-                    Outcome::Closed,
-                    Some(Persist::Delete(vec![id.clone()])),
-                    open.project.as_ref(),
-                ),
+            // Only the session's own process ends it — or, once that one is gone, the process
+            // that reports for it (the rule `moved` follows below). A second terminal that
+            // resumed the same session and then left must not close it for the first (L1).
+            let owner = self
+                .sessions
+                .get(id)
+                .map(|o| o.identity == found.identity || !alive(&o.identity));
+            return Ok(match owner {
                 None => applied(Outcome::Ignored, None, None),
+                Some(false) => applied(Outcome::OtherProcess, None, None),
+                Some(true) => {
+                    let project = self.sessions.remove(id).and_then(|o| o.project);
+                    applied(
+                        Outcome::Closed,
+                        Some(Persist::Delete(vec![id.clone()])),
+                        project.as_ref(),
+                    )
+                }
             });
         }
         let Some(open) = self.sessions.get_mut(id) else {
@@ -460,6 +529,7 @@ impl Store {
             outcome,
             persist,
             projects,
+            replaced: Vec::new(),
         })
     }
 
@@ -552,17 +622,31 @@ impl Store {
         self.sessions.is_empty()
     }
 
-    /// The sessions to resolve to a project: id and first cwd.
-    pub fn cwds(&self) -> Vec<(String, String)> {
-        self.sessions
+    /// Start a project resolution: its sequence number, and the sessions to resolve (id and
+    /// first cwd).
+    pub fn cwds(&mut self) -> (u64, Vec<(String, String)>) {
+        self.resolutions_started += 1;
+        let cwds = self
+            .sessions
             .iter()
             .map(|(id, o)| (id.clone(), o.first_cwd.clone()))
-            .collect()
+            .collect();
+        (self.resolutions_started, cwds)
     }
 
-    /// Set each listed session's project (`Ok`) or unassigned reason (`Err`). Returns the
+    /// The result of resolution `seq`: set each listed session's project (`Ok`) or unassigned
+    /// reason (`Err`). A resolution older than one already applied changes nothing — it may
+    /// have looked at the projects before one was registered (v0.2 review L8). Returns the
     /// projects whose aggregate changed (a session joined or left them).
-    pub fn assign(&mut self, results: Vec<(String, Result<String, &'static str>)>) -> Vec<String> {
+    pub fn assign(
+        &mut self,
+        seq: u64,
+        results: Vec<(String, Result<String, &'static str>)>,
+    ) -> Vec<String> {
+        if seq < self.resolution_applied {
+            return Vec::new();
+        }
+        self.resolution_applied = seq;
         let mut changed = Vec::new();
         for (id, r) in results {
             let Some(open) = self.sessions.get_mut(&id) else {
@@ -648,6 +732,23 @@ impl Store {
             .collect();
         out.sort();
         out.dedup();
+        out
+    }
+
+    /// Each project with a shown session, and its aggregate state (the order of [`Self::live`]).
+    pub fn live_ranks(&self, show_noninteractive: bool) -> BTreeMap<String, State> {
+        let mut out: BTreeMap<String, State> = BTreeMap::new();
+        for o in self
+            .sessions
+            .values()
+            .filter(|o| Self::shown(o, show_noninteractive))
+        {
+            if let Some(p) = &o.project {
+                out.entry(p.clone())
+                    .and_modify(|s| *s = (*s).min(o.state))
+                    .or_insert(o.state);
+            }
+        }
         out
     }
 
@@ -775,6 +876,12 @@ mod tests {
         }
     }
 
+    /// Apply a resolution started now (the latest, so it is never dropped as older).
+    fn assign(s: &mut Store, results: Vec<(String, Result<String, &'static str>)>) -> Vec<String> {
+        let (seq, _) = s.cwds();
+        s.assign(seq, results)
+    }
+
     const ALIVE: fn(&Identity) -> bool = |_| true;
     const GONE: fn(&Identity) -> bool = |_| false;
 
@@ -803,7 +910,7 @@ mod tests {
             state,
         );
         s.sessions.insert(A.into(), open);
-        s.assign(vec![(A.into(), Ok("p".into()))]);
+        assign(&mut s, vec![(A.into(), Ok("p".into()))]);
         s
     }
 
@@ -1032,7 +1139,7 @@ mod tests {
                     )
                     .unwrap();
                 }
-                s.assign(vec![(A.into(), Ok("p".into()))]);
+                assign(&mut s, vec![(A.into(), Ok("p".into()))]);
                 // Of the current prompt: applied.
                 assert_eq!(
                     s.apply_fact(A, &fact(end, Some(P1), 2_500), 3_000),
@@ -1195,6 +1302,229 @@ mod tests {
         assert_eq!(s.identities()[0].1.pid, 30);
     }
 
+    /// v0.2 review L1 (E1): the same session resumed in a second terminal while the first still
+    /// runs; the first one's `SessionEnd` must not close it for the second.
+    #[test]
+    fn session_end_closes_a_session_only_from_its_own_process() {
+        let mut s = Store::default();
+        s.apply(
+            &report(Event::SessionStart(Source::Startup), A),
+            &found(10, 1),
+            5_000,
+            ALIVE,
+        )
+        .unwrap();
+        s.apply(
+            &report(Event::SessionStart(Source::Resume), A),
+            &found(20, 2),
+            6_000,
+            ALIVE,
+        )
+        .unwrap();
+        s.apply(
+            &with_prompt(Event::UserPromptSubmit, A, P1),
+            &found(20, 2),
+            7_000,
+            ALIVE,
+        )
+        .unwrap();
+        let a = s
+            .apply(&report(Event::SessionEnd, A), &found(10, 1), 8_000, ALIVE)
+            .unwrap();
+        assert_eq!(
+            a,
+            Applied {
+                outcome: Outcome::OtherProcess,
+                persist: None,
+                projects: vec![],
+                replaced: vec![],
+            }
+        );
+        assert_eq!(s.open_counts(false).working, 1, "still open, still working");
+        assert_eq!(Outcome::OtherProcess.text(), "ignored (another process)");
+        // A process that never held it, the same.
+        let a = s
+            .apply(&report(Event::SessionEnd, A), &found(30, 3), 8_000, ALIVE)
+            .unwrap();
+        assert_eq!(a.outcome, Outcome::OtherProcess);
+        // Its own process ends it.
+        let a = s
+            .apply(&report(Event::SessionEnd, A), &found(20, 2), 9_000, ALIVE)
+            .unwrap();
+        assert_eq!(
+            (a.outcome, a.persist),
+            (Outcome::Closed, Some(Persist::Delete(vec![A.to_string()])))
+        );
+        assert!(s.is_empty());
+        // Once its process is gone, the process that reports for it may end it (as any other
+        // event moves it there).
+        s.apply(&report(Event::Stop, A), &found(10, 1), 10_000, ALIVE)
+            .unwrap();
+        let a = s
+            .apply(&report(Event::SessionEnd, A), &found(20, 2), 11_000, GONE)
+            .unwrap();
+        assert_eq!(a.outcome, Outcome::Closed);
+        assert!(s.is_empty());
+    }
+
+    /// v0.2 review L2 (E2): `/clear` (or `/resume` inside a session) ends one session and starts
+    /// the next in the same process; when the `SessionEnd` was lost, the `SessionStart` closes
+    /// the old session — and only the sessions of that process.
+    #[test]
+    fn session_start_closes_the_other_sessions_of_its_process() {
+        let mut s = Store::default();
+        for (sid, pid) in [(A, 10), (B, 20)] {
+            s.apply(&report(Event::Stop, sid), &found(pid, 1), 5_000, ALIVE)
+                .unwrap();
+        }
+        assign(
+            &mut s,
+            vec![(A.into(), Ok("p".into())), (B.into(), Ok("q".into()))],
+        );
+        let x = "2b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f";
+        let a = s
+            .apply(
+                &report(Event::SessionStart(Source::Clear), x),
+                &found(10, 1),
+                6_000,
+                ALIVE,
+            )
+            .unwrap();
+        assert_eq!(a.outcome, Outcome::Opened(State::Waiting));
+        assert_eq!(a.replaced, [A]);
+        assert_eq!(a.projects, ["p"], "A's project lost a session");
+        let mut ids: Vec<String> = s.identities().into_iter().map(|(id, _)| id).collect();
+        ids.sort();
+        assert_eq!(ids, [B, x], "B is another process's");
+        // A pid that was reused (another start time) is another process.
+        let a = s
+            .apply(
+                &report(Event::SessionStart(Source::Startup), A),
+                &found(20, 9),
+                7_000,
+                ALIVE,
+            )
+            .unwrap();
+        assert!(a.replaced.is_empty());
+        // compact, and a SessionStart for the session the process already holds, close nothing.
+        for source in [Source::Compact, Source::Resume] {
+            let a = s
+                .apply(
+                    &report(Event::SessionStart(source), x),
+                    &found(10, 1),
+                    8_000,
+                    ALIVE,
+                )
+                .unwrap();
+            assert!(a.replaced.is_empty(), "{source:?}");
+        }
+        // A session moved to the process by `/resume`: the session it held before goes.
+        let a = s
+            .apply(
+                &report(Event::SessionStart(Source::Resume), B),
+                &found(10, 1),
+                9_000,
+                ALIVE,
+            )
+            .unwrap();
+        assert_eq!(
+            (a.outcome, a.replaced),
+            (Outcome::NewProcess(State::Waiting), vec![x.to_string()])
+        );
+        assert_eq!(a.projects, ["q"]);
+        // Other events never close another session.
+        let a = s
+            .apply(&report(Event::Stop, x), &found(10, 1), 10_000, ALIVE)
+            .unwrap();
+        assert_eq!(
+            (a.outcome, a.replaced.len()),
+            (Outcome::Opened(State::Waiting), 0)
+        );
+        assert_eq!(s.totals().0, 3);
+    }
+
+    /// At the limit, a `SessionStart` that replaces its process's sessions has room.
+    #[test]
+    fn a_session_start_that_replaces_sessions_is_not_refused_at_the_limit() {
+        let mut s = Store::default();
+        let sid = |i: usize| format!("{i:08x}-3d2a-4c5b-9e8f-1a2b3c4d5e6f");
+        for i in 0..MAX_SESSIONS {
+            s.apply(&report(Event::Stop, &sid(i)), &found(10, 1), 5_000, ALIVE)
+                .unwrap();
+        }
+        let new = report(Event::SessionStart(Source::Clear), &sid(MAX_SESSIONS));
+        assert_eq!(
+            s.apply(&new, &found(11, 1), 6_000, ALIVE),
+            Err(Refusal::Limit),
+            "another process: still refused"
+        );
+        let a = s.apply(&new, &found(10, 1), 6_000, ALIVE).unwrap();
+        assert_eq!(a.outcome, Outcome::Opened(State::Waiting));
+        assert_eq!(a.replaced.len(), MAX_SESSIONS);
+        assert_eq!(s.totals().0, 1);
+    }
+
+    /// v0.2 review L8 at the store: results apply in the order their resolutions started.
+    #[test]
+    fn resolution_results_apply_only_when_not_older_than_the_last_applied() {
+        let mut s = Store::default();
+        s.apply(&report(Event::Stop, A), &found(10, 1), 1_000, ALIVE)
+            .unwrap();
+        let (first, _) = s.cwds();
+        let (second, _) = s.cwds();
+        assert_eq!(second, first + 1);
+        assert_eq!(s.assign(second, vec![(A.into(), Ok("p".into()))]), ["p"]);
+        assert!(
+            s.assign(first, vec![(A.into(), Err(NOT_REGISTERED))])
+                .is_empty(),
+            "older: dropped"
+        );
+        assert_eq!(s.live_ranks(false).len(), 1);
+        // The same resolution may not be applied twice out of order either way; a newer one is.
+        let (third, _) = s.cwds();
+        assert_eq!(
+            s.assign(third, vec![(A.into(), Ok("q".into()))]),
+            ["p", "q"]
+        );
+    }
+
+    #[test]
+    fn live_ranks_are_each_projects_aggregate_and_lead_in_the_aggregate_order() {
+        assert_eq!(
+            State::ALL.map(State::rank),
+            [0, 1, 2, 3],
+            "needs approval first"
+        );
+        assert!(State::ALL
+            .iter()
+            .all(|s| s.rank() < crate::db::queries::NOT_LIVE));
+        let mut s = Store::default();
+        let x = "2b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f";
+        for (sid, pid, event) in [
+            (A, 10, Event::Stop),
+            (B, 11, Event::Notification(Notice::PermissionPrompt)),
+            (x, 12, Event::UserPromptSubmit),
+        ] {
+            s.apply(&report(event, sid), &found(pid, 1), 1_000, ALIVE)
+                .unwrap();
+        }
+        assign(
+            &mut s,
+            vec![
+                (A.into(), Ok("p".into())),
+                (B.into(), Ok("p".into())),
+                (x.into(), Ok("q".into())),
+            ],
+        );
+        assert_eq!(
+            s.live_ranks(false).into_iter().collect::<Vec<_>>(),
+            [
+                ("p".to_string(), State::NeedsApproval),
+                ("q".to_string(), State::Working)
+            ]
+        );
+    }
+
     #[test]
     fn one_process_may_hold_several_sessions_each_on_its_own() {
         let mut s = Store::default();
@@ -1296,7 +1626,7 @@ mod tests {
                 sid(i),
                 Open::new(f.identity, interactive, "/c".into(), since_ms, state),
             );
-            s.assign(vec![(sid(i), Ok(project.into()))]);
+            assign(s, vec![(sid(i), Ok(project.into()))]);
         };
         add(&mut s, 1, State::Working, 10_000, "p", true);
         add(&mut s, 2, State::NeedsApproval, 30_000, "p", true);
@@ -1382,14 +1712,14 @@ mod tests {
             .unwrap();
         s.apply(&report(Event::Stop, B), &found(11, 1), 1_000, ALIVE)
             .unwrap();
-        let mut cwds = s.cwds();
+        let (_, mut cwds) = s.cwds();
         cwds.sort();
         assert_eq!(cwds.len(), 2);
         assert_eq!(
-            s.assign(vec![
-                (A.into(), Ok("p".into())),
-                (B.into(), Err(NOT_REGISTERED))
-            ]),
+            assign(
+                &mut s,
+                vec![(A.into(), Ok("p".into())), (B.into(), Err(NOT_REGISTERED))]
+            ),
             ["p"]
         );
         assert_eq!(
@@ -1398,20 +1728,26 @@ mod tests {
         );
         // B's project appears (the session file registered it); A's moved.
         assert_eq!(
-            s.assign(vec![(A.into(), Ok("q".into())), (B.into(), Ok("q".into()))]),
+            assign(
+                &mut s,
+                vec![(A.into(), Ok("q".into())), (B.into(), Ok("q".into()))]
+            ),
             ["p", "q"]
         );
         assert!(s.open_counts(false).unassigned.is_empty());
         assert_eq!(
-            s.assign(vec![(A.into(), Ok("q".into()))]),
+            assign(&mut s, vec![(A.into(), Ok("q".into()))]),
             Vec::<String>::new(),
             "no change"
         );
         assert_eq!(
-            s.assign(vec![(
-                "ffffffff-3d2a-4c5b-9e8f-1a2b3c4d5e6f".into(),
-                Ok("x".into())
-            )]),
+            assign(
+                &mut s,
+                vec![(
+                    "ffffffff-3d2a-4c5b-9e8f-1a2b3c4d5e6f".into(),
+                    Ok("x".into())
+                )]
+            ),
             Vec::<String>::new(),
             "closed meanwhile"
         );
@@ -1437,9 +1773,17 @@ mod tests {
         s.refused(Refusal::PidMismatch);
         s.refused(Refusal::Malformed);
         s.refused(Refusal::Malformed);
+        s.refused(Refusal::ClientGone);
         let c = s.counters();
         assert_eq!((c.received, c.last_event_at), (2, Some(12)));
-        assert_eq!(Refusal::ALL.map(|r| c.refused.get(r)), [2, 0, 1, 0]);
+        // Every reason is counted under its own name (what `ccwm status`, `ccwm hooks events`
+        // and `ccwm doctor` read through `Refusal::ALL`).
+        let json = serde_json::to_value(&c.refused).unwrap();
+        assert_eq!(
+            Refusal::ALL.map(|r| json[r.as_str()].as_u64()),
+            [Some(2), Some(0), Some(1), Some(0), Some(1)]
+        );
+        assert_eq!(json.as_object().unwrap().len(), Refusal::ALL.len());
         for i in 0..(LOG_SIZE + 3) {
             s.log(
                 i as i64,

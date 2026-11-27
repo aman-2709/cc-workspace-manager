@@ -1274,6 +1274,40 @@ the background session (left to the maintainer: it changes Claude Code's state).
 - Demo cleaned up: the daemon stopped by its `instance.json` pid, the fake processes (and one orphaned `sleep`)
   killed, the directory removed.
 
+## 13n. v0.2 fix pass — what was actually run (2026-11-26)
+
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `CCWM_REQUIRE_LANDLOCK=1
+  CCWM_REQUIRE_LANDLOCK_ABI=8 CCWM_REQUIRE_INOTIFY=1 cargo test`: green (328 unit tests; every integration suite,
+  `tests/hooks.rs` 10, `tests/live_api.rs` 5, `tests/db.rs` 18, `node --test tests/ui/app.test.js` 39). musl
+  (`CARGO_TARGET_DIR=/tmp/ccwm-musl … --target x86_64-unknown-linux-musl --test hooks --test live_api --test ipc
+  --test db`): green.
+- **Do the new tests fail without their fix?** Each fix taken out in turn (the file restored after each run): L1
+  (owner check), L2 (no replacement), L8 (no sequence check), the live ranks not passed to the query, the rank not
+  in `ORDER BY`, the rank's keyset condition, the toggle not applied live, the check after the walk (L7) — each
+  caught. The check *before* the walk survives alone: with it removed, the check after the walk still refuses a
+  gone client (the two overlap on purpose; the first spares a walk of a pid that names nobody). Also run by hand:
+  the `strace` test against `Owner::current` in `daemon_socket` (fails: `/etc/nsswitch.conf`, `/etc/passwd`
+  opened); the L6 test with `toolUseResult` decoded as a lenient string (fails: the record is malformed); the
+  listen-queue test with `SO_RCVTIMEO` instead of `SO_SNDTIMEO` (fails after 2 s; it used to hang); the colour
+  test on the old stylesheet (fails). The FIFO test of the check after the walk: 20 runs, 20 passes.
+- **Found while testing:** the stop-1 process test pinned the old L1 behaviour ("its session is closed by the
+  event all the same") and was updated; a FIFO serving two reads needs a pause between the writer's two opens,
+  or a reader still attached gets both contents and the second read waits for good (the test also runs the call
+  under a 5 s timeout).
+- **A real browser** (Chrome, through the extension) on a synthetic daemon (`/tmp/ccwm-fp-demo`, port 8766,
+  debug build, 17 projects) with four fake Claude Code processes (`bash` with `argv[0]` `claude`, one session
+  each, hooks fed from the 2.1.332 fixtures): beta needs approval, alpha working, gamma and monorepo waiting.
+  Seen: the table and the cards ordered beta, alpha, gamma, monorepo, then the rest by last change; magenta
+  "Needs approval" next to the orange "main: 1 untracked" in both themes, clearly apart; the teal waiting dot;
+  on cards the state on its own line under the name, "Today" alone at the right of the head; "Needs approval ·
+  1 min" appearing without a reload; Settings → "Show live sessions first" unchecked and saved ("Saved.", no
+  restart note) ⇒ the plain order (alpha, beta, delta, gamma, …), checked again ⇒ beta first again. **Noticed:**
+  in the light theme the teal dot of "Waiting for input" (`#0f766e`) and the green dot of the "Today" activity
+  (`#1a7f37`) look alike at a glance in the table (different columns, both labelled). **Not seen:** a screen
+  reader; the reduced-motion setting (unchanged since stop 2).
+- Demo cleaned up: the daemon stopped by its `instance.json` pid, the four fake processes killed (their `bash`
+  had exec'd the final `sleep`), the directory removed.
+
 ---
 
 ## 14. Decisions log and remaining open items
@@ -1453,16 +1487,35 @@ file's times with the walk's `now`, in whole seconds. **Not done, recorded in RO
 (counting a repository's rules once across projects would make the shares non-additive), I4 (weighting
 expensive rules).
 
+**The v0.2 review (docs/reviews/v0.2.0-review.md), decided by the maintainer (2026-11-26):** L1 — `SessionEnd`
+closes a session only from the process that holds it; L2 — a `SessionStart` closes the other sessions of its
+process (one process = one session); L3, L4 — documented as known limits, no code change; L5 — no NSS lookup on
+the `ccwm hook` path, with an `strace` test; L6 — the raw-invalid-UTF-8 test; L7 — the client's start time
+checked again after the walk; L8 — resolutions carry a sequence number; the info items as the review proposed,
+`>/dev/null` in the snippet and the CLAUDE.md tag drift included, and a timeout for the listen-queue test. From
+the maintainer's real use: "Show live sessions first" (default on, a Settings toggle), teal for "waiting", a
+"needs approval" colour distinct from the uncommitted-changes orange, the card's indicator away from the
+activity label, contrast ≥ 4.5:1, the label always present. **Choices made in the fix, for review:** magenta for
+"needs approval" (red is about 25° of hue from the orange and merges with it for red-green colour blindness);
+the indicator on its own card line (not before the name, which would shorten it); `client_gone` as a fifth
+refusal reason, also for a client already gone before the walk; `SessionEnd` from another process accepted once
+the owner is gone (consistent with the rule that moves such a session); a `SessionStart` of any `source`
+(also `compact`, `startup`) closes the process's other sessions; the live rank as a server-side leading keyset
+key (the API and the UI agree, pages stay consistent) rather than a client-side regrouping; the follow loop
+waiting 5 s for any daemon, not only while the instance lock is held (a restart has a gap without a lock
+holder); the lazy group lookup for every CLI command, not only `ccwm hook`. **Not done:** coalescing
+resolutions (L8's other proposal), letting a tool event of the current prompt move `waiting` → `working` (L3's
+proposal; L3 is documented instead), sending subagent tool events (L4's proposal; documented instead), a test of
+the terminal hint (I5, cosmetic).
+
 Open:
 - **O2:** a `claude` binary outside the sandbox read set cannot be executed: reported as `failed` (the usual
   `~/.local/bin/claude` → `~/.local/share/claude/…` install is inside home, a root).
 - **O3 (M4):** crate/GitHub/distro naming-conflict check needs outbound requests — needs the maintainer's OK.
 - **O4:** `app.js` DOM tests only if Node is present.
-- **O11 (v0.2):** interactive checks on the real home in phase 2 (the maintainer): `idle_prompt` after an
-  interrupt, a background session's process, permission dialogs (approve, deny, Esc) and the events after them, an
-  npm-installed Claude Code's `cmdline`, the arguments SDK hosts start the CLI with. Stop 1 built the tool for
-  it: `ccwm hooks events --follow` (REQUIREMENTS.md §21.10). O9, O10, O12–O17 were decided on
-  2026-11-26 (above; REQUIREMENTS.md §21.12).
+- **O11 (v0.2): done** (2026-11-26; §11a, §13m, REQUIREMENTS.md §21.12) — except an npm-installed Claude Code's
+  `cmdline` (none on the host) and an editor extension's arguments (optional, not run). O9, O10, O12–O17 were
+  decided on 2026-11-26 (above).
 
 ---
 
@@ -1543,13 +1596,15 @@ closes — not at every turn.
 | Event \ state | not tracked | `needs_approval` | `working` | `waiting` | `unknown` |
 |---|---|---|---|---|---|
 | `SessionStart` `startup`/`resume`/`clear`/`fork` | open, `waiting` | `waiting` (new identity) | `waiting` | `waiting` | `waiting` |
+| any `SessionStart` from process P (fix pass, L2) | first: every *other* session P holds is closed (`closed: its process started another session`) | | | | |
 | `SessionStart` `compact` | open, `unknown` | unchanged | unchanged | unchanged | unchanged |
 | `UserPromptSubmit` (sets the current `prompt_id`) | open, `working` | `working` | `working` | `working` | `working` |
 | `Notification` `permission_prompt` | open, `needs_approval` | `needs_approval` | `needs_approval` | `needs_approval` | `needs_approval` |
 | `PostToolUse`, `PostToolUseFailure`, `PostToolBatch` (main thread) | open, `working` | `working` | `working` | unchanged | `working` |
 | `Stop`, `StopFailure`, `Notification` `idle_prompt` | open, `waiting` | `waiting` | `waiting` | `waiting` | `waiting` |
 | any of these with a `prompt_id` ≠ the current one | (cannot be stale) | unchanged, counted `stale` | unchanged | unchanged | unchanged |
-| `SessionEnd` | ignored | closed | closed | closed | closed |
+| `SessionEnd` from the session's process, or from any once that one is gone | ignored | closed | closed | closed | closed |
+| `SessionEnd` from another process while the session's runs (fix pass, L1) | ignored | unchanged, `ignored (another process)` | unchanged | unchanged | unchanged |
 | recorded fact (§21.2a): interrupted, turn ended — current turn only | — | `waiting` | `waiting` | unchanged | `waiting` |
 | process gone (event, restore or sweep) | — | closed | closed | closed | closed |
 
@@ -1559,18 +1614,22 @@ project.
 
 ### Contracts
 - Socket: `{"op":"hook.event", …}` (REQUIREMENTS §21.4) → `{"ok":{"accepted":true}}` (also for a stale event) or
-  `{"error":{"code":"invalid_argument","message":"malformed|no_claude_ancestor|pid_mismatch|limit"}}`.
+  `{"error":{"code":"invalid_argument","message":"malformed|no_claude_ancestor|pid_mismatch|limit|client_gone"}}`.
 - `GET /projects`: `live=waiting|working|open` ("Waiting for me" = `waiting` or `needs_approval`; `open` = any
   state); project objects add `live: null | {state: "needs_approval"|"working"|"waiting"|"unknown", sessions,
   needs_approval, working, waiting, unknown, since (only with one session)}`. `GET /projects/{id}/sessions` items
   add `live: null | {state, since}`. `/stats` adds `live{waiting_for_me, working, open}` (numbers of projects, for
   the filter counts). `/service/status` (and the socket op) adds `hooks{open, needs_approval, working, waiting,
   unknown, hidden_noninteractive, unassigned{reason: n}, received, stale, refused{malformed, no_claude_ancestor,
-  pid_mismatch, limit}, last_event_at}`. Privacy mode changes none of these (no path, pid, id or text in them).
-  `GET`/`PUT /settings`: `indicator.show_noninteractive`.
-- UI: a `.live` element with a decorative dot and a text label; classes `live--needs-approval` (steady, the
-  theme's warning colour), `live--working` (pulse: an `opacity` keyframe animation, about 2 s, `ease-in-out`),
-  `live--waiting`, `live--unknown` (ring); `@media (prefers-reduced-motion: reduce) { .live--working .live-dot {
+  pid_mismatch, limit, client_gone}, last_event_at}`. Privacy mode changes none of these (no path, pid, id or text in them).
+  `GET`/`PUT /settings`: `indicator.show_noninteractive`, `indicator.live_first` (fix pass; default `true`).
+- `GET /projects` with `indicator.live_first` on (fix pass): ordered by the live rank first (0 needs approval,
+  1 working, 2 waiting, 3 unknown — the project's aggregate over its shown sessions — 4 no open session), then
+  the requested sort; the cursor carries the rank (`r`, 0–4; a cursor without it is invalid).
+- UI: a `.live` element with a decorative dot and a text label; classes `live--needs-approval` (steady,
+  magenta since the fix pass — it was the uncommitted-changes orange), `live--working` (pulse: an `opacity` keyframe animation, about 2 s, `ease-in-out`),
+  `live--waiting` (teal since the fix pass; it was gray), `live--unknown` (gray ring); on cards its own line
+  under the name (fix pass); `@media (prefers-reduced-motion: reduce) { .live--working .live-dot {
   animation: none } }`; tooltip and accessible name from the counts; the table's "Claude" column with a `rem` width
   on its header cell (`table-layout: fixed`); three toggle filters with counts, persisted with the other filters;
   the Settings toggle.
@@ -1679,6 +1738,62 @@ against a socket that never answers, the 1 s watchdog, the guarded snippet with 
   `tests/hooks.rs` (a `StepClaude` driven through a FIFO: every state over the API and the WebSocket, a fact
   from a session file written during the test, the session list, the sweep, a restart, the toggle),
   `tests/ui/app.test.js` (labels, minutes, counts, filters, the CSS rules).
+
+### Fix pass as built (2026-11-26; docs/reviews/v0.2.0-review.md)
+- **L1, L2 (`presence::store`):** `Store::apply` first closes, on a `SessionStart`, every other session whose
+  identity equals the reporting process's (`Applied::replaced`; their projects join `Applied::projects`; the
+  limit cannot refuse the new session then, a slot was freed), then `apply_event` (the old `apply`): `SessionEnd`
+  removes the session only when `found.identity` is its identity or `alive(identity)` is false, else
+  `Outcome::OtherProcess` ("ignored (another process)"). `Presence::report` logs each replaced session before the
+  event, deletes their rows (`Persist::Delete`) and publishes. Restore at start is unchanged: two persisted
+  sessions of one process (from before the fix) are both restored, and the next `SessionStart` there closes the
+  older.
+- **L7 (`presence::proc`):** `find_claude` reads the peer's `stat` (gone or a zombie ⇒ `ClientGone`), its
+  `status` (unreadable ⇒ `ClientGone`), walks (`walk`, the old loop), then `still_running(peer, start)` (same
+  start time, not a zombie) or `ClientGone` — whatever the walk found. `Refusal::ClientGone` ("client_gone") is
+  the fifth reason; `Refused::get` is gone (its one user, a test, reads the serialized counters), and the CLI's
+  "refused: …" text (`ccwm status`, `ccwm hooks events`) and the doctor's total come from `Refusal::ALL` in one
+  place (`cli::refused_counts`, I6).
+- **L8:** `Store::cwds` returns `(seq, cwds)` (the next number of `resolutions_started`); `Store::assign(seq, …)`
+  does nothing when `seq < resolution_applied`. `Tracker::resolve_open_sessions` takes the number before it reads
+  the projects. Not coalesced (the review's other proposal; not asked for).
+- **L5:** `Dirs::verify_runtime_lazily(uid, lookup)` checks with `private_gid: None` first and calls `lookup`
+  (`paths::private_group`, NSS) only when that fails for another reason than a missing directory;
+  `cli::daemon_socket` (every CLI command, `ccwm hook` included) uses it. `paths::current_home` already skipped the
+  passwd lookup when `$HOME` qualifies.
+- **Live first:** `config::IndicatorConfig::live_first` (default `true`; `Default` written by hand), in `SETTABLE`,
+  live through `apply_live` → `Presence::set_live_first` (republishes the projects with an open session; also set
+  at start in `daemon::run`). `Presence::live_ranks` (`None` when off) → `Store::live_ranks` (project → aggregate
+  state, shown sessions only) → `State::rank` → `ListParams::live_ranks` (a JSON object `{id: rank}`).
+  `queries::list_projects`: `LEFT JOIN json_each(?15) lr ON lr.key = p.id`, `coalesce(lr.value, 4) AS live_rank`,
+  `ORDER BY live_rank ASC, k1 {dir}, sort_key {dir}, id {dir}`, and the keyset condition spelled out because the
+  rank ascends whatever the direction: `rank > ?16 OR (rank = ?16 AND (k1, key, id) cmp (?11, ?12, ?13))`.
+  `ListParams::after` is a `queries::After {live_rank, k1, sort_key, id}` (was a tuple); `ProjectRow::live_rank`
+  (`NOT_LIVE` outside a listing). The count query is unchanged.
+- **UI:** `--live-approval` magenta (`#bf3989` / dark `#f778ba`), new `--live-waiting` teal (`#0f766e` /
+  `#2ea89a`), `--live-idle` gray only for the "Session open" ring; the card's `.live` moved out of `.head` into a
+  `p.line.live-line` right under it; the Settings checkbox `s-livefirst`; `settingsPatch` sends
+  `indicator.live_first`. The UI loads every page (`loadAll`), so the server's order is the order shown.
+- **I1** `guarded_command` adds `>/dev/null` to the ccwm call; **I2** `cli::hooks_path_warning` (another binary, or
+  a symlinked `~/.local/bin/ccwm`); **I4** the listen-queue test calls `send_hook` on a thread and fails after 2 s;
+  **I7** `hooks_events` waits up to 5 s (`retry_while_starting`) when a poll finds no daemon, after one retry that
+  tells a stopping daemon (no answer) from another failure (`follow_call`).
+- **Tests added:** `presence::store` (`session_end_closes_a_session_only_from_its_own_process`,
+  `session_start_closes_the_other_sessions_of_its_process`, `a_session_start_that_replaces_sessions_is_not_refused_at_the_limit`,
+  `resolution_results_apply_only_when_not_older_than_the_last_applied`, `live_ranks_are_each_projects_aggregate…`),
+  `presence` (`one_process_one_session_and_only_the_owner_ends_it`, `an_older_resolution_result_is_dropped`,
+  `live_ranks_follow_the_aggregate_and_the_toggle`, `client_gone` in the refusal test), `presence::proc`
+  (`a_client_that_is_gone_is_refused_as_client_gone`; `a_client_replaced_during_the_walk_is_refused_as_client_gone`,
+  the peer's `stat` a FIFO that answers the second read with another start time), `paths`
+  (`the_runtime_check_looks_up_the_private_group_only_when_needed`), `claude::parse`
+  (`unread_fields_stay_undecoded_even_with_invalid_utf8`, L6), `cli` (`hooks_print_warns_about_another_binary…`),
+  `tests/db.rs` (`live_ranks_lead_the_listing_in_every_sort_and_across_pages`), `tests/live_api.rs`
+  (`live_sessions_come_first_until_the_toggle_turns_it_off`), `tests/hooks.rs`
+  (`the_hook_makes_no_user_or_group_database_lookup` under `strace`, `hooks_events_follow_waits_for_a_restarted_daemon`;
+  the snippet test now expects empty stdout from the broken stand-in too; the fake-tree test expects
+  `ignored (another process)` for the other process's `SessionEnd`), `tests/ui/app.test.js` (contrast ≥ 4.5:1 and
+  the hue distance from `--dirty`, computed from the stylesheet; the toggle's patch). `tests/common/daemon.rs`:
+  `wrapped_command` (extracted from `Daemon::start_wrapped`).
 
 ### Phase 2 — the build, once the maintainer gives the go-ahead
 Accept (synthetic environment, a real browser): a fake session's `SessionStart` shows "Waiting for input" on its

@@ -5,7 +5,7 @@ ends with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D 
 ROADMAP.md + CLAUDE.md updated; one local commit; a report; then **wait for go-ahead** (M1 was pre-approved to
 start immediately; later milestones are not).
 
-Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); v0.1.1 is built and committed locally (below; three commits), not pushed or tagged. Its spec changes and choices are approved (2026-11-26).** The session activity indicator is the v0.2 headline: **phase 1 (verification and design) is done and committed locally; the design (REQUIREMENTS.md §21) is approved with the maintainer's decisions (2026-11-26); nothing is built; phase 2 waits for the go-ahead** (below).
+Current position: **v0.1.0 is released (tag `v0.1.0` at `975bf10`); v0.1.1 is tagged (`v0.1.1`, annotated, at `972f083`).** The session activity indicator is the v0.2 headline: phase 1 (design), phase 2 (stops 1 and 2) and the review are committed and on `origin/main` (`51ad19d`, the remote-tracking ref as of 2026-11-26); **the v0.2 fix pass is one local commit on top, not pushed; 0.2.0 is not tagged** (below).
 
 ---
 
@@ -342,7 +342,21 @@ After v0.1.1:
 - [x] Docs: docs/session-hooks.md, README, SECURITY.md, configuration, troubleshooting, data retention;
   CHANGELOG 0.2.0; version 0.2.0
 - [x] fmt / clippy / test green; synthetic daemon + real browser check; one local commit; report
-- [ ] **Maintainer:** review; pushing, CI, tagging and the release stay with the maintainer
+- [x] **v0.2 review** (docs/reviews/v0.2.0-review.md, one local commit)
+
+#### Fix pass — the v0.2 review and the maintainer's real use (built 2026-11-26; one local commit, not pushed)
+- [x] L1 `SessionEnd` only from the owning process; L2 one process = one session (`SessionStart` closes the
+  process's other sessions); L7 the client re-checked after the walk (`client_gone`); L8 ordered resolutions
+- [x] L3, L4 documented as known limits (REQUIREMENTS.md §21.2, §21.6; docs/session-hooks.md), no code change
+- [x] L5 no NSS lookup on the `ccwm hook` path (`strace` test); L6 the raw-invalid-UTF-8 test of the unread fields
+- [x] Info: I1 `>/dev/null` in the snippet, I2 symlink warning, I4 the listen-queue test fails instead of hanging,
+  I6 one list of refusal reasons, I7 `--follow` across a restart, I8/I9 documented, the CLAUDE.md tag drift
+- [x] UI from real use: "Show live sessions first" (`[indicator] live_first`, default on; server-side leading
+  keyset key), teal "waiting", magenta "needs approval", the card's indicator on its own line, contrast ≥ 4.5:1
+  (node test)
+- [x] CHANGELOG 0.2.0, docs; fmt / clippy / test green; musl indicator suites; real browser on a synthetic daemon
+- [ ] **Maintainer:** review (choices in ARCHITECTURE.md §14 "The v0.2 review" and REQUIREMENTS.md §21.12); then
+  pushing, CI, tagging and the release stay with the maintainer
 
 ---
 

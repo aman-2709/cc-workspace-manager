@@ -441,11 +441,13 @@ impl Report {
 }
 
 /// The hook command for `event` (§21.9): `command -v '<ccwm>' >/dev/null 2>&1 && '<ccwm>' hook
-/// <event>; exit 0`. A missing ccwm is not called, and the shell exits 0 with nothing on stdout
-/// whatever ccwm did.
+/// <event> >/dev/null; exit 0`. A missing ccwm is not called, and the shell exits 0 with nothing
+/// on stdout whatever ran under that path: ccwm never writes to stdout, and the redirection
+/// keeps an older, foreign or broken binary there out of the model's context too (v0.2 review
+/// I1). Its stderr stays visible (`claude --debug hooks`).
 pub fn guarded_command(ccwm: &str, event: &str) -> String {
     let q = shell_quote(ccwm);
-    format!("command -v {q} >/dev/null 2>&1 && {q} hook {event}; exit 0")
+    format!("command -v {q} >/dev/null 2>&1 && {q} hook {event} >/dev/null; exit 0")
 }
 
 /// One handler entry of the snippet.
@@ -1065,7 +1067,7 @@ mod tests {
                 assert_eq!(h[0]["timeout"], 5);
                 assert_eq!(
                     h[0]["command"],
-                    format!("command -v '/home/synthetic/.local/bin/ccwm' >/dev/null 2>&1 && '/home/synthetic/.local/bin/ccwm' hook {name}; exit 0")
+                    format!("command -v '/home/synthetic/.local/bin/ccwm' >/dev/null 2>&1 && '/home/synthetic/.local/bin/ccwm' hook {name} >/dev/null; exit 0")
                 );
             }
         }
@@ -1078,7 +1080,7 @@ mod tests {
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(
             v["hooks"]["Stop"][0]["hooks"][0]["command"],
-            r#"command -v '/home/syn thetic/it'\''s "x"/ccwm' >/dev/null 2>&1 && '/home/syn thetic/it'\''s "x"/ccwm' hook Stop; exit 0"#
+            r#"command -v '/home/syn thetic/it'\''s "x"/ccwm' >/dev/null 2>&1 && '/home/syn thetic/it'\''s "x"/ccwm' hook Stop >/dev/null; exit 0"#
         );
         for bad in [
             "/a\nb/ccwm",

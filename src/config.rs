@@ -22,11 +22,23 @@ pub struct Config {
     pub indicator: IndicatorConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct IndicatorConfig {
     /// Show non-interactive sessions (`-p`, SDK hosts); hidden by default (O17). Live.
     pub show_noninteractive: bool,
+    /// "Show live sessions first": projects with an open session lead the listing (needs
+    /// approval, working, waiting, unknown), each group in the chosen sort. On by default. Live.
+    pub live_first: bool,
+}
+
+impl Default for IndicatorConfig {
+    fn default() -> Self {
+        Self {
+            show_noninteractive: false,
+            live_first: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

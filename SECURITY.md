@@ -259,14 +259,18 @@ cannot revert a change made elsewhere.
 <Event>` runs as you, from the Claude Code hooks you add; it reads the event's JSON from stdin with an allowlist
 (event, session id, working folder, prompt id, `source`, `notification_type`; the prompt, Claude's reply and the
 tool fields are skipped unread), reads no environment variable but `CLAUDE_PID` and those that locate ccwm's
-socket, never writes to stdout, always exits 0, and gives the socket exchange at most 100 ms. The message travels
+socket, never writes to stdout, always exits 0, gives the socket exchange at most 100 ms, and makes no user or group
+database (NSS) lookup unless a directory on the runtime path is group-writable. The printed hook command also
+sends the stdout of whatever binary is at ccwm's path to `/dev/null`. The message travels
 over the Unix socket like every CLI request (peer UID verified both ways; requests up to 32 KiB). Its working
 folder is the **only path a socket client ever sends**: the daemon handles it like a cwd recorded in a session
 file — untrusted, resolved with the discovery rules, never opened for content, never logged; it is stored only
-with an open session (deleted when the session closes, and by "Clear session index"). The daemon decides which
+with an open session (deleted when the session closes — best effort: a delete dropped because the database
+writer's queue was full is made at the next start, when the process is gone — and by "Clear session index"). The daemon decides which
 process a report comes from itself: from the sender's pid (`SO_PEERCRED`) up the parent chain, at most 8 levels,
 only through processes of your user that started no later than their child, to the nearest Claude Code process
-(by `argv[0]`); `CLAUDE_PID` must name that same process. Liveness reads `/proc/<pid>/stat` (pid + start time +
+(by `argv[0]`); `CLAUDE_PID` must name that same process. The sender itself must still be the process that
+connected, before and after that walk (same start time), or the report is refused (`client_gone`). Liveness reads `/proc/<pid>/stat` (pid + start time +
 boot id). The daemon starts no process, opens no socket and gets no new sandbox rule for any of it. The API
 payload of the indicator holds states, counts and times only (no path, pid, id or text), so privacy mode leaves it
 unchanged. From session files the ingest reads six more top-level fields (`promptId`, `rowSource`,

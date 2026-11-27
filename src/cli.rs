@@ -257,13 +257,8 @@ fn hooks_print() -> Result<()> {
     let snippet = crate::claude::hook::snippet(&path).map_err(Error::new)?;
     let (_, uid) = daemon_dirs()?;
     let installed = current_home(uid)?.join(systemd::BINARY_IN_HOME);
-    if std::fs::canonicalize(&installed).ok().as_deref() != Some(path.as_path()) {
-        errln!(
-            "warning: this ccwm is {}, not {}: the hooks below call it by that path (scripts/install.sh installs ccwm at {})",
-            path.display(),
-            installed.display(),
-            installed.display()
-        );
+    if let Some(warning) = hooks_path_warning(&path, &installed) {
+        errln!("warning: {warning}");
     }
     if std::io::stdout().is_terminal() {
         errln!(
@@ -272,6 +267,29 @@ fn hooks_print() -> Result<()> {
     }
     out!("{snippet}");
     Ok(())
+}
+
+/// What `ccwm hooks print` warns about the path the hooks will call (`exe`, canonical): a binary
+/// other than the installed one (`installed`, `~/.local/bin/ccwm`), or an installed one that is a
+/// symbolic link — the hooks name its target, and an upgrade that moves the link leaves them
+/// calling a path that no longer exists, which the guard then skips silently (v0.2 review I2).
+pub fn hooks_path_warning(exe: &std::path::Path, installed: &std::path::Path) -> Option<String> {
+    if std::fs::canonicalize(installed).ok().as_deref() != Some(exe) {
+        return Some(format!(
+            "this ccwm is {}, not {}: the hooks below call it by that path (scripts/install.sh installs ccwm at {})",
+            exe.display(),
+            installed.display(),
+            installed.display()
+        ));
+    }
+    let link = std::fs::symlink_metadata(installed).is_ok_and(|m| m.file_type().is_symlink());
+    link.then(|| {
+        format!(
+            "{} is a symbolic link: the hooks below call its target, {}; when the link moves (an upgrade), run `ccwm hooks print` again and replace them",
+            installed.display(),
+            exe.display()
+        )
+    })
 }
 
 /// How often `ccwm hooks events --follow` asks the daemon for new events.
@@ -296,7 +314,21 @@ fn hooks_events(follow: bool) -> Result<()> {
     let mut started = v.get("started_at").and_then(serde_json::Value::as_i64);
     loop {
         std::thread::sleep(FOLLOW_EVERY);
-        let v = client::call(&socket, uid, "hooks.events")?;
+        let v = match follow_call(&socket, uid) {
+            Ok(v) => v,
+            // A restart (`ccwm restart`, the service manager): wait for the next daemon, which
+            // the start time below then reports (v0.2 review I7).
+            Err(e) if e.is_not_running() => {
+                errln!(
+                    "-- the daemon is not reachable; waiting up to {} s --",
+                    STARTUP_WAIT.as_secs()
+                );
+                retry_while_starting(STARTUP_WAIT, Duration::from_millis(100), || {
+                    client::call(&socket, uid, "hooks.events")
+                })?
+            }
+            Err(e) => return Err(e),
+        };
         let now_started = v.get("started_at").and_then(serde_json::Value::as_i64);
         if now_started != started {
             outln!("-- the daemon restarted; its log starts over --");
@@ -315,6 +347,22 @@ fn hooks_events(follow: bool) -> Result<()> {
     }
 }
 
+/// One poll of `--follow`. A daemon that stops while it answers ends the connection without an
+/// answer; one more attempt then tells a stopped daemon ("not running") from another failure,
+/// whose first error is returned.
+fn follow_call(socket: &std::path::Path, uid: u32) -> Result<serde_json::Value> {
+    client::call(socket, uid, "hooks.events").or_else(|first| {
+        if first.is_not_running() {
+            return Err(first);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        match client::call(socket, uid, "hooks.events") {
+            Err(e) if !e.is_not_running() => Err(first),
+            other => other,
+        }
+    })
+}
+
 /// The counters above the debug log.
 pub fn format_hook_events_header(v: &serde_json::Value) -> String {
     let n = |p: &str| {
@@ -322,18 +370,11 @@ pub fn format_hook_events_header(v: &serde_json::Value) -> String {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
     };
-    let refused: Vec<String> = crate::presence::store::Refusal::ALL
-        .iter()
-        .filter_map(|r| {
-            let k = n(&format!("/refused/{}", r.as_str()));
-            (k > 0).then(|| format!("{k} {}", r.as_str()))
-        })
-        .collect();
     format!(
         "Hook events since the daemon started ({}): {} received, refused: {}.\nOpen sessions: {} ({} non-interactive). The daemon keeps the last {} events; times are local.\n",
         when(v, "/started_at"),
         n("/received"),
-        if refused.is_empty() { "none".to_string() } else { refused.join(", ") },
+        refused_text(v),
         n("/open"),
         n("/open_noninteractive"),
         n("/kept"),
@@ -408,10 +449,11 @@ fn daemon_dirs() -> Result<(Dirs, u32)> {
     Ok((Dirs::resolve(&EnvVars::from_process(), &home), uid))
 }
 
-/// The daemon's socket after verifying the runtime directory (no TCP, ever).
+/// The daemon's socket after verifying the runtime directory (no TCP, ever). No NSS lookup
+/// unless a group-writable directory needs one (`ccwm hook` runs this at every event).
 fn daemon_socket() -> Result<(std::path::PathBuf, u32)> {
     let (dirs, uid) = daemon_dirs()?;
-    dirs.verify_runtime(&Owner::current(uid))?;
+    dirs.verify_runtime_lazily(uid, crate::paths::private_group)?;
     Ok((dirs.socket_path(), uid))
 }
 
@@ -634,13 +676,6 @@ pub fn format_hooks(h: &serde_json::Value) -> String {
     if !unassigned.is_empty() {
         parts.push(format!("not in a project: {}", unassigned.join(", ")));
     }
-    let refused: Vec<String> = crate::presence::store::Refusal::ALL
-        .iter()
-        .filter_map(|r| {
-            let k = n(&format!("/refused/{}", r.as_str()));
-            (k > 0).then(|| format!("{k} {}", r.as_str()))
-        })
-        .collect();
     format!(
         "  hooks: {} open session(s) ({}), last event {}; {} received, {} stale, {} from session files, refused: {}\n",
         n("/open"),
@@ -649,8 +684,41 @@ pub fn format_hooks(h: &serde_json::Value) -> String {
         n("/received"),
         n("/stale"),
         n("/session_file_facts"),
-        if refused.is_empty() { "none".to_string() } else { refused.join(", ") },
+        refused_text(h),
     )
+}
+
+/// The refused hook events of a status or `hooks.events` object (`refused`), by reason.
+fn refused_counts(v: &serde_json::Value) -> Vec<(&'static str, u64)> {
+    crate::presence::store::Refusal::ALL
+        .iter()
+        .map(|r| {
+            let k = v
+                .pointer(&format!("/refused/{}", r.as_str()))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            (r.as_str(), k)
+        })
+        .collect()
+}
+
+/// "2 malformed, 1 client_gone", or "none".
+fn refused_text(v: &serde_json::Value) -> String {
+    let parts: Vec<String> = refused_counts(v)
+        .into_iter()
+        .filter(|(_, k)| *k > 0)
+        .map(|(name, k)| format!("{k} {name}"))
+        .collect();
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Every refused hook event, whatever the reason (`ccwm doctor`).
+pub fn refused_total(v: &serde_json::Value) -> u64 {
+    refused_counts(v).iter().map(|(_, k)| k).sum()
 }
 
 /// The strings of the array `key` of a status object (empty when absent).
@@ -1069,6 +1137,35 @@ fn open(print_only: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hooks_print_warns_about_another_binary_and_a_symlinked_install() {
+        let t = crate::paths::private_tempdir();
+        let bin = t.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let real = t.path().join("ccwm-0.2.0");
+        std::fs::write(&real, "").unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+        let installed = bin.join("ccwm");
+        // Nothing installed: another binary.
+        let w = hooks_path_warning(&real, &installed).unwrap();
+        assert!(w.contains("not ") && w.contains("install.sh"), "{w}");
+        // The installed file itself (a copy, as scripts/install.sh makes it): no warning.
+        std::fs::write(&installed, "").unwrap();
+        let copy = std::fs::canonicalize(&installed).unwrap();
+        assert_eq!(hooks_path_warning(&copy, &installed), None);
+        // A symlink to a versioned file: the hooks name the target.
+        std::fs::remove_file(&installed).unwrap();
+        std::os::unix::fs::symlink(&real, &installed).unwrap();
+        let w = hooks_path_warning(&real, &installed).unwrap();
+        assert!(
+            w.contains("symbolic link") && w.contains(real.to_str().unwrap()),
+            "{w}"
+        );
+        // A symlink to something else: the first warning.
+        let w = hooks_path_warning(&copy, &installed).unwrap();
+        assert!(w.contains("install.sh"), "{w}");
+    }
     use clap::CommandFactory;
 
     #[test]

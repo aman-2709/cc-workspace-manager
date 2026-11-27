@@ -381,6 +381,7 @@ async fn run(p: Prepared) -> Result<()> {
         notifier.clone(),
     ));
     presence.set_show_noninteractive(file_config.indicator.show_noninteractive);
+    presence.set_live_first(file_config.indicator.live_first);
     tracker.set_presence(Arc::clone(&presence));
     match presence.restore(&reader).await {
         Ok((0, 0)) => {}

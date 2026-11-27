@@ -3,8 +3,10 @@
 //! their states ([`store`]), the ends of a turn recorded in session files (§21.2a), persistence
 //! across restarts, the liveness sweep, and what the API and the UI show.
 //!
-//! Hook events are **never activity** (§21.1): nothing here touches activity times, sort order,
-//! watches or ignore rules, and nothing here registers a project.
+//! Hook events are **never activity** (§21.1): nothing here touches activity times, the sort
+//! orders of §5.4, watches or ignore rules, and nothing here registers a project. The listing's
+//! "live sessions first" grouping (§21.8, [`Presence::live_ranks`]) is a separate leading key
+//! that the UI shows and the toggle turns off.
 
 pub mod proc;
 pub mod store;
@@ -76,6 +78,8 @@ pub struct Presence {
     notifier: Notifier,
     /// `indicator.show_noninteractive` (§21.8, O17), live.
     show_noninteractive: AtomicBool,
+    /// `indicator.live_first` (§21.8): projects with an open session lead the listing. Live.
+    live_first: AtomicBool,
     started_at: i64,
 }
 
@@ -103,6 +107,7 @@ impl Presence {
             clock,
             notifier,
             show_noninteractive: AtomicBool::new(false),
+            live_first: AtomicBool::new(true),
         }
     }
 
@@ -134,6 +139,28 @@ impl Presence {
             let projects = self.store().noninteractive_projects();
             self.publish(&projects);
         }
+    }
+
+    /// Turn "Show live sessions first" on or off (§21.8): the projects with an open session are
+    /// published again (their place in the listing changes).
+    pub fn set_live_first(&self, on: bool) {
+        if self.live_first.swap(on, Ordering::Relaxed) != on {
+            let projects: Vec<String> = self
+                .store()
+                .live_ranks(self.show_noninteractive())
+                .into_keys()
+                .collect();
+            self.publish(&projects);
+        }
+    }
+
+    /// The listing's leading key when "Show live sessions first" is on: each project with a shown
+    /// open session and its aggregate state (needs approval, working, waiting, unknown). `None`
+    /// when the toggle is off.
+    pub fn live_ranks(&self) -> Option<std::collections::BTreeMap<String, store::State>> {
+        self.live_first
+            .load(Ordering::Relaxed)
+            .then(|| self.store().live_ranks(self.show_noninteractive()))
     }
 
     /// A `hook.event` from the socket peer `peer_pid` (§21.5, §21.6). Called by the socket
@@ -197,6 +224,17 @@ impl Presence {
             }
             Err(r) => format!("refused: {}", r.as_str()),
         };
+        // The sessions a SessionStart closed went first (they no longer exist for the event).
+        for sid in applied.iter().flat_map(|a| &a.replaced) {
+            store.log(
+                at_ms,
+                None,
+                None,
+                Some(sid.clone()),
+                None,
+                "closed: its process started another session".into(),
+            );
+        }
         store.log(
             at_ms,
             Some(report.event),
@@ -210,6 +248,9 @@ impl Presence {
                 drop(store);
                 tracing::trace!(event = report.event.name(), "hook event");
                 let resolve = matches!(a.outcome, Outcome::Opened(_) | Outcome::NewProcess(_));
+                if !a.replaced.is_empty() {
+                    self.persist(Persist::Delete(a.replaced));
+                }
                 if let Some(p) = a.persist {
                     self.persist(p);
                 }
@@ -290,14 +331,16 @@ impl Presence {
         self.publish(&changed);
     }
 
-    /// The open sessions to resolve to a project: id and first cwd (never logged).
-    pub fn cwds(&self) -> Vec<(String, String)> {
+    /// Start a project resolution: its sequence number and the open sessions to resolve, id and
+    /// first cwd (never logged).
+    pub fn cwds(&self) -> (u64, Vec<(String, String)>) {
         self.store().cwds()
     }
 
-    /// The tracker's resolution of [`Self::cwds`]: a project id, or why there is none.
-    pub fn assign(&self, results: Vec<(String, Result<String, &'static str>)>) {
-        let changed = self.store().assign(results);
+    /// The tracker's result of resolution `seq` ([`Self::cwds`]): a project id, or why there is
+    /// none. A result older than one already applied is dropped (v0.2 review L8).
+    pub fn assign(&self, seq: u64, results: Vec<(String, Result<String, &'static str>)>) {
+        let changed = self.store().assign(seq, results);
         self.publish(&changed);
     }
 
@@ -463,6 +506,12 @@ mod tests {
     use crate::claude::parse::TurnEnd;
     use crate::clock::FakeClock;
 
+    /// Apply a resolution started now (the latest, so it is never dropped as older).
+    fn assign_now(p: &Presence, results: Vec<(String, Result<String, &'static str>)>) {
+        let (seq, _) = p.cwds();
+        p.assign(seq, results);
+    }
+
     const UID: u32 = 1000;
     const DAEMON: u32 = 7;
     const A: &str = "0b7c1f6e-3d2a-4c5b-9e8f-1a2b3c4d5e6f";
@@ -587,14 +636,15 @@ mod tests {
             Ok(Reported { resolve: true })
         );
         // The tracker resolves the session's project; a state change then publishes it.
+        let (seq, cwds) = p.cwds();
         assert_eq!(
-            p.cwds(),
+            cwds,
             [(
                 A.to_string(),
                 "/home/u/dev/SYNTHETIC-CWD-CANARY".to_string()
             )]
         );
-        p.assign(vec![(A.into(), Ok("proj".into()))]);
+        p.assign(seq, vec![(A.into(), Ok("proj".into()))]);
         assert_eq!(e.published(), ["proj"]);
         let p = &e.presence;
         assert_eq!(p.live("proj").unwrap().state, State::Waiting);
@@ -654,6 +704,138 @@ mod tests {
         );
     }
 
+    /// v0.2 review L1 and L2 through the daemon side: a second process's `SessionEnd` is logged
+    /// and ignored; `/clear` with a lost `SessionEnd` closes the old session, deletes its row and
+    /// publishes its project.
+    #[tokio::test]
+    async fn one_process_one_session_and_only_the_owner_ends_it() {
+        let mut e = env();
+        // A second Claude Code (110) with its own hook process (310).
+        e.fake.process(110, UID, 50, 21, &["claude", "--resume", A]);
+        e.fake.process(210, UID, 110, 32, &["sh", "-c", "x"]);
+        e.fake.process(310, UID, 210, 33, &["ccwm", "hook", "Stop"]);
+        let p = &e.presence;
+        p.report(Some(300), report(Event::Stop, A, None)).unwrap();
+        assign_now(p, vec![(A.into(), Ok("proj".into()))]);
+        p.report(
+            Some(310),
+            report(Event::SessionStart(Source::Resume), A, None),
+        )
+        .unwrap();
+        // The first terminal leaves: A is the second one's now.
+        p.report(Some(300), report(Event::SessionEnd, A, None))
+            .unwrap();
+        assert_eq!(p.live("proj").unwrap().state, State::Waiting);
+        assert_eq!(e.rows().await, [(A.to_string(), 110)]);
+        e.published();
+        // In the second process, `/clear` ends A (its SessionEnd lost) and starts B.
+        let p = &e.presence;
+        p.report(
+            Some(310),
+            report(Event::SessionStart(Source::Clear), B, None),
+        )
+        .unwrap();
+        assert_eq!(e.published(), ["proj"]);
+        assert_eq!(e.rows().await, [(B.to_string(), 110)]);
+        assert_eq!(e.presence.live("proj"), None, "B is not assigned yet");
+        assert_eq!(
+            e.outcomes(),
+            [
+                "opened: waiting",
+                "new process: waiting",
+                "ignored (another process)",
+                "closed: its process started another session",
+                "opened: waiting",
+            ]
+        );
+        let log = e.presence.events().events;
+        assert_eq!(
+            (log[3].event, log[3].session_id.as_deref()),
+            (None, Some(A))
+        );
+        assert_eq!(log[4].session_id.as_deref(), Some(B));
+        assert_eq!(e.presence.events().open, 1);
+    }
+
+    /// v0.2 review L8: the result of a resolution that started earlier never overwrites a later
+    /// one's.
+    #[tokio::test]
+    async fn an_older_resolution_result_is_dropped() {
+        let mut e = env();
+        let p = &e.presence;
+        p.report(Some(300), report(Event::Stop, A, None)).unwrap();
+        let (older, _) = p.cwds();
+        let (newer, _) = p.cwds();
+        assert!(newer > older);
+        p.assign(newer, vec![(A.into(), Ok("proj".into()))]);
+        p.assign(older, vec![(A.into(), Err(store::NOT_REGISTERED))]);
+        assert_eq!(p.live("proj").unwrap().state, State::Waiting);
+        assert_eq!(p.status().counts.unassigned.len(), 0);
+        assert_eq!(e.published(), ["proj"]);
+        // Started later than both: applied.
+        let p = &e.presence;
+        let (latest, _) = p.cwds();
+        p.assign(latest, vec![(A.into(), Err(store::NOT_REGISTERED))]);
+        assert_eq!(p.live("proj"), None);
+    }
+
+    /// "Show live sessions first" (§21.8): the ranks follow the shown sessions' aggregate, the
+    /// toggle turns them off, and a change republishes the projects with an open session.
+    #[tokio::test]
+    async fn live_ranks_follow_the_aggregate_and_the_toggle() {
+        let mut e = env();
+        let p = &e.presence;
+        assert_eq!(p.live_ranks(), Some(Default::default()));
+        p.report(Some(300), report(Event::UserPromptSubmit, A, None))
+            .unwrap();
+        assign_now(p, vec![(A.into(), Ok("proj".into()))]);
+        assert_eq!(
+            p.live_ranks().unwrap().into_iter().collect::<Vec<_>>(),
+            [("proj".to_string(), State::Working)]
+        );
+        e.published();
+        let p = &e.presence;
+        p.set_live_first(false);
+        assert_eq!(p.live_ranks(), None);
+        assert_eq!(e.published(), ["proj"]);
+        let p = &e.presence;
+        p.set_live_first(false);
+        assert!(e.published().is_empty(), "no change, nothing published");
+        let p = &e.presence;
+        p.set_live_first(true);
+        assert_eq!(e.published(), ["proj"]);
+        // A hidden non-interactive session (another process) gives no rank until it is shown.
+        e.fake.process(110, UID, 50, 21, &["claude", "-p", "x"]);
+        e.fake.process(210, UID, 110, 32, &["sh", "-c", "x"]);
+        e.fake.process(310, UID, 210, 33, &["ccwm", "hook", "Stop"]);
+        let p = &e.presence;
+        p.report(
+            Some(310),
+            report(Event::SessionStart(Source::Startup), B, None),
+        )
+        .unwrap();
+        assign_now(
+            p,
+            vec![
+                (A.into(), Ok("proj".into())),
+                (B.into(), Ok("other".into())),
+            ],
+        );
+        assert_eq!(
+            p.live_ranks().unwrap().into_keys().collect::<Vec<_>>(),
+            ["proj"],
+            "B is hidden"
+        );
+        p.set_show_noninteractive(true);
+        assert_eq!(
+            p.live_ranks().unwrap().into_iter().collect::<Vec<_>>(),
+            [
+                ("other".to_string(), State::Waiting),
+                ("proj".to_string(), State::Working)
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn refusals_are_counted_logged_and_change_nothing() {
         let e = env();
@@ -675,6 +857,11 @@ mod tests {
             p.report(Some(-1), report(Event::Stop, A, None)),
             Err(Refusal::NoClaudeAncestor)
         );
+        // The hook process left before its event was handled (v0.2 review L7).
+        assert_eq!(
+            p.report(Some(999), report(Event::Stop, A, None)),
+            Err(Refusal::ClientGone)
+        );
         assert_eq!(
             p.report(Some(300), report(Event::Stop, A, Some(DAEMON))),
             Err(Refusal::Malformed)
@@ -691,13 +878,20 @@ mod tests {
         );
         let v = p.events();
         assert_eq!(v.open, 0);
-        assert_eq!(v.counters.received, 6);
+        assert_eq!(v.counters.received, 7);
         let r = &v.counters.refused;
         assert_eq!(
-            (r.malformed, r.no_claude_ancestor, r.pid_mismatch, r.limit),
-            (2, 3, 1, 0)
+            (
+                r.malformed,
+                r.no_claude_ancestor,
+                r.pid_mismatch,
+                r.limit,
+                r.client_gone
+            ),
+            (2, 3, 1, 0, 1)
         );
-        assert_eq!(v.events[5].event, Some("Stop"));
+        assert_eq!(v.events[4].outcome, "refused: client_gone");
+        assert_eq!(v.events[6].event, Some("Stop"));
         assert!(e.rows().await.is_empty());
     }
 
@@ -709,7 +903,7 @@ mod tests {
         e.presence
             .report(Some(300), report(Event::UserPromptSubmit, A, None))
             .unwrap();
-        e.presence.assign(vec![(A.into(), Ok("proj".into()))]);
+        assign_now(&e.presence, vec![(A.into(), Ok("proj".into()))]);
         let v = e.presence.events();
         assert_eq!((v.open, v.open_noninteractive), (1, 1));
         assert_eq!(e.outcomes(), ["opened: working (non-interactive)"]);
@@ -743,7 +937,7 @@ mod tests {
         e.presence
             .report(Some(300), with_prompt(Event::UserPromptSubmit, P1))
             .unwrap();
-        e.presence.assign(vec![(A.into(), Ok("proj".into()))]);
+        assign_now(&e.presence, vec![(A.into(), Ok("proj".into()))]);
         e.presence
             .report(
                 Some(300),
@@ -796,10 +990,13 @@ mod tests {
         e.presence
             .report(Some(510), report(Event::Stop, B, None))
             .unwrap();
-        e.presence.assign(vec![
-            (A.into(), Ok("p".into())),
-            (B.into(), Err(store::NOT_REGISTERED)),
-        ]);
+        assign_now(
+            &e.presence,
+            vec![
+                (A.into(), Ok("p".into())),
+                (B.into(), Err(store::NOT_REGISTERED)),
+            ],
+        );
         assert!(e.presence.sweep().is_empty(), "both alive");
         e.published();
         e.fake.remove(100);
@@ -855,7 +1052,7 @@ mod tests {
         e.fake.remove(500);
         let restarted = e.restarted();
         assert_eq!(restarted.restore(&e.reader).await.unwrap(), (1, 1));
-        restarted.assign(vec![(A.into(), Ok("proj".into()))]);
+        assign_now(&restarted, vec![(A.into(), Ok("proj".into()))]);
         restarted.set_show_noninteractive(true);
         assert_eq!(
             restarted.live("proj").unwrap().state,
@@ -886,7 +1083,7 @@ mod tests {
         e.presence
             .report(Some(300), report(Event::Stop, A, None))
             .unwrap();
-        e.presence.assign(vec![(A.into(), Ok("proj".into()))]);
+        assign_now(&e.presence, vec![(A.into(), Ok("proj".into()))]);
         assert_eq!(e.rows().await.len(), 1);
         e.published();
         e.writer.clear_session_index().await.unwrap();

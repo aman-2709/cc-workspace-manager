@@ -31,6 +31,25 @@ pub fn command(env: &SynthEnv) -> Command {
     c
 }
 
+/// [`command`], or `wrapper… ccwm` (for example under `strace`) when `wrapper` is not empty.
+pub fn wrapped_command(env: &SynthEnv, wrapper: &[String]) -> Command {
+    match wrapper.split_first() {
+        None => command(env),
+        Some((program, args)) => {
+            let mut c = Command::new(program);
+            c.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("NO_COLOR", "1")
+                .args(args)
+                .arg(BIN);
+            for (k, v) in env.env_pairs() {
+                c.env(k, v);
+            }
+            c
+        }
+    }
+}
+
 pub struct Daemon {
     pub child: Child,
     pub log: Arc<Mutex<String>>,
@@ -56,21 +75,7 @@ impl Daemon {
         vars: &[(&str, &str)],
         wrapper: &[String],
     ) -> Self {
-        let mut c = match wrapper.split_first() {
-            None => command(env),
-            Some((program, args)) => {
-                let mut c = Command::new(program);
-                c.env_clear()
-                    .env("PATH", "/usr/bin:/bin")
-                    .env("NO_COLOR", "1")
-                    .args(args)
-                    .arg(BIN);
-                for (k, v) in env.env_pairs() {
-                    c.env(k, v);
-                }
-                c
-            }
-        };
+        let mut c = wrapped_command(env, wrapper);
         for (k, v) in vars {
             c.env(k, v);
         }
